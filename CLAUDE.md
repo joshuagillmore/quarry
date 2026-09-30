@@ -92,7 +92,13 @@ runs a **Mission** against a question using an intelligence-collection loop:
   used — and crossing it stops the loop, logs `token budget reached`, and
   marks every requirement not yet reached `assessment_missing="not attempted:
   token budget reached"`, the same shape as an unmet requirement rather than
-  a crash.
+  a crash. The per-run override is the "LLM tokens" field in the **Agentic
+  Crawl** panel of the Search page's run form (`max_llm_tokens`, 0–5,000,000,
+  blank or non-numeric falling back to `settings.max_llm_tokens`); `agent_run`
+  writes it into that mission's `budget_json`. There is no agent-level
+  default — the `agents` table is untouched — so re-running a mission from
+  its own page (which carries no budget forward) always gets the operator
+  default, not whatever budget its previous run used.
 - **Source of truth is SQLite, not the job store.** Mission status, requirements,
   and the brief live in the new tables (`agents`, `missions`, `requirements`,
   `mission_documents`). The in-memory job store (`jobs.create_mission_job`) only
@@ -138,7 +144,8 @@ runs a **Mission** against a question using an intelligence-collection loop:
   runs inside a mission, `None` for the one-shot pipeline).
   `storage.get_mission_llm_usage(mission_id)` rolls those rows up per
   mission — totals plus a `by_purpose` breakdown — for the mission page's
-  telemetry strip.
+  telemetry strip; `api_mission` also returns `llm_tokens` so the ~1.2s poll
+  updates that cell without a page reload.
 - **The mission view** (`templates/mission.html`) renders three states from
   `mission.status` — editable **approval gate**, **requirements matrix**, and
   **brief + citation-linked source rail**. It polls `GET /api/mission/<id>`
@@ -165,9 +172,16 @@ runs a **Mission** against a question using an intelligence-collection loop:
   (or restarting the process) therefore can't silently renumber the rail
   against a different ordering than the one the brief text actually cites.
   The mission page renders a `None` slot as a muted "source no longer
-  available" row and excludes it from `doc_number`. `linkify_citations` is
-  bounded by the count of non-`None` stored slots, so an out-of-range `[n]`
-  stays plain text rather than binding to the wrong document.
+  available" row and excludes it from `doc_number`. `linkify_citations`'s
+  bound (`app._cite_bound`) is the **position of the last surviving stored
+  slot**, not the count of surviving slots — those differ once a slot is
+  `None`: with a stored order `[d1, gone, d2]`, the count of surviving slots
+  is 2, but bounding by that count would unlink `[3]` even though it's `d2`,
+  a real, still-cited source. Bounding by position instead keeps `[3]`
+  linked, while `[2]` — the removed slot — still resolves to its "source no
+  longer available" rail row rather than falling through as plain text.
+  Past the bound, `[n]` is either LLM noise or an uncited document and stays
+  plain text.
   `brief.linkify_citations()` turns `[n]` into `.cite` controls **after**
   `render_markdown` sanitization (it only ever injects markup built from an
   integer it re-serializes, so the sanitizer is never weakened or bypassed).
@@ -186,9 +200,11 @@ runs a **Mission** against a question using an intelligence-collection loop:
   briefs side by side (each through `render_markdown`, un-linkified), the two
   questions and dates, and three source lists built from
   `storage.get_mission_pair_documents(mission_id, parent_id)` — new this run,
-  dropped since the parent, and shared. It 404s-to-flash when the mission has
-  no `parent_mission_id` or that parent mission is gone. The mission page
-  links to it ("Compare with previous run") whenever a live parent exists —
+  dropped since the parent, and shared, deduped by URL (a page stored under
+  two different search queries still counts once). It 404s-to-flash when the
+  mission has no `parent_mission_id` or that parent mission is gone. The
+  mission page links to it ("Compare with previous run") whenever a live
+  parent exists —
   every scheduled run already has one via `parent_mission_id`.
 - **Approve and re-task are atomic status transitions, not unconditional
   `UPDATE`s.** `storage.claim_mission_status(mission_id, from_status,

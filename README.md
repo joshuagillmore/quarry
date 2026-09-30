@@ -200,8 +200,10 @@ run.
   tokens (`0` = unlimited, the default); crossing the budget stops collection
   cleanly at the next pass or requirement boundary, and requirements not yet
   reached are marked "not attempted: token budget reached" instead of the run
-  being cut off mid-requirement. The budget can be overridden per run from
-  the mission form.
+  being cut off mid-requirement. Override it per run with the "LLM tokens"
+  field in the Agentic Crawl panel on the Search page (blank uses
+  `MAX_LLM_TOKENS`); it's a per-run choice, not an agent setting, so
+  re-running a mission from its own page doesn't carry its budget forward.
 - **Brief quality checks.** After synthesis, the brief is checked for
   uncited long paragraphs, citations pointing at a source that turned out not
   to be usable, and requirements that never actually made it into the brief's
@@ -210,7 +212,7 @@ run.
 - **Compare view.** A mission with a previous run (every scheduled "morning
   brief" has one) links to "Compare with previous run", showing both briefs
   side by side plus which sources are new, which dropped out, and which are
-  shared between the two runs.
+  shared between the two runs, deduped by URL.
 - **Search signals.** Each requirement's detail view shows a line per
   collection pass — queries run, results returned, and which engine answered
   (e.g. `pass 1 · 3 queries · 11 results · brave`) — so a pass that quietly
