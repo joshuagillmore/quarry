@@ -32,6 +32,15 @@ def _sources_block(docs: list[Document], max_docs: int = 6, excerpt_chars: int =
     return "\n\n".join(lines)
 
 
+def _is_yes(value) -> bool:
+    """Strict reading of the model's verdict. bool("false") is True, so a
+    model that answers with a string (or 1, or a list) must not silently
+    satisfy a requirement: only JSON true or "true"/"yes" count."""
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() in {"true", "yes"}
+
+
 def assess_requirement(requirement: Requirement, docs: list[Document]) -> Assessment:
     """Returns an Assessment. On LLM/parse failure, returns a not-satisfied
     assessment with no new queries (caller's attempt cap will still advance)."""
@@ -54,10 +63,11 @@ def assess_requirement(requirement: Requirement, docs: list[Document]) -> Assess
     if not parsed:
         return Assessment(False, "low", "could not assess", [])
 
-    next_q = [q.strip() for q in (parsed.get("next_queries") or [])
-              if isinstance(q, str) and q.strip()]
+    raw_next = parsed.get("next_queries")
+    next_q = ([q.strip() for q in raw_next if isinstance(q, str) and q.strip()]
+              if isinstance(raw_next, list) else [])
     return Assessment(
-        satisfied=bool(parsed.get("satisfied")),
+        satisfied=_is_yes(parsed.get("satisfied")),
         confidence=str(parsed.get("confidence") or "low"),
         missing=str(parsed.get("missing") or ""),
         next_queries=next_q[:3],

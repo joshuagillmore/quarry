@@ -9,7 +9,9 @@ from models import Document
 def test_block_pages_rejected():
     for title in ("Checking your browser - reCAPTCHA", "Just a moment...",
                   "Access Denied", "Attention Required! | Cloudflare"):
-        junk, why = content_quality.looks_like_block_page(title, 5000)
+        # Short enough to be an interstitial; the title marker is what rejects
+        # it (150 words clears MIN_CONTENT_WORDS).
+        junk, why = content_quality.looks_like_block_page(title, 150)
         assert junk, f"{title!r} should be rejected"
         assert why
 
@@ -97,3 +99,57 @@ def test_cron_validation():
     assert not scheduler.validate_cron("99 99 * * *")[0]
     assert scheduler.describe_next_run("0 7 * * *")
     assert scheduler.describe_next_run("") == ""
+
+
+# ---------- title markers only matter on short pages ----------
+
+def test_article_about_an_error_is_not_junk():
+    """A long page whose title merely mentions a marker is real content."""
+    junk, _ = content_quality.looks_like_block_page("How to Fix a 403 Forbidden Error", 2400)
+    assert not junk
+
+
+def test_short_interstitial_is_junk():
+    junk, why = content_quality.looks_like_block_page("Just a moment...", 40)
+    assert junk and why
+
+
+def test_title_marker_threshold():
+    limit = content_quality.BLOCK_TITLE_MAX_WORDS
+    assert limit == 300
+    assert content_quality.looks_like_block_page("Access Denied", limit - 1)[0]
+    assert not content_quality.looks_like_block_page("Access Denied", limit)[0]
+
+
+# ---------- search: scheme filter and backoff ----------
+
+def test_non_web_schemes_are_dropped(monkeypatch):
+    monkeypatch.setattr(search.settings, "search_backends", "auto")
+    rows = [_row(u) for u in ("file:///etc/passwd", "javascript:alert(1)",
+                              "ftp://files.example/x", "//no-scheme.example/a",
+                              "HTTPS://ok.example/a", "http://ok.example/b")]
+    monkeypatch.setattr(search, "_rows", lambda q, m, b: rows)
+    assert [r.url for r in search.web_search("q", 10)] == [
+        "HTTPS://ok.example/a", "http://ok.example/b"]
+
+
+class _SleepRecorder:
+    def __init__(self):
+        self.sleeps = []
+
+    def sleep(self, seconds=0):
+        self.sleeps.append(seconds)
+
+
+def test_no_sleep_after_the_final_rate_limited_attempt(monkeypatch):
+    monkeypatch.setattr(search.settings, "search_backends", "auto,brave")
+    rec = _SleepRecorder()
+    monkeypatch.setattr(search, "time", rec)
+
+    def throttled(query, max_results, backend):
+        raise search.RatelimitException("slow down")
+
+    monkeypatch.setattr(search, "_rows", throttled)
+    assert search.web_search("q", 3) == []
+    # One backoff between an engine's two attempts; none after its last.
+    assert rec.sleeps == [1.5, 1.5]

@@ -67,7 +67,23 @@ async def crawl_urls(search_results: list[SearchResult], search_query: str) -> l
     return documents
 
 
-async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str, job_id: str) -> list[Document]:
+def _arun_timeout_s() -> float:
+    """Hard ceiling on one page, in seconds. crawl4ai's page_timeout bounds
+    navigation, but not every stage after it (a wedged browser, a script that
+    never settles), and one hung page would otherwise hold its semaphore slot
+    — and the mission's worker and job slot — forever. Twice the navigation
+    budget plus headroom for rendering and markdown extraction."""
+    return settings.crawl_timeout / 1000 * 2 + 15
+
+
+async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,
+                                   job_id: str, attempted: set[str] | None = None) -> list[Document]:
+    """Crawl `search_results` with progress reported into the job store.
+
+    When `attempted` is given, every URL this call tries is added to it —
+    the requested URL and, when the crawl got that far, the final URL after
+    redirects — so a caller can avoid fetching the same page again under
+    another name."""
     from jobs import update_url, add_log, inc_counter
 
     browser_cfg = BrowserConfig(headless=True, browser_type="chromium")
@@ -92,10 +108,16 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         async def crawl_one(sr: SearchResult) -> Document | None:
             async with semaphore:
+                if attempted is not None:
+                    attempted.add(sr.url)
                 update_url(job_id, sr.url, status="fetching")
                 add_log(job_id, "info", f"fetching <code>{_esc(sr.url)}</code>")
+                limit = _arun_timeout_s()
                 try:
-                    result = await crawler.arun(url=sr.url, config=run_cfg)
+                    result = await asyncio.wait_for(
+                        crawler.arun(url=sr.url, config=run_cfg), timeout=limit)
+                    if attempted is not None and getattr(result, "url", None):
+                        attempted.add(result.url)
                     if not result.success:
                         msg = (result.error_message or "unknown error")[:140]
                         update_url(job_id, sr.url, status="error", error=msg)
@@ -147,6 +169,13 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                     inc_counter(job_id, "crawl_done")
                     add_log(job_id, "ok", f"<em>{_esc(title[:80])}</em> · {word_count:,}w")
                     return doc
+                except asyncio.TimeoutError:
+                    # str(TimeoutError()) is "", so say what happened.
+                    msg = f"timed out after {limit:.0f}s"
+                    update_url(job_id, sr.url, status="error", error=msg)
+                    inc_counter(job_id, "crawl_done")
+                    add_log(job_id, "err", f"gave up on <code>{_esc(sr.url)}</code>: {_esc(msg)}")
+                    return None
                 except Exception as e:
                     update_url(job_id, sr.url, status="error", error=str(e)[:140])
                     inc_counter(job_id, "crawl_done")

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from llm import chat_ex, model_for
+from llm import chat_ex, model_for, _extract_json
 from models import Document, ExtractedData
 
 DEFAULT_PROMPT = (
@@ -49,12 +49,13 @@ def extract_from_document(
         result_text, model = chat_ex(system, user, temperature=0.0, max_tokens=2000, tier="fast")
         print(f"[EXTRACT] Got response ({len(result_text)} chars)", file=sys.stderr, flush=True)
 
-        # Try to parse as JSON, wrap in object if needed
-        try:
-            parsed = json.loads(result_text)
-            result_json = json.dumps(parsed, indent=2)
-        except json.JSONDecodeError:
+        # Models often fence their JSON or wrap it in prose; keep the object
+        # whenever one can be found, and wrap the raw text only when not.
+        parsed = _extract_json(result_text)
+        if parsed is None:
             result_json = json.dumps({"raw_response": result_text}, indent=2)
+        else:
+            result_json = json.dumps(parsed, indent=2)
 
         return ExtractedData(
             id=str(uuid.uuid4()),

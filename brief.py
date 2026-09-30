@@ -2,6 +2,7 @@
 collected documents, with [n] citations. Supports a delta block ("what's new
 since last run") for scheduled runs.
 """
+import json
 import re
 
 from models import Document, Mission, Requirement
@@ -38,7 +39,38 @@ def _sources_block(docs: list[Document], max_docs: int = MAX_BRIEF_SOURCES,
     return "\n\n".join(lines)
 
 
+def ordered_sources_for_mission(mission: Mission, docs: list[Document]) -> list[Document]:
+    """The source-rail ordering for a mission's page. When the mission stored
+    the order its brief was written with (`brief_sources_json`), use exactly
+    that — ids no longer present are skipped — followed by any documents the
+    brief did not number (e.g. added by a later retask), in ordered_sources
+    order. Without a usable stored order, this is ordered_sources(docs)."""
+    stored = None
+    raw = getattr(mission, "brief_sources_json", None) if mission else None
+    if raw:
+        try:
+            stored = json.loads(raw)
+        except (TypeError, ValueError):
+            stored = None
+    if not isinstance(stored, list):
+        return ordered_sources(docs)
+
+    by_id = {d.id: d for d in docs}
+    out: list[Document] = []
+    seen: set[str] = set()
+    for doc_id in stored:
+        if isinstance(doc_id, str) and doc_id in by_id and doc_id not in seen:
+            out.append(by_id[doc_id])
+            seen.add(doc_id)
+    rest = [d for d in docs if d.id not in seen]
+    out.extend(ordered_sources(rest, max_docs=len(rest)))
+    return out
+
+
 _CITE_RE = re.compile(r"\[(\d{1,3})\]")
+_TAG_SPLIT_RE = re.compile(r"(<[^>]+>)")
+_TAG_NAME_RE = re.compile(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9]*)")
+_LITERAL_TAGS = ("code", "pre")
 
 
 def linkify_citations(html: str, max_n: int) -> str:
@@ -46,25 +78,52 @@ def linkify_citations(html: str, max_n: int) -> str:
     controls. Runs AFTER markdown_render.render_markdown (never instead of it):
     the only thing injected is markup built from an integer we re-serialize
     ourselves, so no LLM/page content reaches the DOM unescaped. Out-of-range
-    numbers are left as plain text."""
+    numbers are left as plain text.
+
+    Only text is touched: never the inside of a tag (an href or title that
+    contains "[1]" would otherwise get a <button> spliced into the attribute
+    value), and never text inside <code>/<pre>, where [1] is literal. The
+    input is sanitizer output, so `>` inside attribute values is already
+    escaped and splitting on tags is exact."""
     def repl(m: "re.Match[str]") -> str:
         n = int(m.group(1))
         if not 1 <= n <= max_n:
             return m.group(0)
         return (f'<button type="button" class="cite" data-cite="{n}" '
                 f'aria-label="Source {n}">{n}</button>')
-    return _CITE_RE.sub(repl, html or "")
+
+    parts = _TAG_SPLIT_RE.split(html or "")
+    literal_depth = 0
+    for i, part in enumerate(parts):
+        if i % 2:  # a tag (split() puts captured separators at odd indexes)
+            m = _TAG_NAME_RE.match(part)
+            if m and m.group(2).lower() in _LITERAL_TAGS:
+                if m.group(1):
+                    literal_depth = max(0, literal_depth - 1)
+                elif not part.rstrip(">").rstrip().endswith("/"):
+                    literal_depth += 1
+        elif part and not literal_depth:
+            parts[i] = _CITE_RE.sub(repl, part)
+    return "".join(parts)
 
 
 def _delta_block(docs: list[Document], new_urls: set[str], max_items: int = 10) -> str:
+    """What this run found that its previous run did not, referred to by the
+    same [n] the sources block uses plus the domain. Never the page title:
+    it is page-controlled text (a prompt-injection vector) and duplicates
+    what the numbered source already shows."""
     if not new_urls:
         return ""
-    fresh = [d for d in docs if d.url in new_urls][:max_items]
-    if not fresh:
+    numbered = [(n, d) for n, d in enumerate(ordered_sources(docs), 1) if d.url in new_urls]
+    if not numbered:
         return ""
-    lines = ["NEW SINCE LAST RUN (lead the brief with these):"]
-    for d in fresh:
-        lines.append(f"- {d.title or d.domain} ({d.url})")
+    lines = ["NEW SINCE LAST RUN — these sources were not in the previous run; "
+             "lead the brief with what they add, citing them by number:"]
+    for n, d in numbered[:max_items]:
+        lines.append(f"- [{n}] {d.domain}")
+    unlisted = len(new_urls & {d.url for d in docs}) - min(len(numbered), max_items)
+    if unlisted > 0:
+        lines.append(f"- (+{unlisted} more new source(s) not listed)")
     return "\n".join(lines)
 
 

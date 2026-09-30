@@ -47,8 +47,15 @@ class Job:
     document_ids: list = field(default_factory=list)
     error: Optional[str] = None
     done: bool = False
-    # Mission-only: budget telemetry + cooperative cancellation, read by the
-    # mission page's telemetry strip.
+    # Wall-clock time the job reached a terminal stage (finish_job). Freezes
+    # `elapsed` and anchors the finished-trace TTL.
+    finished_at: Optional[float] = None
+    # Monotonic count of every log line ever added. `log` itself is capped at
+    # _LOG_KEEP, and the poll payload is a tail window, so clients use this to
+    # know how many lines they have not rendered yet.
+    log_total: int = 0
+    # Budget telemetry (missions) + cooperative cancellation (missions and
+    # one-shot crawls), read by the mission telemetry strip / crawl page.
     pass_num: int = 0
     sources_used: int = 0
     cancel_requested: bool = False
@@ -65,20 +72,32 @@ _RECENT_LIMIT = 10
 MAX_ACTIVE_JOBS = 6
 _DONE_KEEP = 40                 # most recent finished traces kept for the UI
 _DONE_TTL_S = 6 * 60 * 60      # ...or until they age out
+_LOG_KEEP = 2000                # log lines kept per job (log_total keeps counting)
+
+# LLM extractions run at once per job. Extraction is one independent call per
+# document and was the slow tail of every run; the cap keeps a local model
+# (and a hosted rate limit) from being swamped. Shared with agent_runner.
+EXTRACT_CONCURRENCY = 4
 
 
 class JobLimitReached(RuntimeError):
     """Raised when too many jobs are already running."""
 
 
+def _ended_at(j: "Job") -> float:
+    return j.finished_at or j.started_at
+
+
 def _prune_locked() -> None:
     """Caller holds _lock. Drop finished jobs beyond the keep-window; pages
-    degrade to their DB-rendered form exactly as after a restart."""
+    degrade to their DB-rendered form exactly as after a restart. Age is
+    measured from when a job finished, so a long run that just ended is not
+    evicted as 'old' the moment it completes."""
     done = sorted((j for j in _store.values() if j.done),
-                  key=lambda j: j.started_at, reverse=True)
+                  key=_ended_at, reverse=True)
     now = time.time()
     for i, j in enumerate(done):
-        if i >= _DONE_KEEP or now - j.started_at > _DONE_TTL_S:
+        if i >= _DONE_KEEP or now - _ended_at(j) > _DONE_TTL_S:
             _store.pop(j.id, None)
 
 
@@ -170,6 +189,40 @@ def update_job(job_id: str, **kwargs) -> None:
             setattr(j, k, v)
 
 
+def _finish_locked(j: Job, stage: str, error: Optional[str]) -> None:
+    j.done = True
+    j.stage = stage
+    if error is not None:
+        j.error = error
+    if j.finished_at is None:
+        j.finished_at = time.time()
+
+
+def finish_job(job_id: str, stage: str = "done", error: Optional[str] = None) -> None:
+    """Move a job to a terminal stage and release its slot. Idempotent:
+    finished_at is stamped once, so repeating the call changes nothing.
+    The one way a job should end; `update_job(done=True)` leaves finished_at
+    unset."""
+    with _lock:
+        j = _store.get(job_id)
+        if j:
+            _finish_locked(j, stage, error)
+
+
+def finish_if_running(job_id: str, stage: str = "error",
+                      error: Optional[str] = None) -> bool:
+    """finish_job, but only for a job that has not already finished — the
+    check and the write happen under one lock hold. For crash/cleanup paths
+    that must not overwrite a job the worker ended properly. True if this
+    call finished it."""
+    with _lock:
+        j = _store.get(job_id)
+        if not j or j.done:
+            return False
+        _finish_locked(j, stage, error)
+        return True
+
+
 def inc_counter(job_id: str, field_name: str, by: int = 1) -> None:
     with _lock:
         j = _store.get(job_id)
@@ -184,6 +237,9 @@ def add_log(job_id: str, level: str, msg: str) -> None:
         if not j:
             return
         j.log.append(JobLog(round(time.time() - j.started_at, 2), level, msg))
+        j.log_total += 1
+        if len(j.log) > _LOG_KEEP:
+            del j.log[:len(j.log) - _LOG_KEEP]
 
 
 def add_urls(job_id: str, urls: list[JobUrl]) -> None:
@@ -215,9 +271,10 @@ def set_document_ids(job_id: str, ids: list[str]) -> None:
 
 
 def request_cancel(job_id: str) -> bool:
-    """Ask a running mission to stop at the next pass boundary. Cooperative —
-    agent_runner checks this between passes, so the current pass finishes and
-    the brief is still synthesized from whatever was collected."""
+    """Ask a running job to stop. Cooperative: a mission stops at the next
+    pass boundary (the current pass finishes and the brief is still
+    synthesized from whatever was collected); a one-shot crawl stops before
+    crawling, before extraction, or before its next document's extraction."""
     with _lock:
         j = _store.get(job_id)
         if not j or j.done:
@@ -237,11 +294,15 @@ def job_state(job_id: str) -> Optional[dict]:
         j = _store.get(job_id)
         if not j:
             return None
+        # A finished job's elapsed is frozen, so its payload stops changing.
+        end = j.finished_at if j.finished_at is not None else time.time()
         return {
             "id": j.id,
             "query": j.query,
             "stage": j.stage,
-            "elapsed": round(time.time() - j.started_at, 1),
+            "elapsed": round(end - j.started_at, 1),
+            "finished_at": j.finished_at,
+            "log_total": j.log_total,
             "search_total": j.search_total,
             "crawl_total": j.crawl_total,
             "crawl_done": j.crawl_done,
@@ -265,18 +326,31 @@ def run_job_in_background(job_id: str) -> None:
 
 
 def _run_thread(job_id: str) -> None:
+    """Thread body. Whatever happens inside — including a BaseException that
+    slips past `except Exception`, or a code path that returns without
+    finishing — the job ends in a terminal stage, so it never holds one of
+    the MAX_ACTIVE_JOBS slots forever."""
+    failure: Optional[str] = None
     try:
         asyncio.run(_run_job(job_id))
-    except Exception as e:
+    except BaseException as e:  # noqa: BLE001 - the slot must be released
         traceback.print_exc()
-        update_job(job_id, stage="error", done=True, error=str(e))
-        add_log(job_id, "err", f"worker crashed: {_esc(str(e))}")
+        failure = str(e) or type(e).__name__
+        add_log(job_id, "err", f"worker crashed: {_esc(failure)}")
+    finally:
+        finish_if_running(job_id, stage="error",
+                          error=failure or "worker exited without finishing")
+
+
+def _cancelled(job_id: str, note: str) -> None:
+    add_log(job_id, "warn", f"cancelled by user · {note}")
+    finish_job(job_id, stage="cancelled")
 
 
 async def _run_job(job_id: str) -> None:
     from search import web_search
     from crawler import crawl_urls_with_progress
-    from storage import insert_document, insert_search, insert_extraction
+    from storage import upsert_document, insert_search, insert_extraction
     from models import SearchRecord
     from extractor import extract_from_document
 
@@ -291,8 +365,12 @@ async def _run_job(job_id: str) -> None:
         update_job(job_id, search_total=len(search_results))
 
         if not search_results:
-            update_job(job_id, stage="done", done=True, error="no search results")
             add_log(job_id, "warn", "no results")
+            finish_job(job_id, stage="done", error="no search results")
+            return
+
+        if is_cancelled(job_id):
+            _cancelled(job_id, "before crawling")
             return
 
         domain_set = {urlparse(r.url).netloc for r in search_results}
@@ -304,36 +382,80 @@ async def _run_job(job_id: str) -> None:
 
         documents = await crawl_urls_with_progress(search_results, job.query, job_id)
 
+        # upsert_document returns the id that is authoritative for the
+        # (url, query) pair — an earlier crawl's id on a re-crawl, not
+        # doc.id — so every later reference (document_ids, extractions) uses
+        # it. A document that fails to store is reported and left out.
+        stored = []
         for doc in documents:
-            await insert_document(doc)
-        set_document_ids(job_id, [d.id for d in documents])
-        add_log(job_id, "ok", f"stored <em>{len(documents)}</em> documents")
+            try:
+                doc_id = await upsert_document(doc)
+            except Exception as e:  # noqa: BLE001 - one bad row must not end the job
+                traceback.print_exc()
+                add_log(job_id, "err",
+                        f"could not store <code>{_esc(doc.url)}</code>: {_esc(str(e)[:120])}")
+                continue
+            stored.append(doc if doc_id == doc.id else doc.model_copy(update={"id": doc_id}))
+        set_document_ids(job_id, [d.id for d in stored])
+        add_log(job_id, "ok", f"stored <em>{len(stored)}</em> documents")
 
         search_record = SearchRecord(
             id=str(uuid.uuid4()),
             query=job.query,
             executed_at=datetime.now(timezone.utc).isoformat(),
-            result_count=len(documents),
+            result_count=len(stored),
             job_id=job_id,
         )
         await insert_search(search_record)
 
-        if job.extract and documents:
-            update_job(job_id, stage="extract", extract_total=len(documents))
-            add_log(job_id, "info", f"running llm extraction on <em>{len(documents)}</em> documents")
-            for doc in documents:
-                add_log(job_id, "info", f"extracting <em>{_esc((doc.title or doc.domain)[:70])}</em>")
-                extraction = extract_from_document(doc, job.extract_prompt)
+        if job.extract and stored:
+            if is_cancelled(job_id):
+                _cancelled(job_id, f"kept {len(stored)} documents, skipped extraction")
+                return
+            await _extract_all(job_id, job.extract_prompt, stored,
+                               extract_from_document, insert_extraction)
+            live = get_job(job_id)
+            n_done = live.extract_done if live else len(stored)
+            if n_done < len(stored):  # a cancel skipped at least one document
+                _cancelled(job_id, f"extracted {n_done} of {len(stored)} documents")
+                return
+
+        add_log(job_id, "ok", "agent finished")
+        finish_job(job_id, stage="done")
+    except Exception as e:
+        traceback.print_exc()
+        add_log(job_id, "err", f"job failed: {_esc(str(e))}")
+        finish_job(job_id, stage="error", error=str(e))
+
+
+async def _extract_all(job_id: str, prompt: str, docs: list,
+                       extract_from_document, insert_extraction) -> None:
+    """Run extraction over `docs`, EXTRACT_CONCURRENCY at a time, each call on
+    a worker thread (litellm is synchronous). A cancel stops any document that
+    has not started yet; ones already in flight finish."""
+    update_job(job_id, stage="extract", extract_total=len(docs))
+    add_log(job_id, "info",
+            f"running llm extraction on <em>{len(docs)}</em> documents "
+            f"· concurrency <em>{EXTRACT_CONCURRENCY}</em>")
+    sem = asyncio.Semaphore(EXTRACT_CONCURRENCY)
+
+    async def one(doc) -> None:
+        async with sem:
+            if is_cancelled(job_id):
+                return
+            add_log(job_id, "info", f"extracting <em>{_esc((doc.title or doc.domain)[:70])}</em>")
+            try:
+                extraction = await asyncio.to_thread(extract_from_document, doc, prompt)
                 if extraction:
                     await insert_extraction(extraction)
                     add_log(job_id, "ok", f"extracted <code>{_esc(doc.domain)}</code>")
                 else:
                     add_log(job_id, "warn", f"no extraction for <code>{_esc(doc.domain)}</code>")
-                inc_counter(job_id, "extract_done")
+            except Exception as e:  # noqa: BLE001 - one document, not the job
+                traceback.print_exc()
+                add_log(job_id, "err",
+                        f"extraction failed for <code>{_esc(doc.domain)}</code>: "
+                        f"{_esc(type(e).__name__)}")
+            inc_counter(job_id, "extract_done")
 
-        update_job(job_id, stage="done", done=True)
-        add_log(job_id, "ok", "agent finished")
-    except Exception as e:
-        traceback.print_exc()
-        update_job(job_id, stage="error", done=True, error=str(e))
-        add_log(job_id, "err", f"job failed: {_esc(str(e))}")
+    await asyncio.gather(*(one(d) for d in docs))
