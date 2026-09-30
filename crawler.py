@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from html import escape as _esc, unescape
@@ -149,11 +150,19 @@ _FALLBACK_HEADERS = {
                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
     "Accept": "text/html,*/*",
 }
-# Bigger than any article; the body is converted in memory.
+# Bigger than any article; the body is converted in memory. Enforced on the
+# decoded stream as it arrives, so a longer body is never read in full.
 _FALLBACK_MAX_BYTES = 5_000_000
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.IGNORECASE | re.DOTALL)
-_NON_TEXT_RE = re.compile(r"<(script|style|noscript)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
-_TAG_RE = re.compile(r"<[^>]*>")
+# The fallback's pre-check reads page-controlled HTML, so every scan here is
+# linear: no pattern can run ahead past a "<" it would then backtrack over.
+# (The first versions, `<[^>]*>` and lazy `.*?` spans, were quadratic: about
+# 0.75 s at 40 KB and hours at 5 MB, with the GIL held.)
+_TITLE_SCAN_CHARS = 64 * 1024
+_TITLE_RE = re.compile(r"<title[^<>]*>([^<]*)</title", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^<>]*>")
+_NON_TEXT_OPEN_RE = re.compile(r"<(script|style|noscript)\b", re.IGNORECASE)
+_NON_TEXT_CLOSE_RE = {name: re.compile(f"</{name}", re.IGNORECASE)
+                      for name in ("script", "style", "noscript")}
 
 
 def _is_http_url(url: str) -> bool:
@@ -165,33 +174,97 @@ def _is_http_url(url: str) -> bool:
 
 
 def _html_title(html: str) -> str:
-    m = _TITLE_RE.search(html)
+    """The <title> text, looked for only near the top of the page."""
+    m = _TITLE_RE.search(html, 0, _TITLE_SCAN_CHARS)
     return " ".join(unescape(m.group(1)).split())[:300] if m else ""
 
 
+def _strip_non_text(html: str) -> str:
+    """`html` without its script/style/noscript blocks. Each search starts
+    where the last one ended, so the whole pass is linear; an opener with no
+    closer stops the stripping there (the rest is kept as-is) instead of
+    being searched past again."""
+    parts: list[str] = []
+    pos = 0
+    while True:
+        opener = _NON_TEXT_OPEN_RE.search(html, pos)
+        if not opener:
+            break
+        closer = _NON_TEXT_CLOSE_RE[opener.group(1).lower()].search(html, opener.end())
+        if not closer:
+            break
+        parts.append(html[pos:opener.start()])
+        end = html.find(">", closer.end())
+        pos = len(html) if end == -1 else end + 1
+    parts.append(html[pos:])
+    return " ".join(parts)
+
+
 def _rough_word_count(html: str) -> int:
-    return len(_TAG_RE.sub(" ", _NON_TEXT_RE.sub(" ", html)).split())
+    return len(_TAG_RE.sub(" ", _strip_non_text(html)).split())
+
+
+def _fallback_page_problem(html: str) -> str:
+    """Why a fetched body is not worth converting (a block page, judged on
+    its <title> and a rough word count), or "" when it is."""
+    junk, why = looks_like_block_page(_html_title(html), _rough_word_count(html))
+    return why if junk else ""
+
+
+def _declared_length(response) -> int:
+    try:
+        return int(response.headers.get("content-length") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _decode(body: bytes, encoding: str | None) -> str:
+    try:
+        return body.decode(encoding or "utf-8", errors="replace")
+    except LookupError:  # a charset Python does not know
+        return body.decode("utf-8", errors="replace")
+
+
+def _fetch_fallback_html(url: str) -> tuple[str, str, str]:
+    """Worker-thread body of the fallback: (html, final url, "") from a
+    plain GET of `url`, or ("", "", reason) when it is not a usable page.
+
+    The response is streamed and judged as early as possible: status and
+    content type from the headers before any body is read (a PDF link is
+    never downloaded), a declared or actual size past _FALLBACK_MAX_BYTES
+    aborts the read (so does a wall-clock deadline, since httpx's timeout is
+    per read and a trickling body would never trip it), and only then is
+    the body decoded and checked for a block page. All of it runs here, off
+    the event loop: page-controlled bytes never hold up the app."""
+    budget_s = settings.crawl_timeout / 1000
+    deadline = time.monotonic() + budget_s
+    with httpx.stream("GET", url, follow_redirects=True, timeout=budget_s,
+                      headers=_FALLBACK_HEADERS) as response:
+        if response.status_code != 200:
+            return "", "", f"HTTP {response.status_code}"
+        ctype = (response.headers.get("content-type") or "").lower()
+        if "html" not in ctype:
+            return "", "", f"not HTML ({ctype.split(';')[0].strip() or 'no content type'})"
+        if _declared_length(response) > _FALLBACK_MAX_BYTES:
+            return "", "", "page too large"
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > _FALLBACK_MAX_BYTES:
+                return "", "", "page too large"
+            if time.monotonic() > deadline:
+                return "", "", f"timed out after {budget_s:g}s"
+        html = _decode(bytes(body), response.encoding)
+        final_url = str(response.url)
+    problem = _fallback_page_problem(html)
+    if problem:
+        return "", "", problem
+    return html, final_url, ""
 
 
 async def _fallback_html(url: str) -> tuple[str, str, str]:
-    """(html, final url, "") from a plain GET of `url`, or ("", "", reason)
-    when it is not a usable page: not a 200, not HTML, too large, or itself a
-    block page (judged on its <title> and a rough word count)."""
-    response = await asyncio.to_thread(
-        httpx.get, url, follow_redirects=True,
-        timeout=settings.crawl_timeout / 1000, headers=_FALLBACK_HEADERS)
-    if response.status_code != 200:
-        return "", "", f"HTTP {response.status_code}"
-    ctype = (response.headers.get("content-type") or "").lower()
-    if "html" not in ctype:
-        return "", "", f"not HTML ({ctype.split(';')[0].strip() or 'no content type'})"
-    if len(response.content) > _FALLBACK_MAX_BYTES:
-        return "", "", "page too large"
-    html = response.text
-    junk, why = looks_like_block_page(_html_title(html), _rough_word_count(html))
-    if junk:
-        return "", "", why
-    return html, str(response.url), ""
+    """_fetch_fallback_html on a worker thread."""
+    return await asyncio.to_thread(_fetch_fallback_html, url)
 
 
 async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,

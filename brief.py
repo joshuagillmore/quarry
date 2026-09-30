@@ -138,20 +138,24 @@ UNCITED_MIN_CHARS = 80
 _HEADING_RE = re.compile(r"#{1,6}\s")
 _ITEM_RE = re.compile(r"(?:[-*+]|\d{1,3}[.)])\s+")
 _FENCE_PREFIXES = ("```", "~~~")
+# An inline code span; linkify leaves a [n] inside <code> as text.
+_CODE_SPAN_RE = re.compile(r"`+[^`]*`+")
+# Opens the coverage-only brief synthesize_brief writes when the LLM fails.
+DEGRADED_BRIEF_NOTE = "Automated brief generation failed"
 
 
-def _brief_blocks(brief_md: str) -> list[tuple[str, str]]:
-    """(section heading, text) for each paragraph and each list item of a
-    Markdown brief, in order. Headings themselves and fenced code are not
-    blocks; a list item's continuation lines belong to the item."""
-    blocks: list[tuple[str, str]] = []
+def _brief_blocks(brief_md: str) -> list[tuple[str, str, bool]]:
+    """(section heading, text, is_heading) for each heading, paragraph and
+    list item of a Markdown brief, in order. Fenced code is not a block; a
+    list item's continuation lines belong to the item."""
+    blocks: list[tuple[str, str, bool]] = []
     section = ""
     current: list[str] = []
     in_fence = False
 
     def flush() -> None:
         if current:
-            blocks.append((section, " ".join(current)))
+            blocks.append((section, " ".join(current), False))
             current.clear()
 
     for raw in (brief_md or "").splitlines():
@@ -167,6 +171,7 @@ def _brief_blocks(brief_md: str) -> list[tuple[str, str]]:
         elif _HEADING_RE.match(line):
             flush()
             section = line.lstrip("#").strip()
+            blocks.append((section, section, True))
         elif _ITEM_RE.match(line):
             flush()
             current.append(_ITEM_RE.sub("", line, count=1))
@@ -186,12 +191,23 @@ def _is_coverage_section(heading: str) -> bool:
     return heading.lower().startswith("coverage")
 
 
+def _is_degraded_note(text: str) -> bool:
+    """The coverage-only brief's own failure line: a notice, not a claim."""
+    return text.lstrip("_* ").startswith(DEGRADED_BRIEF_NOTE)
+
+
+def _cited_text(text: str) -> str:
+    """The part of a block where a [n] is a citation: without inline code."""
+    return _CODE_SPAN_RE.sub(" ", text)
+
+
 def brief_warnings(mission: Mission, requirements: list[Requirement],
                    docs: list[Document], brief_md: str) -> list[dict]:
     """Quality checks on a written brief, as {"kind", "detail"} dicts:
 
     - "uncited_paragraph": a paragraph or list item of UNCITED_MIN_CHARS+
-      characters with no [n] (outside the Coverage & Gaps section);
+      characters with no [n] (outside the Coverage & Gaps section, and not
+      the degraded brief's failure line);
     - "junk_citation": a cited [n] whose source is a block/near-empty page
       (not is_usable), once per number;
     - "requirement_unmentioned": a requirement none of whose key terms (as
@@ -201,17 +217,22 @@ def brief_warnings(mission: Mission, requirements: list[Requirement],
     [n] is resolved with ordered_sources_for_mission(mission, docs), so pass
     the mission with the brief_sources_json the brief was numbered with. A
     number that is out of range or names a removed source (None slot) is
-    not a junk citation. Details carry brief/page text: render escaped."""
+    not a junk citation. As in linkify_citations, a [n] in fenced code or an
+    inline code span is not a citation. Details carry brief/page text:
+    render escaped."""
     warnings: list[dict] = []
+    blocks = _brief_blocks(brief_md)
 
-    for section, text in _brief_blocks(brief_md):
-        if (len(text) >= UNCITED_MIN_CHARS and not _CITE_RE.search(text)
-                and not _is_coverage_section(section)):
+    for section, text, is_heading in blocks:
+        if (not is_heading and len(text) >= UNCITED_MIN_CHARS
+                and not _CITE_RE.search(_cited_text(text))
+                and not _is_coverage_section(section) and not _is_degraded_note(text)):
             warnings.append({"kind": "uncited_paragraph", "detail": _excerpt(text)})
 
     slots = ordered_sources_for_mission(mission, docs)
     flagged: set[int] = set()
-    for m in _CITE_RE.finditer(brief_md or ""):
+    cites = (m for _s, text, _h in blocks for m in _CITE_RE.finditer(_cited_text(text)))
+    for m in cites:
         for n in (int(x) for x in m.group(1).split(",")):
             if n in flagged or not 1 <= n <= len(slots):
                 continue
@@ -270,7 +291,7 @@ def synthesize_brief(
         n_sat = sum(1 for r in requirements if r.status == "satisfied")
         lines = [
             f"## Summary",
-            f"_Automated brief generation failed ({type(e).__name__}); showing coverage only._",
+            f"_{DEGRADED_BRIEF_NOTE} ({type(e).__name__}); showing coverage only._",
             "",
             f"Collected {len(docs)} sources. Requirement coverage "
             f"{n_sat}/{len(requirements)} satisfied.",

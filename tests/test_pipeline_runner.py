@@ -89,7 +89,7 @@ def _crash_case(coro_fn):
 
 
 def test_crashed_thread_finishes_its_job():
-    async def boom(mission_id):
+    async def boom(mission_id, job_id=None):
         raise RuntimeError("kaput")
 
     jid, m = _crash_case(boom)
@@ -100,7 +100,7 @@ def test_crashed_thread_finishes_its_job():
 
 
 def test_base_exception_in_thread_still_finishes_its_job():
-    async def fatal(mission_id):
+    async def fatal(mission_id, job_id=None):
         raise _Fatal("interpreter going down")
 
     jid, m = _crash_case(fatal)
@@ -109,7 +109,7 @@ def test_base_exception_in_thread_still_finishes_its_job():
 
 
 def test_thread_that_returns_early_finishes_its_job():
-    async def quits(mission_id):
+    async def quits(mission_id, job_id=None):
         return None
 
     jid, _m = _crash_case(quits)
@@ -118,7 +118,7 @@ def test_thread_that_returns_early_finishes_its_job():
 
 
 def test_thread_leaves_a_properly_finished_job_alone():
-    async def gate(mission_id):
+    async def gate(mission_id, job_id=None):
         m = await storage.get_mission(mission_id)
         jobs.finish_job(m.job_id, stage="awaiting_approval")
 
@@ -590,7 +590,7 @@ def test_worker_finishes_its_own_job_not_the_missions_newer_one():
     newer = jobs.create_mission_job("Q", 10)
     asyncio.run(storage.insert_mission(_mission("m1", newer)))
 
-    async def quits(mission_id):
+    async def quits(mission_id, job_id=None):
         return None
 
     agent_runner._thread(quits, "m1", mine)
@@ -664,3 +664,52 @@ def test_token_budget_parsing(monkeypatch):
     assert agent_runner._token_budget({"max_llm_tokens": "250"}) == 250
     assert agent_runner._token_budget({"max_llm_tokens": "lots"}) == 700
     assert agent_runner._token_budget({"max_llm_tokens": -5}) == 0
+
+
+# ---------- one job per worker: the coroutine uses the job it was given ----------
+
+def test_thread_hands_the_given_job_to_the_coroutine():
+    _init()
+    seen = []
+
+    async def coro(mission_id, job_id=None):
+        seen.append(job_id)
+
+    agent_runner._thread(coro, "m1", "j-given")
+    agent_runner._thread(coro, "m1")
+    assert seen == ["j-given", None]
+
+
+def _run_given(monkeypatch, coro_fn, given, other):
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    asyncio.run(coro_fn("m1", given))
+    return jobs.get_job(given), jobs.get_job(other)
+
+
+def test_run_collection_uses_the_given_job(monkeypatch):
+    _init()
+    given, other = jobs.create_mission_job("Q", 5), jobs.create_mission_job("Q", 5)
+    _one_requirement(other, {"max_passes": 1, "max_sources": 5, "per_req_attempts": 1})
+    g, o = _run_given(monkeypatch, agent_runner._run_collection, given, other)
+    assert g.done and g.stage == "done" and g.log
+    assert not o.done and o.log == []
+
+
+def test_run_planning_uses_the_given_job(monkeypatch):
+    _init()
+    given, other = jobs.create_mission_job("Q", 5), jobs.create_mission_job("Q", 5)
+    asyncio.run(storage.insert_mission(_mission("m1", other, status="planning")))
+    monkeypatch.setattr(agent_runner, "build_collection_plan", lambda agent, mid, q: [
+        Requirement(id="r1", mission_id=mid, title="T", next_queries_json='["q"]')])
+    g, o = _run_given(monkeypatch, agent_runner._run_planning, given, other)
+    assert g.done and g.stage == "awaiting_approval"
+    assert not o.done and o.log == []
+
+
+def test_run_collection_falls_back_to_the_rows_job(monkeypatch):
+    _init()
+    row_job = jobs.create_mission_job("Q", 5)
+    _one_requirement(row_job, {"max_passes": 1, "max_sources": 5, "per_req_attempts": 1})
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert jobs.get_job(row_job).stage == "done"

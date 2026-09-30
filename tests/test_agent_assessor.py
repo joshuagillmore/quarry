@@ -144,15 +144,27 @@ def test_off_topic_sources_skip_the_llm(monkeypatch, capsys):
     a = agent_assessor.assess_requirement(
         _termed_req(), [_src(fit="A recipe for sourdough bread and pastry.")])
     assert a == agent_assessor.Assessment(
-        False, "low", "no collected source mentions the requirement's key terms", [])
+        False, "low", "no collected source mentions the requirement's key terms",
+        ["Lithium battery degradation What mechanisms shorten battery lifetime"])
     assert "skipped" in capsys.readouterr().err
 
 
 def test_no_sources_skip_the_llm(monkeypatch):
     _no_llm(monkeypatch)
     a = agent_assessor.assess_requirement(_termed_req(), [])
-    assert not a.satisfied and a.next_queries == []
+    assert not a.satisfied
     assert a.missing == "no collected source mentions the requirement's key terms"
+    assert a.next_queries == [
+        "Lithium battery degradation What mechanisms shorten battery lifetime"]
+
+
+def test_skip_requery_is_the_title_when_there_is_no_description(monkeypatch):
+    """The next pass searches the requirement itself rather than repeating
+    the queries that found nothing on topic."""
+    _no_llm(monkeypatch)
+    req = Requirement(id="r", mission_id="m", title="Lithium battery degradation")
+    assert agent_assessor.assess_requirement(req, []).next_queries == [
+        "Lithium battery degradation"]
 
 
 def test_a_matching_term_calls_the_llm(monkeypatch):

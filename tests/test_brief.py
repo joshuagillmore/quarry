@@ -288,3 +288,38 @@ def test_requirement_the_brief_never_mentions_is_flagged():
             Requirement(id="rx", mission_id="m", title="GDP up?")]  # no key terms
     w = brief.brief_warnings(_mission(), reqs, [], "Battery lifetimes [1].")
     assert w == [{"kind": "requirement_unmentioned", "detail": "Sodium supply chains"}]
+
+
+def test_citation_inside_inline_code_does_not_count():
+    """linkify leaves [n] in <code> as text, so it is not a citation."""
+    md = _LONG_UNCITED + " `see [1]`\n"
+    w = brief.brief_warnings(_mission(), [_battery_req()], [_sdoc("a", 500)], md)
+    assert _kinds(w) == ["uncited_paragraph"]
+
+
+def test_citations_in_code_are_not_junk_citations():
+    docs = [_sdoc("junk", 5), _sdoc("good", 500)]   # numbered good=[1], junk=[2]
+    md = "Battery [1] and `x[2]`.\n\n```\narr[2] = 1\n```\n"
+    assert brief.brief_warnings(_mission(), [_battery_req()], docs, md) == []
+
+
+def test_junk_citation_in_a_heading_is_still_flagged():
+    """linkify turns a heading's [n] into a control too."""
+    docs = [_sdoc("junk", 5), _sdoc("good", 500)]
+    md = "## Battery findings [2]\nShort text [1].\n"
+    assert _kinds(brief.brief_warnings(_mission(), [_battery_req()], docs, md)) == [
+        "junk_citation"]
+
+
+def test_degraded_brief_is_not_flagged_for_its_own_failure_line(monkeypatch):
+    class ServiceUnavailableErrorFromTheProvider(RuntimeError):
+        pass
+
+    def boom(*a, **k):
+        raise ServiceUnavailableErrorFromTheProvider("down")
+
+    monkeypatch.setattr(brief, "chat", boom)
+    reqs, docs = [_battery_req()], [_sdoc("a", 500)]
+    out = brief.synthesize_brief(_mission(), reqs, docs, set())
+    assert "Automated brief generation failed" in out
+    assert brief.brief_warnings(_mission(), reqs, docs, out) == []

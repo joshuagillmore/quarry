@@ -76,11 +76,12 @@ def _thread(coro_fn, mission_id: str, job_id: str | None = None) -> None:
     on a path that returns without finishing it — so a dead worker never
     holds one of the job store's MAX_ACTIVE_JOBS slots.
 
-    With `job_id`, that job is the one finished, whatever the mission row
-    says by then: the row may be gone (the mission was deleted, so there is
-    nothing to look the job up from) or may already point at a newer job
-    that another worker owns (a retask), which must not be ended here.
-    Without it, the job is looked up from the mission row."""
+    With `job_id`, that job is the one the coroutine reports to and the one
+    finished, whatever the mission row says by then: the row may be gone
+    (the mission was deleted, so there is nothing to look the job up from)
+    or may already point at a newer job that another worker owns (a
+    retask), which must not be touched here. Without it, both look the job
+    up from the mission row."""
     given = job_id
     # Read up front as well as at the end: if the crash was the database
     # going away, the lookup in `finally` fails too.
@@ -88,7 +89,7 @@ def _thread(coro_fn, mission_id: str, job_id: str | None = None) -> None:
         job_id = _mission_job_id(mission_id)
     failure = None
     try:
-        asyncio.run(coro_fn(mission_id))
+        asyncio.run(coro_fn(mission_id, given))
     except BaseException as e:  # noqa: BLE001 - the slot must be released
         traceback.print_exc()
         failure = str(e) or type(e).__name__
@@ -109,12 +110,13 @@ def _thread(coro_fn, mission_id: str, job_id: str | None = None) -> None:
 
 # --- Stage 1: planning ---
 
-async def _run_planning(mission_id: str) -> None:
+async def _run_planning(mission_id: str, job_id: str | None = None) -> None:
+    """Plan; `job_id` is the job to report to (else the mission row's)."""
     mission = await get_mission(mission_id)
     if not mission:
         return
     agent = await get_agent(mission.agent_id)
-    job_id = mission.job_id
+    job_id = job_id or mission.job_id
 
     await update_mission(mission_id, status="planning", started_at=_now())
     if job_id:
@@ -151,7 +153,7 @@ async def _run_planning(mission_id: str) -> None:
             jobs.add_log(job_id, "ok",
                          f"plan ready: <em>{len(requirements)}</em> requirements "
                          f"— auto-approved (scheduled run)")
-        await _run_collection(mission_id)
+        await _run_collection(mission_id, job_id)
         return
 
     await update_mission(
@@ -203,12 +205,14 @@ async def _stop_reason(mission_id: str, job_id, token_budget: int,
     return None
 
 
-async def _run_collection(mission_id: str) -> None:
+async def _run_collection(mission_id: str, job_id: str | None = None) -> None:
+    """Collect, then brief; `job_id` is the job to report to (else the
+    mission row's)."""
     mission = await get_mission(mission_id)
     if not mission:
         return
     agent = await get_agent(mission.agent_id)
-    job_id = mission.job_id
+    job_id = job_id or mission.job_id
     budget = json.loads(mission.budget_json or "{}")
     max_passes = int(budget.get("max_passes", agent.default_max_passes if agent else 4))
     max_sources = int(budget.get("max_sources", agent.default_max_sources if agent else 30))

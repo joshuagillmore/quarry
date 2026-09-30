@@ -56,6 +56,7 @@ _STOPWORDS = frozenset({
 _TERM_RE = re.compile(r"[^\W\d_]{5,}")
 
 NO_TERM_OVERLAP = "no collected source mentions the requirement's key terms"
+_CLAUSE_END_RE = re.compile(r"[.;:?!\n]")
 
 
 def key_terms(requirement: Requirement) -> set[str]:
@@ -65,6 +66,17 @@ def key_terms(requirement: Requirement) -> set[str]:
     judged from it."""
     text = f"{requirement.title or ''} {requirement.description or ''}".lower()
     return set(_TERM_RE.findall(text)) - _STOPWORDS
+
+
+def _requery(requirement: Requirement) -> list[str]:
+    """A fresh query for a requirement nothing on-topic was found for: its
+    title plus the first clause of its description (when that adds
+    anything), so the next pass does not repeat the queries that missed."""
+    title = (requirement.title or "").strip()
+    clause = _CLAUSE_END_RE.split(requirement.description or "", maxsplit=1)[0].strip()
+    query = f"{title} {clause}" if clause and clause.lower() not in title.lower() else title
+    query = query[:200].strip()
+    return [query] if query else []
 
 
 def _mentions_any(docs: list[Document], terms: set[str]) -> bool:
@@ -82,7 +94,8 @@ def assess_requirement(requirement: Requirement, docs: list[Document],
 
     When the requirement has key terms and no collected source mentions any
     of them (or nothing was collected), the answer is already known: not
-    satisfied, with no LLM call. A requirement without key terms is always
+    satisfied, with no LLM call, re-tasked with a query built from the
+    requirement itself (_requery). A requirement without key terms is always
     sent to the LLM. `search_note` summarises this pass's searches for the
     prompt."""
     terms = key_terms(requirement)
@@ -90,7 +103,7 @@ def assess_requirement(requirement: Requirement, docs: list[Document],
         print(f"[ASSESS] skipped LLM for {requirement.title!r}: none of "
               f"{len(docs)} source(s) mentions its key terms",
               file=sys.stderr, flush=True)
-        return Assessment(False, "low", NO_TERM_OVERLAP, [])
+        return Assessment(False, "low", NO_TERM_OVERLAP, _requery(requirement))
 
     prompt = build_assess_prompt(requirement.title, requirement.description,
                                  _sources_block(docs), search_note=search_note)
