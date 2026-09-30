@@ -67,7 +67,9 @@ def ordered_sources_for_mission(mission: Mission, docs: list[Document]) -> list[
     return out
 
 
-_CITE_RE = re.compile(r"\[(\d{1,3})\]")
+# One marker or a comma-separated group: models write both "[2]" and
+# "[2,14]" / "[2, 6, 10]"; each number becomes its own control.
+_CITE_RE = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]")
 # A whole tag, quote-aware: a `>` inside a quoted attribute value does not end
 # it. The alternatives are disjoint on their first character, so no
 # backtracking blow-up.
@@ -89,12 +91,17 @@ def linkify_citations(html: str, max_n: int) -> str:
     escapes `<` in text but leaves `>` raw inside attribute values
     (title="a > [1]"), so tags are matched quote-aware rather than ending at
     the first `>`."""
-    def repl(m: "re.Match[str]") -> str:
-        n = int(m.group(1))
-        if not 1 <= n <= max_n:
-            return m.group(0)
+    def button(n: int) -> str:
         return (f'<button type="button" class="cite" data-cite="{n}" '
                 f'aria-label="Source {n}">{n}</button>')
+
+    def repl(m: "re.Match[str]") -> str:
+        nums = [int(x) for x in m.group(1).split(",")]
+        if not any(1 <= n <= max_n for n in nums):
+            return m.group(0)
+        # In-range numbers become controls; out-of-range ones stay as digits
+        # so a partly-valid group is never silently dropped.
+        return ", ".join(button(n) if 1 <= n <= max_n else str(n) for n in nums)
 
     parts = _TAG_SPLIT_RE.split(html or "")
     literal_depth = 0

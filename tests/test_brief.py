@@ -183,3 +183,16 @@ def test_linkify_quote_aware_on_raw_html():
     assert 'title="see > [1] here"' in out
     assert "title='q > [1]'" in out
     assert out.count('class="cite"') == 1 and 'data-cite="2"' in out
+
+
+def test_linkify_grouped_citations_become_one_button_each():
+    from brief import linkify_citations
+    out = linkify_citations("<p>Seen by ADRAS-J [2,14] and [2, 6, 10].</p>", 20)
+    assert out.count("<button") == 5
+    assert 'data-cite="2"' in out and 'data-cite="14"' in out and 'data-cite="10"' in out
+    assert "[" not in out and "]" not in out
+    # A partly out-of-range group keeps the valid controls and the bad digits.
+    out = linkify_citations("<p>x [2,999]</p>", 5)
+    assert out.count("<button") == 1 and "999" in out
+    # A wholly out-of-range group is left untouched, like a single bad marker.
+    assert linkify_citations("<p>[7,8]</p>", 5) == "<p>[7,8]</p>"
