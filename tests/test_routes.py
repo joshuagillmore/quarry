@@ -2,14 +2,16 @@
 input bounds, the mission state machine's compare-and-set transitions, SSE,
 crawl cancellation, Library pagination and form re-rendering.
 
-Task-2 pipeline names (jobs.finish_job, brief.ordered_sources_for_mission,
-scheduler.launch_scheduled_mission) are monkeypatched with raising=False where
-a test depends on them, so this file is self-sufficient either way.
+The pipeline pieces the routes call (jobs.finish_job,
+brief.ordered_sources_for_mission, scheduler.launch_scheduled_mission) run for
+real; only the worker-thread launchers (start_collection, start_planning) are
+replaced, so nothing outlives a test and writes into the next test's DB.
 """
 import asyncio
 import json
 import re
 import threading
+import warnings
 from urllib.parse import urlsplit
 
 import flask
@@ -56,17 +58,8 @@ def _login(client):
     assert r.status_code == 302
 
 
-@pytest.fixture()
-def finished(monkeypatch):
-    """Stand-in for jobs.finish_job that records its calls."""
-    calls = []
-
-    def fake_finish(job_id, stage="done", error=None):
-        calls.append((job_id, stage))
-        jobs.update_job(job_id, stage=stage, done=True)
-
-    monkeypatch.setattr(jobs, "finish_job", fake_finish, raising=False)
-    return calls
+def _live_jobs():
+    return [j for j in jobs._store.values() if not j.done]
 
 
 @pytest.fixture()
@@ -222,6 +215,29 @@ def test_initialize_is_idempotent_and_locked(app_mod, monkeypatch):
     app_mod.initialize()
     assert calls == [1]
     assert app_mod.app._db_initialized is True
+
+
+def test_run_async_is_warning_free_with_or_without_a_running_loop(app_mod):
+    async def answer():
+        return 42
+
+    async def from_inside_a_loop():
+        return app_mod.run_async(answer())
+
+    # A fresh policy: get_event_loop() warns only on the first loop-less call
+    # per policy, and an earlier test in the process may have spent that.
+    asyncio.set_event_loop_policy(None)
+    results = []
+    with warnings.catch_warnings():
+        # The old get_event_loop() path warned here ("There is no current
+        # event loop"); the suite output must stay warning-free.
+        warnings.simplefilter("error")
+        results.append(app_mod.run_async(answer()))          # no loop (main thread)
+        results.append(asyncio.run(from_inside_a_loop()))     # a loop is running
+        t = threading.Thread(target=lambda: results.append(app_mod.run_async(answer())))
+        t.start()
+        t.join()                                               # a request thread
+    assert results == [42, 42, 42]
 
 
 def test_first_request_runs_initialize(app_mod, monkeypatch):
@@ -425,7 +441,7 @@ def test_retask_when_busy_leaves_the_requirement_alone(client, app_mod, starts, 
     assert any(m.startswith("Busy") for m in _flashes(client))
 
 
-def test_retask_lost_race_releases_its_job(client, app_mod, starts, finished, monkeypatch):
+def test_retask_lost_race_releases_its_job(client, app_mod, starts, monkeypatch):
     _seed_mission(status="done")
     _run(storage.update_requirement("r0", status="unmet", attempts=3))
 
@@ -437,8 +453,10 @@ def test_retask_lost_race_releases_its_job(client, app_mod, starts, finished, mo
     req = _reqs()["r0"]
     assert (req.status, req.attempts) == ("unmet", 3)
     assert starts == []
-    assert len(finished) == 1 and finished[0][1] == "cancelled"
-    assert not any(not j.done for j in jobs._store.values())
+    # The job it minted first was finished for real, so it holds no slot.
+    [job] = jobs._store.values()
+    assert job.done and job.stage == "cancelled" and job.finished_at
+    assert _live_jobs() == []
 
 
 def test_retask_refused_while_running_or_at_the_gate(client, starts):
@@ -453,78 +471,94 @@ def test_retask_refused_while_running_or_at_the_gate(client, starts):
 
 # --- delete -------------------------------------------------------------
 
-def test_delete_at_the_gate_releases_a_live_job(client, finished):
+def test_delete_at_the_gate_releases_a_live_job(client):
     jid = jobs.create_mission_job("Where is it?", 7)
     _seed_mission(job_id=jid)
     r = client.post("/missions/m1/delete")
     assert _path(r) == "/missions"
     assert _mission() is None
-    assert finished == [(jid, "cancelled")]
+    job = jobs.get_job(jid)
+    assert job.done and job.stage == "cancelled" and job.finished_at
+    assert _live_jobs() == []
 
 
-def test_delete_refused_while_running(client, finished):
+def test_delete_refused_while_running(client):
     jid = jobs.create_mission_job("Where is it?", 7)
     _seed_mission(status="collecting", job_id=jid)
     r = client.post("/missions/m1/delete")
     assert _path(r) == "/missions/m1"
     assert _mission() is not None
-    assert finished == []
+    assert not jobs.get_job(jid).done
 
 
-def test_delete_finished_mission_leaves_done_job_alone(client, finished):
+def test_delete_finished_mission_leaves_done_job_alone(client):
     jid = jobs.create_mission_job("Where is it?", 7)
-    jobs.update_job(jid, done=True, stage="done")
+    jobs.finish_job(jid, stage="done")
+    stamped = jobs.get_job(jid).finished_at
     _seed_mission(status="done", job_id=jid)
     client.post("/missions/m1/delete")
     assert _mission() is None
-    assert finished == []
+    job = jobs.get_job(jid)
+    assert (job.stage, job.finished_at) == ("done", stamped)
 
 
 # --- run the scheduled question now -------------------------------------
 
-def test_run_scheduled_redirects_to_the_new_mission(client, monkeypatch):
-    import scheduler
+@pytest.fixture()
+def plannings(monkeypatch):
+    """The real scheduler.launch_scheduled_mission runs; only the planning
+    worker thread it would start is replaced."""
+    import agent_runner
+    calls = []
+    monkeypatch.setattr(agent_runner, "start_planning", lambda mid: calls.append(mid))
+    return calls
+
+
+def test_run_scheduled_redirects_to_the_new_mission(client, plannings):
     _seed_agent(schedule_question="What changed overnight?", schedule_cron="0 7 * * *")
-    monkeypatch.setattr(scheduler, "launch_scheduled_mission", lambda aid: "m-new",
-                        raising=False)
     r = client.post("/agents/a1/run-scheduled")
-    assert _path(r) == "/missions/m-new"
+    [mission] = _run(storage.list_missions())
+    assert _path(r) == f"/missions/{mission.id}"
+    assert mission.question == "What changed overnight?"
+    assert json.loads(mission.budget_json)["auto_approve"] is True
+    assert plannings == [mission.id]
 
 
-def test_run_scheduled_when_busy(client, monkeypatch):
-    import scheduler
+def test_run_scheduled_when_busy(client, plannings):
     _seed_agent(schedule_question="What changed overnight?")
-
-    def full(_aid):
-        raise jobs.JobLimitReached("6 jobs already running")
-
-    monkeypatch.setattr(scheduler, "launch_scheduled_mission", full, raising=False)
+    for _ in range(jobs.MAX_ACTIVE_JOBS):
+        jobs.create_job("filler", 5, False, "")
     r = client.post("/agents/a1/run-scheduled")
     assert _path(r) == "/agents"
     assert any(m.startswith("Busy") for m in _flashes(client))
+    assert _run(storage.list_missions()) == []
+    assert plannings == []
 
 
-def test_run_scheduled_explains_why_nothing_started(client, monkeypatch):
-    import scheduler
+def test_run_scheduled_explains_an_active_mission(client, plannings):
     _seed_agent(schedule_question="What changed overnight?")
     _run(storage.insert_mission(Mission(id="m-live", agent_id="a1", question="Q",
                                         status="collecting", created_at="t")))
-    monkeypatch.setattr(scheduler, "launch_scheduled_mission", lambda aid: None,
-                        raising=False)
     r = client.post("/agents/a1/run-scheduled")
     assert _path(r) == "/agents"
-    assert any("already" in m for m in _flashes(client))
+    assert any("already has a mission running" in m for m in _flashes(client))
+    assert plannings == []
 
 
-def test_run_scheduled_needs_a_question(client, monkeypatch):
-    import scheduler
+def test_run_scheduled_explains_an_inactive_agent(client, plannings):
+    _seed_agent(schedule_question="What changed overnight?", active=0)
+    r = client.post("/agents/a1/run-scheduled")
+    assert _path(r) == "/agents"
+    assert any("inactive" in m for m in _flashes(client))
+    assert plannings == []
+
+
+def test_run_scheduled_needs_a_question(client, plannings):
     _seed_agent()
-    called = []
-    monkeypatch.setattr(scheduler, "launch_scheduled_mission",
-                        lambda aid: called.append(aid), raising=False)
     r = client.post("/agents/a1/run-scheduled")
     assert _path(r) == "/agents/a1/edit"
-    assert called == []
+    assert _run(storage.list_missions()) == []
+    assert plannings == []
 
 
 # --- SSE ----------------------------------------------------------------
@@ -755,43 +789,55 @@ def test_agent_edit_validation_rerenders_with_values(client):
 
 # --- mission page -------------------------------------------------------
 
-def _seed_briefed_mission(with_agent=True):
+def _seed_briefed_mission(with_agent=True, n_docs=2, stored_order=None,
+                          brief_md="See [1] and [2]."):
     _seed_mission(status="done", with_agent=with_agent)
 
     async def go():
-        for i in (1, 2):
+        for i in range(1, n_docs + 1):
             doc_id = await storage.upsert_document(Document(
-                id=f"doc{i}", url=f"https://s{i}.example/", domain=f"s{i}.example",
+                id=f"doc{i:02d}", url=f"https://s{i}.example/", domain=f"s{i}.example",
                 title=f"Source {i}", search_query="Where is it?",
-                crawled_at=f"2026-01-01T00:00:0{i}", content_markdown="body text " * 50,
-                word_count=100))
+                crawled_at=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+                content_markdown="An ordinary sentence about the topic. " * 60,
+                word_count=360))
             await storage.link_mission_document("m1", "r0", doc_id)
-        await storage.update_mission("m1", brief_markdown="See [1] and [2].",
-                                     finished_at="2026-01-01T01:00:00")
+        fields = dict(brief_markdown=brief_md, finished_at="2026-01-01T01:00:00")
+        if stored_order is not None:
+            fields["brief_sources_json"] = json.dumps(stored_order)
+        await storage.update_mission("m1", **fields)
     _run(go())
 
 
-def test_mission_page_numbers_sources_by_the_stored_order(client, monkeypatch):
-    import brief
-    _seed_briefed_mission()
-    calls = []
+def _rail(html):
+    return re.findall(r'data-src="(\d+)" href="/document/(doc\d+)"', html)
 
-    def fake_order(mission, docs):
-        calls.append(mission.id)
-        return sorted(docs, key=lambda d: d.id, reverse=True)
 
-    monkeypatch.setattr(brief, "ordered_sources_for_mission", fake_order, raising=False)
+def test_mission_page_numbers_sources_by_the_stored_order(client):
+    _seed_briefed_mission(stored_order=["doc02", "doc01"])
     html = client.get("/missions/m1").get_data(as_text=True)
-    assert calls == ["m1"]
-    rail = re.findall(r'data-src="(\d+)" href="/document/(doc\d)"', html)
-    assert rail == [("1", "doc2"), ("2", "doc1")]
+    assert _rail(html) == [("1", "doc02"), ("2", "doc01")]
     assert 'class="cite" data-cite="1"' in html
+    assert 'class="cite" data-cite="2"' in html
 
 
-def test_mission_page_rerun_needs_the_agent(client, monkeypatch):
+def test_mission_rail_is_capped_like_the_brief(client, app_mod):
     import brief
-    monkeypatch.setattr(brief, "ordered_sources_for_mission",
-                        lambda m, docs: list(docs), raising=False)
+    cited = ["doc25", "doc24", "doc23"]
+    _seed_briefed_mission(n_docs=25, stored_order=cited,
+                          brief_md="See [1], [3] and [21].")
+    html = client.get("/missions/m1").get_data(as_text=True)
+    rail = _rail(html)
+    # Every uncited doc is appended after the stored order, but numbering
+    # stops where a brief's citations can reach.
+    assert len(rail) == brief.MAX_BRIEF_SOURCES
+    assert [d for _n, d in rail[:3]] == cited
+    assert [n for n, _d in rail] == [str(i) for i in range(1, brief.MAX_BRIEF_SOURCES + 1)]
+    assert 'data-cite="3"' in html
+    assert 'data-cite="21"' not in html and "[21]" in html
+
+
+def test_mission_page_rerun_needs_the_agent(client):
     _seed_briefed_mission(with_agent=False)
     html = client.get("/missions/m1").get_data(as_text=True)
     assert "/agents/a1/run" not in html
@@ -801,10 +847,7 @@ def test_mission_page_rerun_needs_the_agent(client, monkeypatch):
     assert 'action="/agents/a1/run"' in html
 
 
-def test_gate_offers_discard(client, monkeypatch):
-    import brief
-    monkeypatch.setattr(brief, "ordered_sources_for_mission",
-                        lambda m, docs: list(docs), raising=False)
+def test_gate_offers_discard(client):
     _seed_mission()
     html = client.get("/missions/m1").get_data(as_text=True)
     assert 'id="discardForm"' in html

@@ -169,16 +169,20 @@ def inject_globals():
 
 
 def run_async(coro):
+    """Run a coroutine to completion from sync code (routes, startup).
+
+    Routes run on plain threads with no event loop, so this is normally just
+    asyncio.run. If a loop is already running on this thread (a caller that
+    is itself async), asyncio.run would refuse, so run the coroutine on a
+    fresh loop in a worker thread instead. get_running_loop, unlike
+    get_event_loop, never warns or implicitly creates a loop."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, coro).result()
-        else:
-            return loop.run_until_complete(coro)
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 @app.url_defaults
@@ -912,8 +916,11 @@ def mission_view(mission_id):
 
     # Number the sources exactly as brief.py numbered them for the LLM (the
     # order stored with the brief when there is one), so the [n] markers in
-    # the brief bind to the right rail entry.
-    numbered = list(enumerate(brief.ordered_sources_for_mission(mission, documents), 1))
+    # the brief bind to the right rail entry. Capped like the brief itself:
+    # with a stored order, ordered_sources_for_mission appends every uncited
+    # document too, and numbering must not run past what a brief can cite.
+    ordered = brief.ordered_sources_for_mission(mission, documents)
+    numbered = list(enumerate(ordered[:brief.MAX_BRIEF_SOURCES], 1))
     doc_number = {d.id: n for n, d in numbered}
 
     # Sanitize first (never bypassed), then turn [n] into citation controls.
