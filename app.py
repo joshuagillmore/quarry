@@ -45,7 +45,7 @@ from jobs import (
     get_sidebar_jobs, get_in_memory_job_ids, create_mission_job,
     request_cancel, JobLimitReached,
 )
-from agent_runner import start_planning, start_collection
+from agent_runner import start_planning, start_collection, _token_budget
 from brief import linkify_citations
 from scheduler import (start_scheduler, sync_agent_jobs, validate_cron,
                        describe_next_run, scheduled_jobs)
@@ -1336,14 +1336,16 @@ def mission_approve(mission_id):
 
 @app.route("/missions/<mission_id>/stop", methods=["POST"])
 def mission_stop(mission_id):
-    """Cooperative stop: the runner finishes the current pass, then synthesizes
-    a brief from whatever was collected."""
+    """Cooperative stop, honoured before the next requirement: the runner
+    finishes the requirement in flight, marks the rest unmet (one never
+    tried says "not attempted: stopped by user"), then synthesizes a brief
+    from whatever was collected."""
     mission = run_async(get_mission(mission_id))
     if not mission:
         flash("Mission not found.", "error")
         return redirect(url_for("missions_list"))
     if mission.job_id and request_cancel(mission.job_id):
-        flash("Stopping after the current pass — the brief will still be written.", "info")
+        flash("Stopping after the current requirement — the brief will still be written.", "info")
     else:
         flash("This mission is not running.", "info")
     return redirect(url_for("mission_view", mission_id=mission_id))
@@ -1389,6 +1391,17 @@ def requirement_retask(mission_id, req_id):
     if mission.status == "awaiting_approval":
         flash("Approve the plan first — re-tasking is for a mission that has finished.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
+    # A mission that has spent its token budget cannot collect again (the
+    # runner stops before the first requirement), yet a retask would still
+    # re-extract and re-write the brief: refuse it before anything changes.
+    token_budget = _token_budget(_mission_budget(mission))
+    if token_budget > 0:
+        usage = run_async(get_mission_llm_usage(mission_id))
+        used = usage["prompt_tokens"] + usage["completion_tokens"]
+        if used >= token_budget:
+            flash(f"This mission has used {used:,} of {token_budget:,} tokens; "
+                  "raise the budget before re-tasking.", "error")
+            return redirect(url_for("mission_view", mission_id=mission_id))
 
     req = next((r for r in run_async(get_requirements_for_mission(mission_id))
                 if r.id == req_id), None)

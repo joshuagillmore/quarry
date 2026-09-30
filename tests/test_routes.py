@@ -576,6 +576,55 @@ def test_retask_refused_while_running_or_at_the_gate(client, starts):
     assert not jobs._store
 
 
+def _spend_tokens(mission_id, prompt, completion=0):
+    from models import LlmCall
+    _run(storage.insert_llm_call(LlmCall(
+        purpose="assess", tier="reasoning", model="m", mission_id=mission_id,
+        prompt_tokens=prompt, completion_tokens=completion)))
+
+
+def _budget_mission(max_llm_tokens=None):
+    _seed_mission(status="done")
+    budget = {"max_sources": 7}
+    if max_llm_tokens is not None:
+        budget["max_llm_tokens"] = max_llm_tokens
+    _run(storage.update_mission("m1", budget_json=json.dumps(budget)))
+    _run(storage.update_requirement("r0", status="unmet", attempts=3,
+                                    assessment_missing="not attempted: token budget reached"))
+
+
+@pytest.mark.parametrize("own_budget, setting", [(1203, 0), (None, 1203)],
+                         ids=["mission-budget", "setting-default"])
+def test_retask_refused_once_the_token_budget_is_spent(client, starts, monkeypatch,
+                                                       own_budget, setting):
+    """A budget-stopped mission is over budget by definition: a retask could
+    not collect and would still re-extract and re-write the brief. It is
+    refused with nothing changed, not even a job created."""
+    monkeypatch.setattr(config.settings, "max_llm_tokens", setting)
+    _budget_mission(own_budget)
+    _spend_tokens("m1", 1200, 3)   # exactly the budget: nothing is left to spend
+    r = client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert _path(r) == "/missions/m1"
+    req = _reqs()["r0"]
+    assert (req.status, req.attempts) == ("unmet", 3)
+    assert req.assessment_missing == "not attempted: token budget reached"
+    assert json.loads(req.next_queries_json) == ["q0"]
+    assert _mission().status == "done"
+    assert starts == [] and not jobs._store
+    assert _flashes(client) == [
+        "This mission has used 1,203 of 1,203 tokens; raise the budget before re-tasking."]
+
+
+@pytest.mark.parametrize("own_budget, used", [(100, 99), (0, 10 ** 6)],
+                         ids=["under-budget", "unlimited"])
+def test_retask_allowed_while_the_token_budget_has_room(client, starts, own_budget, used):
+    _budget_mission(own_budget)
+    _spend_tokens("m1", used)
+    client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert _reqs()["r0"].status == "pending"
+    assert _mission().status == "collecting" and len(starts) == 1
+
+
 # --- delete -------------------------------------------------------------
 
 def test_delete_at_the_gate_releases_a_live_job(client):
@@ -778,6 +827,24 @@ def test_api_mission_trace_carries_log_total(client):
     assert trace["log_total"] == 230
     assert len(trace["log"]) == 200
     assert trace["log"][0]["msg"] == "line 30"
+
+
+# --- mission stop -------------------------------------------------------
+
+def test_mission_stop_says_it_lands_after_the_current_requirement(client):
+    """The runner honours a stop before the next requirement, not at the
+    next pass, and the page and flash say so."""
+    jid = jobs.create_mission_job("Where is it?", 7)
+    _seed_mission(status="collecting", job_id=jid)
+    page = client.get("/missions/m1").get_data(as_text=True)
+    assert "Stop after the current requirement" in page
+    assert "stopping after the current requirement" in page   # the live meta line
+    assert "after this pass" not in page
+    r = client.post("/missions/m1/stop")
+    assert _path(r) == "/missions/m1"
+    assert jobs.is_cancelled(jid)
+    assert _flashes(client) == [
+        "Stopping after the current requirement — the brief will still be written."]
 
 
 # --- crawl cancel -------------------------------------------------------

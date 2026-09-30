@@ -315,9 +315,15 @@ async def _run_collection(mission_id: str, job_id: str | None = None) -> None:
             await update_requirement(r.id, **fields)
 
     # Optional LLM extraction over the collected sources (applies regardless of
-    # how they were gathered).
+    # how they were gathered). Not once the token budget stopped collection:
+    # extraction costs one LLM call per source. The brief, a single call,
+    # still runs so the mission ends with a write-up of what was collected.
     if budget.get("extract"):
-        await _extract_sources(mission_id, budget.get("extract_prompt", ""), job_id)
+        if stop_reason == TOKEN_BUDGET_REACHED:
+            if job_id:
+                jobs.add_log(job_id, "warn", f"skipping extraction: {TOKEN_BUDGET_REACHED}")
+        else:
+            await _extract_sources(mission_id, budget.get("extract_prompt", ""), job_id)
 
     await _synthesize(mission_id, agent, job_id)
 

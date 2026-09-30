@@ -337,6 +337,48 @@ def test_fallback_rescues_a_failed_page(monkeypatch):
     assert resp.closed, "the stream is always closed"
 
 
+def test_fallback_conversion_uses_its_own_browserless_config(monkeypatch):
+    """crawl4ai 0.9.2 routes a raw: URL through the browser whenever its
+    config asks for browser work (simulate_user, remove_overlay_elements,
+    ...), so reusing the stealth crawl's config would re-render every
+    rescued page in headless Chromium. The conversion gets its own config
+    with none of those set, and the final URL as its base."""
+    class _Cfg:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    start, final = "http://f.example/1", "http://f.example/landed"
+
+    async def page():
+        return _failed(start)
+
+    seen = []   # (url, config) of every arun call, in order
+
+    class Recording(_raw_aware_crawler({start: page}, [])):
+        async def arun(self, url, config=None):
+            seen.append((url, config))
+            return await super().arun(url, config)
+
+    monkeypatch.setattr(crawler, "CrawlerRunConfig", _Cfg)
+    monkeypatch.setattr(crawler.httpx, "stream", lambda m, u, **k: _Stream(url=final))
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", Recording)
+    jid = _job([start])
+    docs = asyncio.run(crawler.crawl_urls_with_progress(_srs([start]), "q", jid))
+
+    assert [d.url for d in docs] == [final]
+    [(browser_url, run_cfg), (raw_url, convert_cfg)] = seen
+    assert browser_url == start and raw_url.startswith("raw:")
+    assert run_cfg.kw["simulate_user"] is True, "the browser crawl keeps its stealth options"
+    assert convert_cfg is not run_cfg
+    assert "simulate_user" not in convert_cfg.kw
+    assert "remove_overlay_elements" not in convert_cfg.kw
+    browser_work = {"override_navigator", "user_agent_mode", "js_code", "wait_for", "magic",
+                    "scan_full_page", "process_iframes", "screenshot", "pdf",
+                    "process_in_browser", "remove_consent_popups", "page_timeout"}
+    assert not browser_work & set(convert_cfg.kw)
+    assert convert_cfg.kw["base_url"] == final
+
+
 def test_fallback_rescues_a_block_page(monkeypatch):
     blocked = _Result("http://f.example/1", title="Just a moment...", words=20)
     docs, job, _calls, _raw = _fallback_case(monkeypatch, blocked, _Stream())

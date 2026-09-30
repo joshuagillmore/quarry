@@ -40,6 +40,19 @@ def _sources_block(docs: list[Document], max_docs: int = MAX_BRIEF_SOURCES,
     return "\n\n".join(lines)
 
 
+def _stored_order(mission: Mission | None) -> list | None:
+    """The order the mission's brief was numbered with (brief_sources_json),
+    or None when there is none or it is unusable (not JSON, not a list)."""
+    raw = getattr(mission, "brief_sources_json", None) if mission else None
+    if not raw:
+        return None
+    try:
+        stored = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return stored if isinstance(stored, list) else None
+
+
 def ordered_sources_for_mission(mission: Mission,
                                 docs: list[Document]) -> list[Document | None]:
     """The source-rail ordering for a mission's page. When the mission stored
@@ -57,14 +70,8 @@ def ordered_sources_for_mission(mission: Mission,
     position, counting only up to the last non-None slot, never by the
     count of non-None slots, or a document after a removed one would lose
     its link."""
-    stored = None
-    raw = getattr(mission, "brief_sources_json", None) if mission else None
-    if raw:
-        try:
-            stored = json.loads(raw)
-        except (TypeError, ValueError):
-            stored = None
-    if not isinstance(stored, list):
+    stored = _stored_order(mission)
+    if stored is None:
         return ordered_sources(docs)
 
     by_id = {d.id: d for d in docs}
@@ -211,15 +218,18 @@ def brief_warnings(mission: Mission, requirements: list[Requirement],
     - "junk_citation": a cited [n] whose source is a block/near-empty page
       (not is_usable), once per number;
     - "requirement_unmentioned": a requirement none of whose key terms (as
-      the assessor computes them) appears in the brief; a requirement with
-      no key terms is never flagged.
+      the assessor computes them) appears in the brief outside its Coverage
+      & Gaps section (which restates every requirement by design) and
+      fenced code; a requirement with no key terms is never flagged, and a
+      degraded (coverage-only) brief is not checked for this at all.
 
     [n] is resolved with ordered_sources_for_mission(mission, docs), so pass
     the mission with the brief_sources_json the brief was numbered with. A
-    number that is out of range or names a removed source (None slot) is
-    not a junk citation. As in linkify_citations, a [n] in fenced code or an
-    inline code span is not a citation. Details carry brief/page text:
-    render escaped."""
+    number past the slots the brief could cite (the stored order, when there
+    is one: documents appended after it had no number when the brief was
+    written) or naming a removed source (None slot) is not a junk citation.
+    As in linkify_citations, a [n] in fenced code or an inline code span is
+    not a citation. Details carry brief/page text: render escaped."""
     warnings: list[dict] = []
     blocks = _brief_blocks(brief_md)
 
@@ -230,11 +240,13 @@ def brief_warnings(mission: Mission, requirements: list[Requirement],
             warnings.append({"kind": "uncited_paragraph", "detail": _excerpt(text)})
 
     slots = ordered_sources_for_mission(mission, docs)
+    stored = _stored_order(mission)
+    citable = len(stored) if stored is not None else len(slots)
     flagged: set[int] = set()
     cites = (m for _s, text, _h in blocks for m in _CITE_RE.finditer(_cited_text(text)))
     for m in cites:
         for n in (int(x) for x in m.group(1).split(",")):
-            if n in flagged or not 1 <= n <= len(slots):
+            if n in flagged or not 1 <= n <= citable:
                 continue
             doc = slots[n - 1]
             if doc is None or is_usable(doc):
@@ -244,10 +256,15 @@ def brief_warnings(mission: Mission, requirements: list[Requirement],
             warnings.append({"kind": "junk_citation",
                              "detail": f"[{n}] {doc.domain}: {why}"})
 
-    text = (brief_md or "").lower()
+    # A degraded brief is coverage only and already says it failed: every
+    # requirement would be "unmentioned" outside its coverage list.
+    if any(_is_degraded_note(text) for _s, text, _h in blocks):
+        return warnings
+    prose = " ".join(text for section, text, _h in blocks
+                     if not _is_coverage_section(section)).lower()
     for r in requirements:
         terms = key_terms(r)
-        if terms and not any(t in text for t in terms):
+        if terms and not any(t in prose for t in terms):
             warnings.append({"kind": "requirement_unmentioned", "detail": r.title})
     return warnings
 

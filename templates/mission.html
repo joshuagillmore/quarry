@@ -135,7 +135,7 @@
         <span class="mono" style="font-size:11px;color:var(--fg-subtle)">stopping…</span>
       {% else %}
       <form method="post" action="/missions/{{ mission.id }}/stop" style="margin:0">
-        <button type="submit" class="btn btn-sm">Stop after this pass</button>
+        <button type="submit" class="btn btn-sm">Stop after the current requirement</button>
       </form>
       {% endif %}
     </div>
@@ -746,7 +746,7 @@
         const inflight = (s.trace.urls || []).filter(u => u.status === 'fetching').length;
         if (traceMeta) {
           traceMeta.textContent = s.trace.cancel_requested
-            ? 'stopping after this pass'
+            ? 'stopping after the current requirement'
             : s.trace.stage + ' · ' + inflight + ' in flight';
         }
       }

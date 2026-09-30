@@ -196,11 +196,15 @@ run.
 - **LLM token telemetry and budget.** Every planning, assessment, brief, and
   extraction call is logged (model, purpose, token counts, duration) and
   rolled up per mission on the mission page's telemetry strip, broken down by
-  purpose. Set `MAX_LLM_TOKENS` to cap a mission's total prompt + completion
-  tokens (`0` = unlimited, the default); crossing the budget stops collection
-  cleanly at the next pass or requirement boundary, and requirements not yet
-  reached are marked "not attempted: token budget reached" instead of the run
-  being cut off mid-requirement. Override it per run with the "LLM tokens"
+  purpose. Set `MAX_LLM_TOKENS` to give a mission a token budget, counted in
+  prompt + completion tokens (`0` = unlimited, the default). Once a mission's
+  spend passes it, collection stops cleanly at the next pass or requirement
+  boundary instead of mid-requirement, and extraction is skipped too; the
+  brief is still written from what was collected, so the final spend can
+  run a little past the budget. Requirements that were never tried are
+  marked "not attempted: token budget reached"; one already tried in an
+  earlier pass keeps its last gap note. A mission that has used up its
+  budget can't be re-tasked. Override it per run with the "LLM tokens"
   field in the Agentic Crawl panel on the Search page (blank uses
   `MAX_LLM_TOKENS`); it's a per-run choice, not an agent setting, so
   re-running a mission from its own page doesn't carry its budget forward.
@@ -218,9 +222,11 @@ run.
   (e.g. `pass 1 · 3 queries · 11 results · brave`) — so a pass that quietly
   returned nothing is visible instead of looking identical to one that found
   nothing worth citing.
-- **Stop lands mid-pass.** Clicking Stop on a running mission is honored
-  before each requirement within the current pass, not just between passes —
-  requirements not reached show "not attempted: stopped by user".
+- **Stop lands mid-pass.** Clicking "Stop after the current requirement" on
+  a running mission is honored before each requirement within the current
+  pass, not just between passes. Requirements that were never tried show
+  "not attempted: stopped by user"; one already tried in an earlier pass
+  keeps its last gap note.
 
 ## Architecture
 

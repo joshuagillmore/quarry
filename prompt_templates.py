@@ -110,7 +110,7 @@ SOURCES (numbered; cite them as [n]):
 {delta}
 Write the brief in Markdown with these sections:
 ## Summary
-A 3-5 sentence answer to the question.
+A 3-5 sentence answer to the question, citing its sources inline as [n].
 ## Key Findings
 Bullet points of the most important findings. Cite supporting sources inline as \
 [n]. Only state what the sources support.

@@ -528,6 +528,47 @@ def test_token_budget_stops_before_the_next_requirement(monkeypatch):
     assert asyncio.run(storage.get_mission("m1")).status == "done"
 
 
+def _record_extraction(monkeypatch):
+    calls = []
+
+    async def fake_extract(mission_id, prompt, job_id):
+        calls.append(mission_id)
+
+    monkeypatch.setattr(agent_runner, "_extract_sources", fake_extract)
+    return calls
+
+
+def test_token_budget_stop_skips_extraction_but_still_writes_the_brief(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _two_requirements(jid, {"max_passes": 2, "max_sources": 5, "per_req_attempts": 2,
+                            "max_llm_tokens": 100, "extract": True, "extract_prompt": "p"})
+    _spend("m1", 101)
+    _wire(monkeypatch, ["http://a.example/1"])
+    extracted = _record_extraction(monkeypatch)
+
+    asyncio.run(agent_runner._run_collection("m1"))
+
+    assert extracted == []
+    assert "skipping extraction: token budget reached" in _log_text(jid)
+    m = asyncio.run(storage.get_mission("m1"))
+    assert m.status == "done" and m.brief_markdown == "brief"
+
+
+def test_extraction_still_runs_when_collection_ends_otherwise(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _two_requirements(jid, {"max_passes": 1, "max_sources": 5, "per_req_attempts": 1,
+                            "max_llm_tokens": 10 ** 6, "extract": True})
+    _wire(monkeypatch, ["http://a.example/1"])
+    extracted = _record_extraction(monkeypatch)
+
+    asyncio.run(agent_runner._run_collection("m1"))
+
+    assert extracted == ["m1"]
+    assert "skipping extraction" not in _log_text(jid)
+
+
 def test_token_budget_checked_at_the_pass_boundary(monkeypatch):
     _init()
     jid = jobs.create_mission_job("Q", 5)

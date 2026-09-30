@@ -265,7 +265,11 @@ def test_coverage_section_is_not_held_to_citations():
     """Coverage & Gaps is commentary on the requirements, not a claim
     drawn from a source."""
     md = "## Coverage & Gaps\n" + _LONG_UNCITED + "\n"
-    assert brief.brief_warnings(_mission(), [_battery_req()], [], md) == []
+    # (The battery requirement is named only here, so it is "unmentioned":
+    # see test_a_requirement_named_only_in_coverage_and_gaps_is_unmentioned.)
+    kinds = _kinds(brief.brief_warnings(_mission(), [_battery_req()], [], md))
+    assert "uncited_paragraph" not in kinds
+    assert brief.brief_warnings(_mission(), [], [], md) == []
 
 
 def test_citing_a_junk_source_is_flagged_once():
@@ -323,3 +327,41 @@ def test_degraded_brief_is_not_flagged_for_its_own_failure_line(monkeypatch):
     out = brief.synthesize_brief(_mission(), reqs, docs, set())
     assert "Automated brief generation failed" in out
     assert brief.brief_warnings(_mission(), reqs, docs, out) == []
+
+
+def test_a_requirement_named_only_in_coverage_and_gaps_is_unmentioned():
+    """Coverage & Gaps restates every requirement by design, so a mention
+    there says nothing about whether the brief's findings covered it."""
+    only_coverage = ("## Summary\nShort answer [1].\n\n"
+                     "## Key Findings\n- Something else entirely [1].\n\n"
+                     "## Coverage & Gaps\n- Lithium battery degradation: thin.\n")
+    w = brief.brief_warnings(_mission(), [_battery_req()], [_sdoc("a", 500)], only_coverage)
+    assert w == [{"kind": "requirement_unmentioned",
+                  "detail": "Lithium battery degradation"}]
+
+    in_findings = only_coverage.replace("Something else entirely", "Battery fade")
+    assert brief.brief_warnings(_mission(), [_battery_req()], [_sdoc("a", 500)],
+                                in_findings) == []
+
+
+def test_junk_citation_only_resolves_within_the_stored_order():
+    """A document appended after the stored order (a later retask) had no
+    number when the brief was written, so [2] cannot mean it."""
+    docs = [_sdoc("good", 500), _sdoc("junk", 5)]
+    md = "Battery findings [1] and [2]."
+    appended = _mission_with(json.dumps(["good"]))
+    assert _ids(brief.ordered_sources_for_mission(appended, docs)) == ["good", "junk"]
+    assert brief.brief_warnings(appended, [_battery_req()], docs, md) == []
+
+    numbered = _mission_with(json.dumps(["good", "junk"]))
+    w = brief.brief_warnings(numbered, [_battery_req()], docs, md)
+    assert _kinds(w) == ["junk_citation"] and w[0]["detail"].startswith("[2]")
+
+
+def test_brief_prompt_asks_for_citations_in_the_summary_too():
+    """The uncited-paragraph check holds the Summary to citations, so the
+    prompt must ask for them there, not only in Key Findings."""
+    from prompt_templates import build_brief_prompt
+    prompt = build_brief_prompt("Q?", "- [x] R", "[1] src")
+    summary = prompt.split("## Summary", 1)[1].split("## Key Findings", 1)[0]
+    assert "[n]" in summary

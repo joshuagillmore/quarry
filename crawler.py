@@ -296,12 +296,17 @@ def _fetch_fallback_html(url: str) -> tuple[str, str, str]:
     body is (a PDF link is never downloaded; a coding other than none or a
     single gzip/deflate is refused). A declared size past the cap is
     refused too. The raw body then goes through _CappedBody, which bounds
-    its decoded size exactly (httpx's own decoding has no output limit). A
-    wall-clock deadline, started before the request, covers headers,
-    redirects and the body, since httpx's timeout is per read and a
-    trickling server would never trip it. Only then is the body decoded to
-    text and checked for a block page. All of it runs here, off the event
-    loop: page-controlled bytes never hold up the app."""
+    its decoded size exactly (httpx's own decoding has no output limit).
+
+    A wall-clock deadline starts before the request, since httpx's timeout
+    is per read and a trickling server would never trip it. It is checked
+    once the final headers are in and again after every body chunk, so the
+    body is bounded by it (to within one chunk read), but the headers and
+    redirects are not: time they take is refused after the fact, when the
+    first check sees the deadline already passed, and each of those reads
+    is only bounded by httpx's per-read timeout. Only then is the body
+    decoded to text and checked for a block page. All of it runs here, off
+    the event loop: page-controlled bytes never hold up the app."""
     budget_s = settings.crawl_timeout / 1000
     timed_out = f"timed out after {budget_s:g}s"
     deadline = time.monotonic() + budget_s
@@ -341,6 +346,22 @@ def _fetch_fallback_html(url: str) -> tuple[str, str, str]:
 async def _fallback_html(url: str) -> tuple[str, str, str]:
     """_fetch_fallback_html on a worker thread."""
     return await asyncio.to_thread(_fetch_fallback_html, url)
+
+
+def _conversion_config(base_url: str) -> CrawlerRunConfig:
+    """The run config for turning fallback-fetched HTML into markdown via a
+    "raw:" URL. Never the browser crawl's config: crawl4ai sends a raw: URL
+    through the browser whenever the config asks for browser work
+    (simulate_user, remove_overlay_elements, js_code, wait_for, ...), which
+    would render the rescued page in headless Chromium, inline scripts and
+    all, for up to the whole page timeout. With none of those set it takes
+    the fast path and just parses the HTML. `base_url` (the fetch's final
+    URL) resolves the page's relative links."""
+    return CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        word_count_threshold=50,
+        base_url=base_url,
+    )
 
 
 async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,
@@ -412,7 +433,8 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
             if not html:
                 return None, reason
             result = await asyncio.wait_for(
-                crawler.arun(url="raw:" + html, config=run_cfg), timeout=limit)
+                crawler.arun(url="raw:" + html, config=_conversion_config(final_url)),
+                timeout=limit)
             if not result.success:
                 return None, f"conversion failed: {(result.error_message or 'unknown error')[:100]}"
             names = [n for n in dict.fromkeys((sr.url, final_url)) if n]

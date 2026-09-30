@@ -44,8 +44,8 @@ The crawl page is driven by the SSE endpoint alone (`GET /api/job/<id>/stream`, 
 
 ### Two crawler functions — use the progress one
 
-`crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. The one-shot crawl (`_run_job`) passes `skip_on_cancel=True`: a cancel marks every page not fetched yet `skipped`, keeps the pages already fetched, and ends the job `cancelled`. Missions leave it off, because their stop is honoured at the next pass boundary. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
-- **A failed or blocked crawl gets one plain-HTTP retry.** When a page's Chromium fetch fails, or `content_quality.looks_like_block_page` rejects it, and `settings.crawl_fallback` is true (default), `crawl_urls_with_progress` fetches the URL once more with `httpx.get` — off the event loop via `asyncio.to_thread`, a desktop `User-Agent`, `follow_redirects=True` — and, only if that comes back `200`, HTML, and doesn't itself look like a block page, feeds the raw HTML straight into crawl4ai via `crawler.arun(url="raw:" + html, config=run_cfg)` so it goes through the same markdown extraction and junk gate as a normal crawl. Rows fetched this way are stored with `metadata_json["fetched_via"] = "fallback"` and the URL's status becomes `done`, not a degraded state. The fallback never runs for `file:`/non-HTTP URLs, and its log lines are still `html.escape`d like the rest of the crawl log.
+`crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. The one-shot crawl (`_run_job`) passes `skip_on_cancel=True`: a cancel marks every page not fetched yet `skipped`, keeps the pages already fetched, and ends the job `cancelled`. Missions leave it off, because their stop is honoured before the next requirement: the requirement in flight finishes its crawl and assessment. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
+- **A failed or blocked crawl gets one plain-HTTP retry.** When a page's Chromium fetch fails or times out, or `content_quality.looks_like_block_page` rejects it, and `settings.crawl_fallback` is true (default), `crawl_urls_with_progress` fetches the URL once more (`_fetch_fallback_html`). It streams the response with `httpx.stream` (a desktop `User-Agent`, `follow_redirects=True`, `Accept-Encoding: gzip, deflate` pinned, never `br`) and judges it from the headers before any body is read: a non-`200` status, a non-HTML content type, an unsupported or stacked `Content-Encoding`, or a `Content-Length` past the 5 MB cap is refused without downloading. The body is read raw (`iter_raw`, so httpx never decodes it) through `_CappedBody`, which inflates gzip/deflate itself with zlib's `max_length` and so bounds the **decoded** size exactly. A wall-clock deadline (the crawl timeout) runs from before the request, checked after the final headers and after every chunk, since httpx's timeout is per read. All of that body work — fetching, inflating, decoding, the block-page check — runs off the event loop via `asyncio.to_thread`, and every scan of the page-controlled HTML (title, script/style stripping, rough word count) is linear. Only a page that passes is converted: `crawler.arun(url="raw:" + html, config=_conversion_config(final_url))`, a plain config with no browser-requiring flags (crawl4ai would otherwise render a `raw:` page in Chromium) and the final URL as `base_url`. The result then goes through the same `_page_document` junk gate as a normal crawl, so a thin or block page is still discarded. Rows fetched this way are stored under the fetch's final URL with `metadata_json["fetched_via"] = "fallback"`, and the URL's status becomes `done`, not a degraded state. The fallback never runs for `file:`/non-HTTP URLs, and its log lines are still `html.escape`d like the rest of the crawl log.
 
 ### Storage (`storage.py`)
 
@@ -89,10 +89,18 @@ runs a **Mission** against a question using an intelligence-collection loop:
   against `budget.get("max_llm_tokens", settings.max_llm_tokens)` (`0` =
   unlimited) at each pass boundary and again before each requirement inside
   the pass — the same checkpoint the mid-pass `Stop` cancellation already
-  used — and crossing it stops the loop, logs `token budget reached`, and
-  marks every requirement not yet reached `assessment_missing="not attempted:
-  token budget reached"`, the same shape as an unmet requirement rather than
-  a crash. The per-run override is the "LLM tokens" field in the **Agentic
+  used — and crossing it stops the loop and logs `token budget reached`.
+  Collection stopped that way also skips extraction (`skipping extraction:
+  token budget reached`, one LLM call per source), while the brief, a single
+  call, still runs. Every requirement still pending is marked `unmet`, the
+  same shape as any unmet requirement rather than a crash; one never tried
+  (`attempts == 0`) gets `assessment_missing="not attempted: token budget
+  reached"` (or `"not attempted: stopped by user"` after a Stop), while one
+  already tried in an earlier pass keeps its last assessor gap text.
+  `requirement_retask` refuses a mission whose spend has reached its budget,
+  with a flash and no state change: the runner would stop before the first
+  requirement, yet the retask would still re-extract and re-write the brief.
+  The per-run override is the "LLM tokens" field in the **Agentic
   Crawl** panel of the Search page's run form (`max_llm_tokens`, 0–5,000,000,
   blank or non-numeric falling back to `settings.max_llm_tokens`); `agent_run`
   writes it into that mission's `budget_json`. There is no agent-level
@@ -187,9 +195,15 @@ runs a **Mission** against a question using an intelligence-collection loop:
   integer it re-serializes, so the sanitizer is never weakened or bypassed).
 - **The brief is checked for its own mistakes.** After `_synthesize` writes
   the brief, `brief.brief_warnings(mission, requirements, docs, brief_md)`
-  flags three things: an uncited paragraph or bullet of real length, a `[n]`
-  citation pointing at a source `content_quality.is_usable` would reject, and
-  a requirement whose key terms never surface in the brief text at all. The
+  flags three things: an uncited paragraph or bullet of real length (outside
+  Coverage & Gaps), a `[n]` citation pointing at a source
+  `content_quality.is_usable` would reject, and a requirement whose key terms
+  never surface in the brief outside its Coverage & Gaps section (which
+  restates every requirement by design; a degraded coverage-only brief is not
+  checked for this). `[n]` resolves only within the stored order the brief
+  was numbered with, never against documents a later retask appended after
+  it. The prompt asks for inline `[n]` in the Summary as well as Key
+  Findings, so the uncited check does not fire on every Summary. The
   warnings are stored as `missions.brief_warnings_json` in the same
   `update_mission` call that saves the brief, and `_synthesize` logs
   `brief checks: N warning(s)`. The mission page renders any of them as a
@@ -213,7 +227,10 @@ runs a **Mission** against a question using an intelligence-collection loop:
   dropped connection) can't launch collection twice for the same mission.
 - **Telemetry + cooperative stop** live in the job store (`pass_num`,
   `sources_used`, `cancel_requested`); `agent_runner` checks `jobs.is_cancelled`
-  at pass boundaries so a stop still produces a brief from what was collected.
+  at each pass boundary and again before each requirement, so a stop costs at
+  most the requirement in flight and still produces a brief from what was
+  collected. The mission page's button says so: "Stop after the current
+  requirement".
 - **Static assets are cache-busted** by mtime (`@app.url_defaults`), because a
   deploy otherwise leaves users on a stale `style.css`.
 - **Scheduling ("morning brief")** lives in `scheduler.py`. An agent with a
@@ -337,6 +354,13 @@ web-researcher:/tmp/x.py && docker compose exec -T web-researcher python
   `_DONE_KEEP`/`_DONE_TTL_S`. `create_job`/`create_mission_job` raise
   `JobLimitReached`; routes flash "Busy". The scheduler's `_launch` creates the
   job before the mission row, so a full queue skips a scheduled fire cleanly.
+- **The crawl fallback never lets httpx decode a body.** It reads only
+  `iter_raw()`, the decoded size is bounded by `_CappedBody` (zlib
+  `max_length`, so a gzip bomb stops at the 5 MB cap), and `Accept-Encoding`
+  stays pinned to `gzip, deflate`: httpx's own decoders (br above all) have
+  no output limit, so a few hundred wire bytes could expand to gigabytes in
+  one read. Any other or stacked `Content-Encoding` is refused before the
+  body is read.
 - **Dependencies are pinned** via `constraints.txt` (a `pip freeze` of a
   verified image) used as `pip install -r requirements.txt -c constraints.txt`.
   To upgrade deliberately: bump/rebuild, verify, re-freeze.
