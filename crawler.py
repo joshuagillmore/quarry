@@ -3,6 +3,7 @@ import json
 import re
 import time
 import uuid
+import zlib
 from datetime import datetime, timezone
 from html import escape as _esc, unescape
 from urllib.parse import urlparse
@@ -149,10 +150,15 @@ _FALLBACK_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
     "Accept": "text/html,*/*",
+    # Only codings _CappedBody decodes itself under the cap. httpx would
+    # otherwise decode br (and stacked codings) with no output limit: a few
+    # hundred wire bytes can expand to gigabytes in one read.
+    "Accept-Encoding": "gzip, deflate",
 }
 # Bigger than any article; the body is converted in memory. Enforced on the
-# decoded stream as it arrives, so a longer body is never read in full.
+# decoded size as the body arrives, so a longer one is never read in full.
 _FALLBACK_MAX_BYTES = 5_000_000
+_SUPPORTED_CODINGS = ("", "identity", "gzip", "x-gzip", "deflate")
 # The fallback's pre-check reads page-controlled HTML, so every scan here is
 # linear: no pattern can run ahead past a "<" it would then backtrack over.
 # (The first versions, `<[^>]*>` and lazy `.*?` spans, were quadratic: about
@@ -211,6 +217,62 @@ def _fallback_page_problem(html: str) -> str:
     return why if junk else ""
 
 
+class _CappedBody:
+    """A response body accumulated from raw (still-encoded) chunks with an
+    exact bound on its decoded size. gzip/deflate are decompressed here with
+    zlib's max_length, so no chunk can expand past the cap in memory: at
+    most cap + 1 decoded bytes are ever held (cap + one chunk for an
+    unencoded body). The zlib flavour is sniffed from the first two bytes:
+    gzip, zlib-wrapped deflate, or the raw deflate some servers send."""
+
+    def __init__(self, coding: str, cap: int):
+        self.coding = "" if coding in ("", "identity") else coding
+        self.cap = cap
+        self.body = bytearray()
+        self._z = None
+        self._head = b""    # raw bytes held until the flavour is known
+
+    @staticmethod
+    def _wbits(head: bytes) -> int:
+        if head[:2] == b"\x1f\x8b":
+            return 31                                   # gzip
+        if len(head) >= 2 and head[0] & 0x0F == 8 and (head[0] << 8 | head[1]) % 31 == 0:
+            return 15                                   # zlib-wrapped deflate
+        return -15                                      # raw deflate
+
+    def _inflate(self, raw: bytes) -> bool:
+        out = self._z.decompress(raw, self.cap - len(self.body) + 1)
+        self.body += out
+        return len(self.body) <= self.cap and not self._z.unconsumed_tail
+
+    def feed(self, raw: bytes) -> bool:
+        """Add a raw chunk. False once the decoded body is past the cap (the
+        caller stops reading). Raises zlib.error on a corrupt body."""
+        if not self.coding:
+            self.body += raw
+            return len(self.body) <= self.cap
+        if self._z is None:
+            self._head += raw
+            if len(self._head) < 2:
+                return True
+            raw, self._head = self._head, b""
+            self._z = zlib.decompressobj(self._wbits(raw))
+        return self._inflate(raw)
+
+    def finish(self) -> bool:
+        """End of body: decode what is still held. False if past the cap."""
+        if not self.coding:
+            return len(self.body) <= self.cap
+        if self._z is None:
+            if not self._head:
+                return True
+            self._z = zlib.decompressobj(self._wbits(self._head))
+            if not self._inflate(self._head):
+                return False
+        self.body += self._z.flush()
+        return len(self.body) <= self.cap
+
+
 def _declared_length(response) -> int:
     try:
         return int(response.headers.get("content-length") or 0)
@@ -229,32 +291,46 @@ def _fetch_fallback_html(url: str) -> tuple[str, str, str]:
     """Worker-thread body of the fallback: (html, final url, "") from a
     plain GET of `url`, or ("", "", reason) when it is not a usable page.
 
-    The response is streamed and judged as early as possible: status and
-    content type from the headers before any body is read (a PDF link is
-    never downloaded), a declared or actual size past _FALLBACK_MAX_BYTES
-    aborts the read (so does a wall-clock deadline, since httpx's timeout is
-    per read and a trickling body would never trip it), and only then is
-    the body decoded and checked for a block page. All of it runs here, off
-    the event loop: page-controlled bytes never hold up the app."""
+    The response is streamed and judged as early as possible. Status,
+    content type and content coding are read from the headers before any
+    body is (a PDF link is never downloaded; a coding other than none or a
+    single gzip/deflate is refused). A declared size past the cap is
+    refused too. The raw body then goes through _CappedBody, which bounds
+    its decoded size exactly (httpx's own decoding has no output limit). A
+    wall-clock deadline, started before the request, covers headers,
+    redirects and the body, since httpx's timeout is per read and a
+    trickling server would never trip it. Only then is the body decoded to
+    text and checked for a block page. All of it runs here, off the event
+    loop: page-controlled bytes never hold up the app."""
     budget_s = settings.crawl_timeout / 1000
+    timed_out = f"timed out after {budget_s:g}s"
     deadline = time.monotonic() + budget_s
     with httpx.stream("GET", url, follow_redirects=True, timeout=budget_s,
                       headers=_FALLBACK_HEADERS) as response:
+        if time.monotonic() > deadline:
+            return "", "", timed_out
         if response.status_code != 200:
             return "", "", f"HTTP {response.status_code}"
         ctype = (response.headers.get("content-type") or "").lower()
         if "html" not in ctype:
             return "", "", f"not HTML ({ctype.split(';')[0].strip() or 'no content type'})"
+        coding = (response.headers.get("content-encoding") or "").strip().lower()
+        if coding not in _SUPPORTED_CODINGS:
+            return "", "", f"unsupported content-encoding ({coding[:40]})"
         if _declared_length(response) > _FALLBACK_MAX_BYTES:
             return "", "", "page too large"
-        body = bytearray()
-        for chunk in response.iter_bytes():
-            body += chunk
-            if len(body) > _FALLBACK_MAX_BYTES:
+        body = _CappedBody("gzip" if coding == "x-gzip" else coding, _FALLBACK_MAX_BYTES)
+        try:
+            for chunk in response.iter_raw():
+                if not body.feed(chunk):
+                    return "", "", "page too large"
+                if time.monotonic() > deadline:
+                    return "", "", timed_out
+            if not body.finish():
                 return "", "", "page too large"
-            if time.monotonic() > deadline:
-                return "", "", f"timed out after {budget_s:g}s"
-        html = _decode(bytes(body), response.encoding)
+        except zlib.error as e:
+            return "", "", f"could not decompress the body ({str(e)[:60]})"
+        html = _decode(bytes(body.body), response.encoding)
         final_url = str(response.url)
     problem = _fallback_page_problem(html)
     if problem:

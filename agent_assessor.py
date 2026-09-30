@@ -56,7 +56,11 @@ _STOPWORDS = frozenset({
 _TERM_RE = re.compile(r"[^\W\d_]{5,}")
 
 NO_TERM_OVERLAP = "no collected source mentions the requirement's key terms"
-_CLAUSE_END_RE = re.compile(r"[.;:?!\n]")
+# Where a description's first clause ends: ? ! ; or a line break, or a full
+# stop after a lowercase word ("... batteries. Then"), never the dots of an
+# abbreviation such as "U.S." or "e.g.".
+_CLAUSE_END_RE = re.compile(r"[?!;\n]|(?<=[a-z]{2})\.(?:\s|$)")
+REQUERY_MAX_CHARS = 200
 
 
 def key_terms(requirement: Requirement) -> set[str]:
@@ -75,7 +79,11 @@ def _requery(requirement: Requirement) -> list[str]:
     title = (requirement.title or "").strip()
     clause = _CLAUSE_END_RE.split(requirement.description or "", maxsplit=1)[0].strip()
     query = f"{title} {clause}" if clause and clause.lower() not in title.lower() else title
-    query = query[:200].strip()
+    if len(query) > REQUERY_MAX_CHARS:   # cut at a word boundary
+        cut = query[:REQUERY_MAX_CHARS + 1]
+        space = cut.rfind(" ")
+        query = cut[:space] if space > 0 else cut[:REQUERY_MAX_CHARS]
+    query = query.strip()
     return [query] if query else []
 
 

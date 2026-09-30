@@ -226,15 +226,19 @@ _BLOCK_HTML = ("<html><head><title>Just a moment...</title></head>"
 
 class _Stream:
     """Stands in for the response of `with httpx.stream(...) as r`: status,
-    headers and url are there at once; the body only arrives when iterated,
-    and `pulled` counts the bytes the caller actually read."""
+    headers and url are there at once; the raw (still-encoded) body only
+    arrives when iterated, and `pulled` counts the bytes the caller read."""
 
     def __init__(self, status=200, ctype="text/html; charset=utf-8", text=_GOOD_HTML,
-                 url="http://f.example/1", chunks=None, length=None, encoding="utf-8"):
+                 url="http://f.example/1", chunks=None, length=None, encoding="utf-8",
+                 content_encoding=None, header_delay=0.0):
         self.status_code = status
         self.headers = {"content-type": ctype}
         if length is not None:
             self.headers["content-length"] = str(length)
+        if content_encoding is not None:
+            self.headers["content-encoding"] = content_encoding
+        self._header_delay = header_delay
         self.url = url
         self.encoding = encoding
         self._chunks = chunks if chunks is not None else [text.encode()]
@@ -243,13 +247,16 @@ class _Stream:
         self.closed = False
 
     def __enter__(self):
+        if self._header_delay:   # a server slow to send its headers
+            import time as _time
+            _time.sleep(self._header_delay)
         return self
 
     def __exit__(self, *a):
         self.closed = True
         return False
 
-    def iter_bytes(self):
+    def iter_raw(self):
         self.body_read = True
         for chunk in self._chunks:
             self.pulled += len(chunk)
@@ -325,6 +332,7 @@ def test_fallback_rescues_a_failed_page(monkeypatch):
     assert kwargs["timeout"] == crawler.settings.crawl_timeout / 1000
     assert "Mozilla/5.0" in kwargs["headers"]["User-Agent"]
     assert kwargs["headers"]["Accept"] == "text/html,*/*"
+    assert kwargs["headers"]["Accept-Encoding"] == "gzip, deflate", "never br"
     assert raw_calls == [_GOOD_HTML]
     assert resp.closed, "the stream is always closed"
 
@@ -506,3 +514,106 @@ def test_fallback_skipped_after_a_one_shot_cancel(monkeypatch):
     docs = asyncio.run(crawler.crawl_urls_with_progress(
         _srs(["http://f.example/1"]), "q", jid, skip_on_cancel=True))
     assert docs == [] and calls == []
+
+
+# ---------- fallback: compressed bodies are bounded by their decoded size ----------
+
+import zlib  # noqa: E402
+
+
+def _compressed(size, wbits, piece=1024 * 1024):
+    """`size` bytes of zeros compressed with `wbits` (31 gzip, 15 zlib, -15
+    raw deflate), produced piecewise so the test never holds `size` bytes."""
+    z = zlib.compressobj(9, zlib.DEFLATED, wbits)
+    out = bytearray()
+    zeros = b"\0" * piece
+    for _ in range(size // piece):
+        out += z.compress(zeros)
+    out += z.flush()
+    return bytes(out)
+
+
+def _chunks(data, size):
+    return [data[i:i + size] for i in range(0, len(data), size)]
+
+
+def test_capped_body_stops_a_gzip_bomb_at_the_cap():
+    cap = crawler._FALLBACK_MAX_BYTES
+    bomb = _compressed(64 * 1024 * 1024, 31)          # 64 MB of zeros, ~64 KB on the wire
+    body = crawler._CappedBody("gzip", cap)
+    peak = 0
+    fits = True
+    for chunk in _chunks(bomb, 16 * 1024):
+        fits = body.feed(chunk)
+        peak = max(peak, len(body.body))
+        if not fits:
+            break
+    assert not fits, "the bomb must be refused"
+    assert peak <= cap + 1, "decoded bytes never run more than a byte past the cap"
+
+
+def test_capped_body_identity_stops_within_one_chunk():
+    cap, chunk = 1000, 300
+    body = crawler._CappedBody("", cap)
+    results = [body.feed(b"x" * chunk) for _ in range(4)]
+    assert results == [True, True, True, False]
+    assert len(body.body) <= cap + chunk
+
+
+@pytest.mark.parametrize("wbits,label", [(31, "gzip"), (15, "deflate"), (-15, "deflate"),
+                                         (15, "gzip")])
+def test_capped_body_decodes_gzip_and_both_deflate_flavours(wbits, label):
+    z = zlib.compressobj(6, zlib.DEFLATED, wbits)
+    data = z.compress(_GOOD_HTML.encode()) + z.flush()
+    body = crawler._CappedBody(label, crawler._FALLBACK_MAX_BYTES)
+    # One-byte first chunk: the flavour is sniffed from the first two bytes.
+    assert all(body.feed(c) for c in [data[:1]] + _chunks(data[1:], 100))
+    assert body.finish() and bytes(body.body) == _GOOD_HTML.encode()
+
+
+def test_fallback_aborts_a_gzip_bomb(monkeypatch):
+    bomb = _compressed(64 * 1024 * 1024, 31)
+    resp = _Stream(chunks=_chunks(bomb, 16 * 1024), content_encoding="gzip")
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert "fallback failed: page too large" in _msgs(job)
+    assert resp.pulled < len(bomb), "reading stops once the decoded size passes the cap"
+    assert resp.closed
+
+
+@pytest.mark.parametrize("encoding", ["br", "gzip, gzip", "deflate, gzip", "zstd", "compress"])
+def test_fallback_rejects_unsupported_content_encodings_before_reading(monkeypatch, encoding):
+    resp = _Stream(content_encoding=encoding)
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert not resp.body_read
+    assert "fallback failed: unsupported content-encoding" in _msgs(job)
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "identity", "GZIP"])
+def test_fallback_stores_a_compressed_page_under_the_cap(monkeypatch, encoding):
+    raw = _GOOD_HTML.encode()
+    if encoding.lower() == "gzip":
+        z = zlib.compressobj(6, zlib.DEFLATED, 31)
+        raw = z.compress(raw) + z.flush()
+    elif encoding == "deflate":
+        z = zlib.compressobj(6, zlib.DEFLATED, 15)
+        raw = z.compress(raw) + z.flush()
+    resp = _Stream(chunks=_chunks(raw, 50), content_encoding=encoding)
+    docs, _job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert [d.title for d in docs] == ["Plain page"]
+    assert raw_calls == [_GOOD_HTML]
+
+
+def test_fallback_corrupt_compressed_body_is_reported(monkeypatch):
+    resp = _Stream(chunks=[b"\x1f\x8b" + b"not really gzip" * 10], content_encoding="gzip")
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and "fallback failed: could not decompress" in _msgs(job)
+
+
+def test_fallback_deadline_covers_slow_headers(monkeypatch):
+    monkeypatch.setattr(crawler.settings, "crawl_timeout", 50)    # 0.05 s budget
+    resp = _Stream(header_delay=0.1)
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and not resp.body_read
+    assert "fallback failed: timed out" in _msgs(job)

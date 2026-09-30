@@ -189,3 +189,20 @@ def test_requirement_without_key_terms_always_calls_the_llm(monkeypatch):
     agent_assessor.assess_requirement(short, [])
     agent_assessor.assess_requirement(short, [_src(fit="nothing relevant here")])
     assert len(calls) == 2
+
+
+def test_requery_does_not_split_abbreviations(monkeypatch):
+    _no_llm(monkeypatch)
+    req = Requirement(id="r", mission_id="m", title="Battery import rules",
+                      description="Which U.S. agencies regulate lithium batteries? And costs.")
+    assert agent_assessor.assess_requirement(req, []).next_queries == [
+        "Battery import rules Which U.S. agencies regulate lithium batteries"]
+
+
+def test_requery_is_capped_at_200_characters(monkeypatch):
+    _no_llm(monkeypatch)
+    req = Requirement(id="r", mission_id="m", title="Battery import rules",
+                      description="regulation " * 40)
+    [q] = agent_assessor.assess_requirement(req, []).next_queries
+    assert len(q) <= 200 and q.startswith("Battery import rules regulation")
+    assert set(q.split()[3:]) == {"regulation"}, "cut at a word boundary"
