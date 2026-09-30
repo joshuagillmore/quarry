@@ -22,11 +22,14 @@
 {% set per_req_attempts = budget.get('per_req_attempts', 3) %}
 {% set sources_used = live_state.sources_used if live_state else documents | length %}
 
-{# 1234 -> 1.2k, 1000 -> 1k: compact token counts for the telemetry cell. #}
+{# 1234 -> 1.2k, 1000 -> 1k, 999950 -> 1M: compact token counts for the
+   telemetry cell. Rounded to tenths in integers first, then the unit is
+   chosen, so a value just under a million never reads "1000k". #}
 {% macro kfmt(n) -%}
+  {%- set k10 = (n + 50) // 100 -%}
   {%- if n < 1000 -%}{{ n }}
-  {%- elif n < 1000000 -%}{{ ('%.1f' % (n / 1000)) | replace('.0', '') }}k
-  {%- else -%}{{ ('%.1f' % (n / 1000000)) | replace('.0', '') }}M
+  {%- elif k10 < 10000 -%}{{ ('%.1f' % (k10 / 10)) | replace('.0', '') }}k
+  {%- else -%}{{ ('%.1f' % (((n + 50000) // 100000) / 10)) | replace('.0', '') }}M
   {%- endif -%}
 {%- endmacro %}
 
@@ -326,7 +329,7 @@
           <ul class="search-stats">
             {% for p in req_search[r.id] %}
             <li class="search-stat{{ ' zero' if not p.results }}">
-              pass {{ p.n }} · {{ p.queries }} quer{{ 'y' if p.queries == 1 else 'ies' }} · {{ p.results }} result{{ '' if p.results == 1 else 's' }} · {{ p.engines | join(', ') if p.engines else 'no engine answered' }}
+              {% if p.run > 1 %}run {{ p.run }} · {% endif %}pass {{ p.n }} · {{ p.queries }} quer{{ 'y' if p.queries == 1 else 'ies' }} · {{ p.results }} result{{ '' if p.results == 1 else 's' }} · {{ p.engines | join(', ') if p.engines else 'no engine answered' }}
             </li>
             {% endfor %}
           </ul>

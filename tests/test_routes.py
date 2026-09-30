@@ -902,6 +902,16 @@ def test_full_text_query_seeds_the_one_input_without_refiltering(client):
     assert _cards(html) == 3
 
 
+def test_zero_hit_full_text_search_keeps_the_input(client):
+    # With no matches there are no cards, but the query must stay editable.
+    _seed_docs(2)
+    html = client.get("/documents?q=zzzznomatch").get_data(as_text=True)
+    assert 'value="zzzznomatch"' in _lib_input(html)
+    assert _cards(html) == 0
+    assert "No pages match" in html
+    assert "No documents yet" not in html
+
+
 def test_library_without_a_query_leaves_the_input_empty(client):
     _seed_docs(2)
     html = client.get("/documents").get_data(as_text=True)
@@ -1179,6 +1189,20 @@ def test_mission_page_token_cap_defaults_to_the_setting(client, monkeypatch):
     assert "<span data-tele-tokens-bar" not in html
 
 
+@pytest.mark.parametrize("tokens, shown", [
+    (999, "999"), (1_000, "1k"), (12_340, "12.3k"), (999_949, "999.9k"),
+    (999_950, "1M"), (1_260_000, "1.3M"),
+])
+def test_token_breakdown_rounds_before_choosing_a_unit(client, tokens, shown):
+    from models import LlmCall
+    _seed_mission(status="done")
+    _run(storage.insert_llm_call(LlmCall(
+        purpose="plan", tier="reasoning", model="m", mission_id="m1",
+        prompt_tokens=tokens, completion_tokens=0)))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert re.search(rf'<small class="tele-sub">\s*plan {re.escape(shown)}\s*</small>', html)
+
+
 def test_api_mission_reports_llm_tokens(client):
     _seed_mission(status="collecting")
     assert client.get("/api/mission/m1").get_json()["llm_tokens"] == 0
@@ -1210,6 +1234,27 @@ def test_requirement_detail_shows_search_signals(client):
     assert rows == [
         ("", "pass 1 · 3 queries · 11 results · brave, bing"),
         (" zero", "pass 2 · 2 queries · 0 results · no engine answered"),
+    ]
+
+
+def test_search_signals_keep_a_retask_run_apart(client):
+    # Rows are appended in order and every collection run numbers its passes
+    # from 1, so a retask's pass 1 must not merge into the first run's.
+    _seed_mission(status="done")
+    _run(storage.update_requirement("r0", search_stats_json=json.dumps([
+        {"pass": 1, "query": "a", "engine": "brave", "results": 4},
+        {"pass": 1, "query": "b", "engine": "brave", "results": 2},
+        {"pass": 2, "query": "c", "engine": "bing", "results": 3},
+        {"pass": 1, "query": "d", "engine": None, "results": 0},
+        {"pass": 2, "query": "e", "engine": "brave", "results": 5},
+    ])))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    rows = re.findall(r'<li class="search-stat( zero)?">\s*(.*?)\s*</li>', html, re.S)
+    assert rows == [
+        ("", "pass 1 · 2 queries · 6 results · brave"),
+        ("", "pass 2 · 1 query · 3 results · bing"),
+        (" zero", "run 2 · pass 1 · 1 query · 0 results · no engine answered"),
+        ("", "run 2 · pass 2 · 1 query · 5 results · brave"),
     ]
 
 
@@ -1251,13 +1296,21 @@ def test_agent_run_hands_its_job_to_the_planner(client, app_mod, monkeypatch):
     assert not jobs.get_job(m.job_id).done
 
 
-def test_run_form_offers_a_token_budget(client, monkeypatch):
-    monkeypatch.setattr(config.settings, "max_llm_tokens", 250000)
+@pytest.mark.parametrize("setting, shown", [
+    (250000, "250,000"), (8_000_000, "8,000,000"), (-1, "unlimited"), (0, "unlimited"),
+])
+def test_run_form_offers_a_token_budget(client, monkeypatch, setting, shown):
+    monkeypatch.setattr(config.settings, "max_llm_tokens", setting)
     _seed_agent()
     html = client.get("/").get_data(as_text=True)
     tag = re.search(r'<input[^>]*name="max_llm_tokens"[^>]*>', html).group(0)
-    assert 'value="250000"' in tag
     assert 'min="0"' in tag and 'max="5000000"' in tag
+    # The field starts blank (blank means the setting) so its value is always
+    # in range: the panel is hidden until Agentic Crawl is chosen, and an
+    # invalid hidden field silently blocks every submit of the search form.
+    value = re.search(r'\svalue="([^"]*)"', tag)
+    assert value is None or value.group(1) == ""
+    assert f'placeholder="{shown}"' in tag
 
 
 # --- crawl page: skipped count --------------------------------------------

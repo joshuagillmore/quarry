@@ -38,9 +38,11 @@ NEW = "https://new.example/c"
 
 def _seed_pair(parent=True, parent_id="p1",
                parent_brief="Old finding [1] with **bold**.",
-               child_brief="New finding [1] and <script>alert(1)</script> more [2]."):
+               child_brief="New finding [1] and <script>alert(1)</script> more [2].",
+               child_docs=True, child_status="done"):
     """A parent run p1 (SHARED + DROPPED) and its child m2 (SHARED + NEW).
-    With parent=False only m2 exists, still pointing at `parent_id`."""
+    With parent=False only m2 exists, still pointing at `parent_id`; with
+    child_docs=False m2 has collected nothing."""
     async def go():
         await storage.init_db()
         await storage.insert_agent(Agent(id="a1", name="Ada", expertise="orbital mechanics",
@@ -51,7 +53,7 @@ def _seed_pair(parent=True, parent_id="p1",
                 brief_markdown=parent_brief, created_at="2026-01-01T07:00:00",
                 finished_at="2026-01-01T07:05:00"))
         await storage.insert_mission(Mission(
-            id="m2", agent_id="a1", question="What changed on Tuesday?", status="done",
+            id="m2", agent_id="a1", question="What changed on Tuesday?", status=child_status,
             brief_markdown=child_brief, parent_mission_id=parent_id,
             created_at="2026-01-02T07:00:00", finished_at="2026-01-02T07:06:00"))
 
@@ -62,10 +64,11 @@ def _seed_pair(parent=True, parent_id="p1",
                 content_markdown="An ordinary sentence about the topic. " * 20, word_count=120))
 
         shared = await doc("d-shared", SHARED, "q")
-        await storage.link_mission_document("m2", "r", shared)
-        await storage.link_mission_document("m2", "r", await doc("d-new", NEW, "q"))
-        # The same URL stored under a second query must count once.
-        await storage.link_mission_document("m2", "r", await doc("d-new-2", NEW, "q2"))
+        if child_docs:
+            await storage.link_mission_document("m2", "r", shared)
+            await storage.link_mission_document("m2", "r", await doc("d-new", NEW, "q"))
+            # The same URL stored under a second query must count once.
+            await storage.link_mission_document("m2", "r", await doc("d-new-2", NEW, "q2"))
         if parent:
             await storage.link_mission_document("p1", "r", shared)
             await storage.link_mission_document("p1", "r", await doc("d-dropped", DROPPED, "q"))
@@ -148,8 +151,43 @@ def test_mission_page_links_to_compare_only_when_the_parent_exists(client):
     assert "/compare" not in client.get("/missions/m2").get_data(as_text=True)
 
 
-def test_compare_a_run_with_no_brief_yet(client):
+def _columns(html):
+    """(previous run column, this run column)."""
+    cols = re.findall(r'<section class="brief cmp-col">(.*?)</section>', html, re.S)
+    assert len(cols) == 2
+    return cols
+
+
+def test_compare_a_finished_run_without_a_brief(client):
     _seed_pair(child_brief=None)
     html = client.get("/missions/m2/compare").get_data(as_text=True)
-    assert "No brief was written for this run" in html
-    assert "Old finding [1]" in html
+    prev, this = _columns(html)
+    assert "No brief." in this and "in progress" not in this
+    assert "Old finding [1]" in prev
+
+
+def test_compare_a_run_still_in_progress(client):
+    _seed_pair(child_brief=None, child_status="collecting")
+    html = client.get("/missions/m2/compare").get_data(as_text=True)
+    _prev, this = _columns(html)
+    assert "No brief yet: this run is still in progress." in this
+
+
+def test_compare_a_parent_without_a_brief(client):
+    _seed_pair(parent_brief=None)
+    html = client.get("/missions/m2/compare").get_data(as_text=True)
+    prev, this = _columns(html)
+    assert "No brief." in prev
+    assert "New finding [1]" in this
+
+
+def test_compare_a_run_that_collected_nothing(client):
+    # Empty lists say only what is true of them: a run with no sources has
+    # nothing new, but not because "every source was already there".
+    _seed_pair(child_docs=False)
+    html = client.get("/missions/m2/compare").get_data(as_text=True)
+    assert "already in the previous run" not in html
+    assert "No new sources." in _section(html, "new")
+    dropped = _section(html, "dropped")
+    assert SHARED in dropped and DROPPED in dropped
+    assert "No sources in common." in _section(html, "shared")

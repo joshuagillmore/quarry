@@ -59,7 +59,9 @@
     });
   </script>
 
-  {% if documents %}
+  {# The search input stays when a full-text search matched nothing, so the
+     query can be refined; the card filters only make sense with cards. #}
+  {% if documents or full_text_query %}
   <form class="library-toolbar" method="get" action="/documents" id="libForm">
     {% if search_filter %}<input type="hidden" name="search" value="{{ search_filter }}">{% endif %}
     {% if mission_filter %}<input type="hidden" name="mission" value="{{ mission_filter }}">{% endif %}
@@ -76,6 +78,7 @@
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5 12.5 12.5M12.5 3.5l-9 9"/></svg>
       </button>
     </div>
+    {% if documents %}
     <select id="libAge" class="select">
       <option value="all">Any date</option>
       <option value="day">Last 24 hours</option>
@@ -93,7 +96,11 @@
       <option value="words">Word count</option>
       <option value="domain">Domain</option>
     </select>
+    {% endif %}
   </form>
+  {% endif %}
+
+  {% if documents %}
 
   <div class="filter-row" id="domainChips">
     <button type="button" class="filter-chip active" data-domain="all">
@@ -146,6 +153,11 @@
     {% if pager.next_url %}<a class="btn btn-sm" href="{{ pager.next_url }}" rel="next">Older &rarr;</a>{% endif %}
   </nav>
   {% endif %}
+  {% elif full_text_query %}
+  <div class="empty-state">
+    <div class="title">No pages match <em>"{{ full_text_query }}"</em>.</div>
+    <div>Try other words, or <a href="{{ url_for('documents_list', search=search_filter) if search_filter else url_for('documents_list') }}" style="color: var(--accent);">clear the search</a>.</div>
+  </div>
   {% else %}
   <div class="empty-state">
     <div class="title">No documents yet.</div>

@@ -80,11 +80,17 @@
               <label class="ag-label">Tries/req</label>
               <input type="number" class="select" style="width:84px;" name="per_req_attempts" id="agTries" min="1" max="6" value="{{ agents[0].default_per_req_attempts }}">
             </div>
+            {# Starts blank (blank = MAX_LLM_TOKENS, shown as the placeholder):
+               the setting may be -1 or above the field's max, and this panel
+               is hidden until Agentic Crawl is chosen, where an out-of-range
+               value would silently block every submit of the search form. #}
+            {% set tok_default = default_max_llm_tokens | default(0) %}
             <div class="ag-field">
               <label class="ag-label" for="agTokens">LLM tokens</label>
               <input type="number" class="select" style="width:112px;" name="max_llm_tokens" id="agTokens"
-                     min="0" max="5000000" value="{{ default_max_llm_tokens | default(0) }}"
-                     title="Stop collecting once this mission's LLM calls have used this many tokens (prompt + completion). 0 = no limit.">
+                     min="0" max="5000000"
+                     placeholder="{{ '{:,}'.format(tok_default) if tok_default > 0 else 'unlimited' }}"
+                     title="Stop collecting once this mission's LLM calls have used this many tokens (prompt + completion). 0 = no limit; blank = the default shown.">
             </div>
           </div>
           {% else %}

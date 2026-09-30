@@ -1006,15 +1006,24 @@ def _brief_checks(raw) -> list[dict]:
 
 
 def _search_passes(raw) -> list[dict]:
-    """A requirement's search_stats_json summed per pass, in pass order:
-    {"n", "queries", "results", "engines"}; engines are the distinct names
-    that answered, first seen first (empty when none did). Rows that are not
+    """A requirement's search_stats_json as one line per pass, in the order
+    the searches ran: {"run", "n", "queries", "results", "engines"}.
+
+    Rows are appended chronologically, and every collection run (the first,
+    then each retask) numbers its passes from 1 again. So consecutive rows
+    with the same pass number are one line, and a pass number lower than the
+    line before starts a new run: a retask's pass 1 never merges into the
+    first run's. (A retask right after a run whose last search for this
+    requirement was also pass 1 looks like more queries in that pass;
+    nothing in a row marks the run.) engines are the distinct names that
+    answered, first seen first (empty when none did). Rows that are not
     dicts or carry no integer pass are skipped; never raises."""
     try:
         parsed = json.loads(raw) if raw else []
     except (ValueError, RecursionError):
         return []
-    passes: dict[int, dict] = {}
+    lines: list[dict] = []
+    run = 1
     for item in parsed if isinstance(parsed, list) else []:
         if not isinstance(item, dict):
             continue
@@ -1026,13 +1035,17 @@ def _search_passes(raw) -> list[dict]:
             results = max(0, int(item.get("results") or 0))
         except (TypeError, ValueError, OverflowError):
             results = 0
-        p = passes.setdefault(n, {"n": n, "queries": 0, "results": 0, "engines": []})
-        p["queries"] += 1
-        p["results"] += results
+        if not lines or lines[-1]["n"] != n:
+            if lines and n < lines[-1]["n"]:
+                run += 1
+            lines.append({"run": run, "n": n, "queries": 0, "results": 0, "engines": []})
+        line = lines[-1]
+        line["queries"] += 1
+        line["results"] += results
         engine = item.get("engine")
-        if isinstance(engine, str) and engine and engine[:40] not in p["engines"]:
-            p["engines"].append(engine[:40])
-    return [passes[n] for n in sorted(passes)]
+        if isinstance(engine, str) and engine and engine[:40] not in line["engines"]:
+            line["engines"].append(engine[:40])
+    return lines
 
 
 _PURPOSE_ORDER = ("plan", "assess", "extract", "brief")

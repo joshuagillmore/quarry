@@ -24,8 +24,10 @@
   <div class="cmp-q">{{ m.question }}</div>
   {% if brief_html %}
   <div class="brief-body">{{ brief_html | safe }}</div>
+  {% elif m.status in ('planning', 'awaiting_approval', 'collecting', 'synthesizing') %}
+  <div class="cmp-empty">No brief yet: this run is still in progress.</div>
   {% else %}
-  <div class="cmp-empty">No brief was written for this run.</div>
+  <div class="cmp-empty">No brief.</div>
   {% endif %}
 </section>
 {% endmacro %}
@@ -91,12 +93,10 @@
   </div>
 
   <div class="cmp-lists">
-    {{ source_list('new', 'New in this run', delta.new,
-                   'Nothing new: every source was already in the previous run.') }}
-    {{ source_list('dropped', 'Dropped since the previous run', delta.dropped,
-                   'Nothing dropped: this run kept every earlier source.') }}
-    {{ source_list('shared', 'In both runs', delta.shared,
-                   'The two runs share no sources.') }}
+    {# Empty-list copy says only what an empty list proves. #}
+    {{ source_list('new', 'New in this run', delta.new, 'No new sources.') }}
+    {{ source_list('dropped', 'Dropped since the previous run', delta.dropped, 'Nothing dropped.') }}
+    {{ source_list('shared', 'In both runs', delta.shared, 'No sources in common.') }}
   </div>
 
 </div>
