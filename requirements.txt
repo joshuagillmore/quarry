@@ -5,7 +5,7 @@ pydantic>=2.5
 pydantic-settings>=2.0
 aiosqlite>=0.20
 python-dotenv>=1.0
-rich>=13.0
+unclecode-litellm==1.81.13  # the litellm fork crawl4ai pins; imported directly by llm.py/extractor.py
 markdown>=3.6
 bleach>=6.1
 gunicorn>=21.2

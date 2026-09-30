@@ -1,3 +1,7 @@
+# Pinned by tag, not digest: python:3.12-slim@sha256:... would be more
+# reproducible (a tag can move), but constraints.txt is what actually freezes
+# the dependency tree here, and a moving base-image tag still gets security
+# patches. Revisit if supply-chain requirements tighten.
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,6 +22,10 @@ WORKDIR /app
 COPY requirements.txt constraints.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
+# Fail the build here, not at first request, if the pinned litellm fork or
+# crawl4ai can't actually be imported (e.g. a transitive dep mismatch).
+RUN python -c "import litellm, crawl4ai"
+
 # Install Chromium's OS-level dependencies as root. The unprivileged app user
 # cannot apt-install, which is why crawl4ai-setup's dependency step failed
 # (su: Authentication failure) and left Chromium unable to launch at runtime.
@@ -31,21 +39,28 @@ USER app
 # crawl4ai-setup aborts its own browser download when its dep-install step
 # (which needs root) fails, leaving no Chromium binary at runtime.
 RUN python -m playwright install chromium
-RUN crawl4ai-setup || true
+# crawl4ai-setup's own dependency step needs root and used to fail silently
+# (hence the old `|| true`); that step now runs as root above, so a failure
+# here is real and should break the build. Follow it with an actual browser
+# launch — a broken/missing Chromium binary must fail the build, not surface
+# for the first time as a crawl error in production.
+RUN crawl4ai-setup
+RUN python -c "from playwright.sync_api import sync_playwright as p; b = p().start().chromium.launch(); b.close()"
 
 USER root
 
 COPY --chown=app:app . .
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN mkdir -p /app/data && chown -R app:app /app
+# Only /app/data needs app ownership here (the bind mount target); everything
+# else under /app was already chowned by the COPY --chown above, and
+# re-chowning the whole tree on every build was needless I/O.
+RUN mkdir -p /app/data && chown -R app:app /app/data
 
 EXPOSE 5000
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-# IMPORTANT: exactly 1 worker — the live job/mission trace is in-process memory
-# (jobs.py _store), so multiple workers would split state. gthread keeps the
-# arbiter heartbeat off request threads, so long-lived SSE streams and slow
-# crawl requests are not killed by the timeout.
-CMD ["gunicorn", "--workers", "1", "--worker-class", "gthread", "--threads", "16", \
-     "--timeout", "120", "--graceful-timeout", "30", "--bind", "0.0.0.0:5000", \
-     "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+# gunicorn.conf.py holds the server settings (workers=1 is load-bearing: see
+# the comment there) and post_worker_init, which runs app.initialize() once
+# per worker startup (init_db, reconcile_interrupted_missions, the scheduler)
+# instead of racing the first inbound request through ensure_db's lock.
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "app:app"]

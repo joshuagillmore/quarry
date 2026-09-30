@@ -3,7 +3,7 @@ with varying agents + settings, and verifies each surface. Run inside the
 container:  python /tmp/qa_harness.py
 Verification reads the SQLite DB directly; actions go through the HTTP routes.
 """
-import json, sqlite3, sys, time, urllib.parse, urllib.request
+import json, re, sqlite3, sys, time, urllib.parse, urllib.request
 
 BASE = "http://127.0.0.1:5000"
 DB = "/app/data/research.db"
@@ -29,6 +29,31 @@ def set_settings(reasoning, fast):
     post("/settings", {"llm_provider": reasoning, "llm_provider_fast": fast,
                        "ollama_api_base": "http://host.docker.internal:11434",
                        "search_max_results": "5"})
+
+def _field(html, name, default):
+    # The settings form's <input> tags wrap onto a second line, so the match
+    # has to span lines (re.S) to find id="..." and value="..." together.
+    m = re.search(rf'<input\b[^>]*\bid="{name}"[^>]*>', html, re.S)
+    if not m:
+        return default
+    v = re.search(r'value="([^"]*)"', m.group(0))
+    return v.group(1) if v else default
+
+def read_live_settings():
+    """Snapshot the settings actually in effect right now (whatever the user
+    has configured, via .env or the Settings page), so the harness can put
+    them back at the end instead of overwriting real config with its own
+    hard-coded Cohere/qwen QA baseline."""
+    _, html = get("/settings")
+    return {
+        "llm_provider": _field(html, "llm_provider", "cohere/command-a-03-2025"),
+        "llm_provider_fast": _field(html, "llm_provider_fast", ""),
+        "ollama_api_base": _field(html, "ollama_api_base", "http://host.docker.internal:11434"),
+        "search_max_results": _field(html, "search_max_results", "5"),
+    }
+
+def restore_live_settings(saved):
+    post("/settings", saved)
 
 def agent_id_by_name(name):
     row = db().execute("SELECT id FROM agents WHERE name=? ORDER BY created_at DESC LIMIT 1", (name,)).fetchone()
@@ -68,6 +93,9 @@ def check(cond, label, detail=""):
     return {"label": label, "ok": bool(cond), "detail": detail}
 
 try:
+    print("== capturing the user's real settings (restored on exit) ==", flush=True)
+    _user_settings = read_live_settings()
+
     print("== baseline settings ==", flush=True)
     set_settings("cohere/command-a-03-2025", "ollama_chat/qwen2.5:14b")
 
@@ -158,8 +186,8 @@ try:
         check(gone, "agent delete works")
 
 finally:
-    print("\n== restoring baseline settings ==", flush=True)
-    set_settings("cohere/command-a-03-2025", "ollama_chat/qwen2.5:14b")
+    print("\n== restoring the user's real settings ==", flush=True)
+    restore_live_settings(_user_settings)
 
 # summary
 print("\n================ SUMMARY ================", flush=True)
