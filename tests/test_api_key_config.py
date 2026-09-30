@@ -50,7 +50,9 @@ def test_no_key_means_litellm_falls_back_to_vendor_env(monkeypatch):
 
 def test_repo_ships_no_real_api_key():
     """.env.example must contain only blanks/placeholders — never a live key."""
-    text = pathlib.Path(".env.example").read_text(encoding="utf-8")
+    # Resolved from this file, not the cwd, so the check runs from anywhere.
+    example = pathlib.Path(__file__).resolve().parent.parent / ".env.example"
+    text = example.read_text(encoding="utf-8")
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#") or "=" not in line:

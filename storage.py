@@ -7,6 +7,29 @@ from models import Document, ExtractedData, SearchRecord, Agent, Mission, Requir
 
 DB_PATH = None
 
+# Mission states with a live worker thread behind them. `awaiting_approval` is
+# deliberately absent: it rests on the user, not on a thread.
+_IN_FLIGHT_MISSION_STATUSES = ("planning", "collecting", "synthesizing")
+
+# Columns update_agent/update_mission/update_requirement may set. Their SQL is
+# built from the keyword names, so anything else is refused outright. `id` is
+# excluded: rows are never re-keyed.
+_AGENT_COLUMNS = frozenset({
+    "name", "expertise", "persona_prompt", "default_max_passes",
+    "default_max_sources", "default_per_req_attempts", "schedule_cron",
+    "schedule_question", "active", "created_at",
+})
+_MISSION_COLUMNS = frozenset({
+    "agent_id", "question", "status", "plan_json", "budget_json",
+    "brief_markdown", "brief_sources_json", "job_id", "parent_mission_id",
+    "error", "created_at", "started_at", "finished_at",
+})
+_REQUIREMENT_COLUMNS = frozenset({
+    "mission_id", "title", "description", "rationale", "status", "attempts",
+    "next_queries_json", "satisfied_doc_ids_json", "assessment_missing",
+    "assessment_confidence", "accepted_by_user",
+})
+
 
 def get_db_path() -> str:
     global DB_PATH
@@ -16,9 +39,30 @@ def get_db_path() -> str:
     return DB_PATH
 
 
+async def _add_column(db, table: str, col: str, decl: str) -> None:
+    """Add a column to a table created before the column existed. Checks
+    PRAGMA table_info first, so an ALTER that fails for a real reason surfaces
+    instead of being swallowed along with the expected "already there" case.
+    `table`/`col`/`decl` are code constants, never user input."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        existing = {row[1] for row in await cur.fetchall()}
+    if col not in existing:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+def _validated_columns(fields: dict, allowed: frozenset, table: str) -> str:
+    """The `col = ?, ...` SET clause for an update, refusing any key that is
+    not a known column (the clause is built from the keyword names)."""
+    unknown = sorted(set(fields) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {table} column(s): {', '.join(unknown)}")
+    return ", ".join(f"{k} = ?" for k in fields)
+
+
 async def init_db():
     db_path = get_db_path()
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    # A bare filename (DB_PATH=research.db) has no directory component.
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
@@ -57,10 +101,7 @@ async def init_db():
                 job_id TEXT
             )
         """)
-        try:
-            await db.execute("ALTER TABLE searches ADD COLUMN job_id TEXT")
-        except Exception:
-            pass
+        await _add_column(db, "searches", "job_id", "TEXT")
         await db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
                 doc_id UNINDEXED,
@@ -88,10 +129,7 @@ async def init_db():
             )
         """)
         # The standing question a scheduled ("morning brief") run researches.
-        try:
-            await db.execute("ALTER TABLE agents ADD COLUMN schedule_question TEXT")
-        except Exception:
-            pass
+        await _add_column(db, "agents", "schedule_question", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS missions (
                 id TEXT PRIMARY KEY,
@@ -101,6 +139,7 @@ async def init_db():
                 plan_json TEXT,
                 budget_json TEXT,
                 brief_markdown TEXT,
+                brief_sources_json TEXT,
                 job_id TEXT,
                 parent_mission_id TEXT,
                 error TEXT,
@@ -109,6 +148,8 @@ async def init_db():
                 finished_at TEXT
             )
         """)
+        # The citation order the brief was written against (see models.Mission).
+        await _add_column(db, "missions", "brief_sources_json", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS requirements (
                 id TEXT PRIMARY KEY,
@@ -131,10 +172,7 @@ async def init_db():
         for _col, _type in (("assessment_missing", "TEXT"),
                             ("assessment_confidence", "TEXT"),
                             ("accepted_by_user", "INTEGER DEFAULT 0")):
-            try:
-                await db.execute(f"ALTER TABLE requirements ADD COLUMN {_col} {_type}")
-            except Exception:
-                pass
+            await _add_column(db, "requirements", _col, _type)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS mission_documents (
                 mission_id TEXT NOT NULL,
@@ -143,6 +181,22 @@ async def init_db():
                 PRIMARY KEY (mission_id, requirement_id, document_id)
             )
         """)
+        # Lookup indexes for the hot filters and joins: the Library by
+        # collection, extractions per document, a mission's requirements,
+        # reverse document-to-mission links, and an agent's in-flight missions.
+        for _stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_documents_query_crawled "
+            "ON documents(search_query, crawled_at)",
+            "CREATE INDEX IF NOT EXISTS idx_extractions_document "
+            "ON extractions(document_id)",
+            "CREATE INDEX IF NOT EXISTS idx_requirements_mission "
+            "ON requirements(mission_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mission_documents_document "
+            "ON mission_documents(document_id)",
+            "CREATE INDEX IF NOT EXISTS idx_missions_agent_status "
+            "ON missions(agent_id, status)",
+        ):
+            await db.execute(_stmt)
 
         async with db.execute("SELECT COUNT(*) FROM documents") as c:
             docs_ct = (await c.fetchone())[0]
@@ -158,32 +212,12 @@ async def init_db():
         await db.commit()
 
 
-async def insert_document(doc: Document) -> bool:
-    db_path = get_db_path()
-    async with aiosqlite.connect(db_path) as db:
-        try:
-            await db.execute(
-                """INSERT OR REPLACE INTO documents
-                   (id, url, domain, title, search_query, crawled_at,
-                    content_markdown, content_fit, word_count,
-                    links_internal, links_external, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (doc.id, doc.url, doc.domain, doc.title, doc.search_query,
-                 doc.crawled_at, doc.content_markdown, doc.content_fit,
-                 doc.word_count, doc.links_internal, doc.links_external,
-                 doc.metadata_json)
-            )
-            await db.execute("DELETE FROM documents_fts WHERE doc_id = ?", (doc.id,))
-            await db.execute(
-                """INSERT INTO documents_fts(doc_id, title, domain, url, content)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (doc.id, doc.title or "", doc.domain, doc.url, doc.content_markdown or "")
-            )
-            await db.commit()
-            return True
-        except Exception as e:
-            print(f"Error inserting document: {e}")
-            return False
+async def insert_document(doc: Document) -> str:
+    """Store a crawled document and return the id that is authoritative for
+    its (url, search_query): the existing row's id on a re-crawl, not doc.id.
+    Kept as a name for callers; it is exactly upsert_document and, like it,
+    raises on failure instead of printing and reporting success."""
+    return await upsert_document(doc)
 
 
 def _build_fts_query(text: str) -> str:
@@ -268,25 +302,54 @@ async def get_document(doc_id: str) -> Optional[Document]:
     return None
 
 
-async def get_documents_by_search(query: str) -> list[Document]:
-    db_path = get_db_path()
-    async with aiosqlite.connect(db_path) as db:
+# Every documents column except the two (potentially huge) markdown bodies.
+_DOC_META_COLUMNS = (
+    "id, url, domain, title, search_query, crawled_at, word_count, "
+    "links_internal, links_external, metadata_json"
+)
+
+
+async def _list_documents(where: str, where_args: tuple, limit: Optional[int],
+                          offset: int, preview_chars: Optional[int]) -> list[Document]:
+    """Shared body of get_all_documents / get_documents_by_search.
+
+    preview_chars set: content_fit carries only the first preview_chars of
+    (content_fit, else content_markdown) and content_markdown is None, so a
+    listing page does not pull every full page body out of SQLite."""
+    args: list = []
+    if preview_chars is None:
+        cols = "*"
+    else:
+        cols = (f"{_DOC_META_COLUMNS}, "
+                "substr(coalesce(content_fit, content_markdown), 1, ?) AS content_fit, "
+                "NULL AS content_markdown")
+        args.append(max(0, int(preview_chars)))
+    sql = f"SELECT {cols} FROM documents"
+    if where:
+        sql += f" WHERE {where}"
+        args.extend(where_args)
+    # id breaks crawled_at ties so consecutive pages neither overlap nor skip.
+    sql += " ORDER BY crawled_at DESC, id"
+    offset = max(0, int(offset or 0))
+    if limit is not None or offset:
+        # SQLite needs a LIMIT to take an OFFSET; -1 means "no limit".
+        sql += " LIMIT ? OFFSET ?"
+        args.extend((-1 if limit is None else max(0, int(limit)), offset))
+    async with aiosqlite.connect(get_db_path()) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM documents WHERE search_query = ? ORDER BY crawled_at DESC",
-            (query,)
-        ) as cursor:
+        async with db.execute(sql, args) as cursor:
             rows = await cursor.fetchall()
             return [Document(**dict(row)) for row in rows]
 
 
-async def get_all_documents() -> list[Document]:
-    db_path = get_db_path()
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM documents ORDER BY crawled_at DESC") as cursor:
-            rows = await cursor.fetchall()
-            return [Document(**dict(row)) for row in rows]
+async def get_documents_by_search(query: str, limit: Optional[int] = None, offset: int = 0,
+                                  preview_chars: Optional[int] = None) -> list[Document]:
+    return await _list_documents("search_query = ?", (query,), limit, offset, preview_chars)
+
+
+async def get_all_documents(limit: Optional[int] = None, offset: int = 0,
+                            preview_chars: Optional[int] = None) -> list[Document]:
+    return await _list_documents("", (), limit, offset, preview_chars)
 
 
 async def get_extractions_for_document(doc_id: str) -> list[ExtractedData]:
@@ -387,42 +450,37 @@ async def get_related_documents(doc_id: str, search_query: str, domain: str, lim
 async def upsert_document(doc: Document) -> str:
     """Insert a document, or if one already exists for (url, search_query),
     refresh its content in place and keep its existing id. Returns the id that
-    is now authoritative for that (url, search_query). Used by mission
-    collection so the mission_documents join table never points at an orphaned
-    id (unlike INSERT OR REPLACE, which mints a new id on conflict)."""
+    is now authoritative for that (url, search_query), so mission links and
+    extractions never point at an orphaned id (INSERT OR REPLACE would mint a
+    new one on conflict).
+
+    One INSERT ... ON CONFLICT DO UPDATE statement, not select-then-write: two
+    concurrent crawls of the same URL cannot both miss the row and then collide
+    on the UNIQUE constraint. The FTS row is replaced in the same transaction."""
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id FROM documents WHERE url = ? AND search_query = ?",
-            (doc.url, doc.search_query),
+            """INSERT INTO documents
+               (id, url, domain, title, search_query, crawled_at,
+                content_markdown, content_fit, word_count,
+                links_internal, links_external, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(url, search_query) DO UPDATE SET
+                   domain=excluded.domain, title=excluded.title,
+                   crawled_at=excluded.crawled_at,
+                   content_markdown=excluded.content_markdown,
+                   content_fit=excluded.content_fit,
+                   word_count=excluded.word_count,
+                   links_internal=excluded.links_internal,
+                   links_external=excluded.links_external,
+                   metadata_json=excluded.metadata_json
+               RETURNING id""",
+            (doc.id, doc.url, doc.domain, doc.title, doc.search_query,
+             doc.crawled_at, doc.content_markdown, doc.content_fit,
+             doc.word_count, doc.links_internal, doc.links_external,
+             doc.metadata_json),
         ) as cur:
-            existing = await cur.fetchone()
-
-        doc_id = existing["id"] if existing else doc.id
-        if existing:
-            await db.execute(
-                """UPDATE documents SET
-                       domain=?, title=?, crawled_at=?, content_markdown=?,
-                       content_fit=?, word_count=?, links_internal=?,
-                       links_external=?, metadata_json=?
-                   WHERE id=?""",
-                (doc.domain, doc.title, doc.crawled_at, doc.content_markdown,
-                 doc.content_fit, doc.word_count, doc.links_internal,
-                 doc.links_external, doc.metadata_json, doc_id),
-            )
-        else:
-            await db.execute(
-                """INSERT INTO documents
-                   (id, url, domain, title, search_query, crawled_at,
-                    content_markdown, content_fit, word_count,
-                    links_internal, links_external, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (doc_id, doc.url, doc.domain, doc.title, doc.search_query,
-                 doc.crawled_at, doc.content_markdown, doc.content_fit,
-                 doc.word_count, doc.links_internal, doc.links_external,
-                 doc.metadata_json),
-            )
+            doc_id = (await cur.fetchone())[0]
         await db.execute("DELETE FROM documents_fts WHERE doc_id = ?", (doc_id,))
         await db.execute(
             """INSERT INTO documents_fts(doc_id, title, domain, url, content)
@@ -466,7 +524,7 @@ async def update_agent(agent_id: str, **fields) -> None:
     if not fields:
         return
     db_path = get_db_path()
-    cols = ", ".join(f"{k} = ?" for k in fields)
+    cols = _validated_columns(fields, _AGENT_COLUMNS, "agents")
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             f"UPDATE agents SET {cols} WHERE id = ?",
@@ -517,12 +575,13 @@ async def insert_mission(mission: Mission) -> bool:
         await db.execute(
             """INSERT INTO missions
                (id, agent_id, question, status, plan_json, budget_json,
-                brief_markdown, job_id, parent_mission_id, error,
-                created_at, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                brief_markdown, brief_sources_json, job_id,
+                parent_mission_id, error, created_at, started_at, finished_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mission.id, mission.agent_id, mission.question, mission.status,
              mission.plan_json, mission.budget_json, mission.brief_markdown,
-             mission.job_id, mission.parent_mission_id, mission.error,
+             mission.brief_sources_json, mission.job_id,
+             mission.parent_mission_id, mission.error,
              mission.created_at, mission.started_at, mission.finished_at),
         )
         await db.commit()
@@ -533,13 +592,40 @@ async def update_mission(mission_id: str, **fields) -> None:
     if not fields:
         return
     db_path = get_db_path()
-    cols = ", ".join(f"{k} = ?" for k in fields)
+    cols = _validated_columns(fields, _MISSION_COLUMNS, "missions")
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             f"UPDATE missions SET {cols} WHERE id = ?",
             (*fields.values(), mission_id),
         )
         await db.commit()
+
+
+async def claim_mission_status(mission_id: str, from_status: str, to_status: str) -> bool:
+    """Atomic compare-and-set on a mission's status. True only for the one
+    caller whose UPDATE actually moved it from `from_status`, so a double
+    submit (two approve clicks, approve racing retask) starts one worker."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        cur = await db.execute(
+            "UPDATE missions SET status = ? WHERE id = ? AND status = ?",
+            (to_status, mission_id, from_status),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
+async def agent_has_active_mission(agent_id: str) -> bool:
+    """True while any of the agent's missions has a live worker (planning,
+    collecting, synthesizing). `awaiting_approval` does not count."""
+    db_path = get_db_path()
+    marks = ",".join("?" * len(_IN_FLIGHT_MISSION_STATUSES))
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            f"SELECT 1 FROM missions WHERE agent_id = ? AND status IN ({marks}) LIMIT 1",
+            (agent_id, *_IN_FLIGHT_MISSION_STATUSES),
+        ) as cur:
+            return await cur.fetchone() is not None
 
 
 async def get_mission(mission_id: str) -> Optional[Mission]:
@@ -571,7 +657,7 @@ async def reconcile_interrupted_missions() -> int:
     `awaiting_approval` is deliberately excluded: it is a legitimate resting
     state that waits on the user, not on a thread.
     """
-    stuck = ("planning", "collecting", "synthesizing")
+    stuck = _IN_FLIGHT_MISSION_STATUSES
     note = "Interrupted by a server restart — the collection worker did not survive."
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
@@ -703,7 +789,7 @@ async def update_requirement(req_id: str, **fields) -> None:
     if not fields:
         return
     db_path = get_db_path()
-    cols = ", ".join(f"{k} = ?" for k in fields)
+    cols = _validated_columns(fields, _REQUIREMENT_COLUMNS, "requirements")
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             f"UPDATE requirements SET {cols} WHERE id = ?",

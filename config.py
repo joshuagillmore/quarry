@@ -1,13 +1,28 @@
 import json
 import os
 import sys
-from pydantic_settings import BaseSettings
+import tempfile
+import threading
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
-load_dotenv()
+# utf-8-sig strips a BOM (what PowerShell's `-Encoding utf8` writes) so the
+# first key is not read with a stray U+FEFF prefix.
+load_dotenv(encoding="utf-8-sig")
 
 
 class Settings(BaseSettings):
+    # extra="ignore": .env may legitimately hold keys this class does not
+    # declare (OPENAI_API_KEY and friends, which LiteLLM reads itself).
+    # env_ignore_empty: `CRAWL_TIMEOUT=` means "use the default", not "fail to
+    # parse an empty int".
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8-sig",
+        extra="ignore",
+        env_ignore_empty=True,
+    )
+
     # API key for whichever hosted LLM provider you point LLM_PROVIDER at.
     # Provider-agnostic: LLM_API_KEY is the name to use. COHERE_API_KEY is kept
     # working because early versions assumed Cohere. Local Ollama needs no key.
@@ -25,7 +40,12 @@ class Settings(BaseSettings):
     search_backends: str = "auto,brave,bing,duckduckgo"
     db_path: str = "data/research.db"
     crawl_timeout: int = 30000
-    flask_host: str = "0.0.0.0"
+    # Per-call LLM request timeout in seconds. Without one, a hung provider
+    # holds a mission worker (and its job slot) forever.
+    llm_timeout_s: int = 120
+    # Loopback by default: the dev server must not be network-reachable
+    # unless asked (the Docker image sets its own bind address).
+    flask_host: str = "127.0.0.1"
     flask_port: int = 5000
     flask_debug: bool = False
     flask_secret_key: str = ""
@@ -41,9 +61,11 @@ class Settings(BaseSettings):
     # Mirrors the compose-level publish interface (env_file passes it through)
     # so the app can warn when it is exposed beyond loopback without a password.
     quarry_bind: str = "127.0.0.1"
-
-    class Config:
-        env_file = ".env"
+    # Comma-separated extra hostnames accepted in the Host header, on top of
+    # localhost / 127.0.0.1 / [::1]. Always enforced while auth is off (a DNS
+    # rebinding guard); with QUARRY_PASSWORD set, enforced only if non-empty.
+    # Add the name you browse to if it is not localhost.
+    quarry_trusted_hosts: str = ""
 
 
 settings = Settings()
@@ -103,37 +125,49 @@ def load_overrides() -> None:
             setattr(settings, k, data[k])
 
 
+# Serialises save_overrides' read-modify-write: two concurrent Settings saves
+# must not each start from the same file and drop the other's change.
+_overrides_lock = threading.Lock()
+
+
 def save_overrides(values: dict) -> None:
     path = _overrides_path()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            current = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        current = {}
-    for k in OVERRIDE_KEYS:
-        if k in values and values[k] is not None:
-            current[k] = values[k]
-            setattr(settings, k, values[k])
-    # Remember every model that's been used so it stays in the dropdown even
-    # after you overwrite a field.
-    models = list(current.get("known_models", []))
-    for m in (current.get("llm_provider"), current.get("llm_provider_fast")):
-        if m and m not in models:
-            models.append(m)
-    current["known_models"] = models
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # Atomic write (temp file + rename) so a crash mid-dump can't truncate the
-    # live file and take UI-saved settings (incl. the API key) with it.
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(current, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    try:
-        os.chmod(tmp, 0o600)  # may hold an API key
-    except OSError:
-        pass  # best-effort (e.g. Windows bind mounts)
-    os.replace(tmp, path)
+    with _overrides_lock:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                current = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            current = {}
+        for k in OVERRIDE_KEYS:
+            if k in values and values[k] is not None:
+                current[k] = values[k]
+                setattr(settings, k, values[k])
+        # Remember every model that's been used so it stays in the dropdown
+        # even after you overwrite a field.
+        models = list(current.get("known_models", []))
+        for m in (current.get("llm_provider"), current.get("llm_provider_fast")):
+            if m and m not in models:
+                models.append(m)
+        current["known_models"] = models
+        data_dir = os.path.dirname(path) or "."
+        os.makedirs(data_dir, exist_ok=True)
+        # Atomic write (unique temp file + rename) so a crash mid-dump can't
+        # truncate the live file and take UI-saved settings (incl. the API
+        # key) with it. mkstemp creates the file 0600 from the start, so the
+        # key is never briefly world-readable.
+        fd, tmp = tempfile.mkstemp(dir=data_dir, prefix="settings.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(current, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def persistent_secret_key() -> str:
@@ -155,12 +189,16 @@ def persistent_secret_key() -> str:
     key = _secrets.token_hex(32)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # Created 0600 (not chmod-ed afterwards) so the key is never briefly
+    # readable by other users.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+                 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(key)
     try:
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, 0o600)  # a stale tmp from a crash keeps its old mode
     except OSError:
-        pass
+        pass  # best-effort (e.g. Windows bind mounts)
     os.replace(tmp, path)
     return key
 
@@ -169,11 +207,14 @@ def known_models() -> list[str]:
     """Model ids to suggest in the Settings dropdowns: seeds + any ever used +
     the currently active ones."""
     models = list(DEFAULT_KNOWN_MODELS)
-    try:
-        with open(_overrides_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {}
+    # Same lock as save_overrides: on Windows, replacing a file another thread
+    # holds open fails, so a render must not overlap a save.
+    with _overrides_lock:
+        try:
+            with open(_overrides_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
     for m in list(data.get("known_models", [])) + [settings.llm_provider, settings.llm_provider_fast]:
         if m and m not in models:
             models.append(m)
