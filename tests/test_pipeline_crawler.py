@@ -92,6 +92,51 @@ def test_attempted_is_optional(monkeypatch):
     assert [d.url for d in docs] == ["http://c.example/1"]
 
 
+def _pages(urls):
+    def page(u):
+        async def fetch():
+            return _Result(u)
+        return fetch
+    return {u: page(u) for u in urls}
+
+
+def test_cancel_skips_every_unfetched_page_when_asked(monkeypatch):
+    urls = ["http://c.example/1", "http://c.example/2?q=<b>"]
+    fetched = []
+
+    class Recording(_fake_crawler(_pages(urls))):
+        async def arun(self, url, config=None):
+            fetched.append(url)
+            return await super().arun(url, config)
+
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", Recording)
+    jid = _job(urls)
+    jobs.request_cancel(jid)
+    attempted = set()
+    docs = asyncio.run(crawler.crawl_urls_with_progress(
+        _srs(urls), "q", jid, attempted=attempted, skip_on_cancel=True))
+
+    assert docs == [] and fetched == []
+    assert attempted == set(), "a skipped page was never tried; a later run may fetch it"
+    job = jobs.get_job(jid)
+    assert [u.status for u in job.urls] == ["skipped", "skipped"]
+    assert job.crawl_done == 2
+    msgs = " ".join(entry.msg for entry in job.log)
+    assert "&lt;b&gt;" in msgs and "<b>" not in msgs
+
+
+def test_cancel_does_not_skip_pages_by_default(monkeypatch):
+    """Missions leave skip_on_cancel off: their stop is honoured at the next
+    pass boundary, so the crawl in flight still fetches every page."""
+    urls = ["http://c.example/1", "http://c.example/2"]
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", _fake_crawler(_pages(urls)))
+    jid = _job(urls)
+    jobs.request_cancel(jid)
+    docs = asyncio.run(crawler.crawl_urls_with_progress(_srs(urls), "q", jid))
+    assert sorted(d.url for d in docs) == urls
+    assert [u.status for u in jobs.get_job(jid).urls] == ["done", "done"]
+
+
 def test_hung_page_times_out(monkeypatch):
     async def hangs():
         await asyncio.sleep(30)

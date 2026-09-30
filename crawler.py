@@ -86,7 +86,8 @@ def _page_names(sr: SearchResult, result) -> list[str]:
 
 async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,
                                    job_id: str, attempted: set[str] | None = None,
-                                   aliases: dict[str, str] | None = None) -> list[Document]:
+                                   aliases: dict[str, str] | None = None,
+                                   skip_on_cancel: bool = False) -> list[Document]:
     """Crawl `search_results` with progress reported into the job store.
 
     One page can go by several URLs (the search result, the URL crawl4ai
@@ -96,8 +97,15 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
     another name. When `aliases` is given, each name other than the stored
     document's `url` is mapped to it, so a caller can find the document from
     any of them. The extra names are also kept in the document's metadata
-    (`requested_url`, `redirected_url`) for callers in a later run."""
-    from jobs import update_url, add_log, inc_counter
+    (`requested_url`, `redirected_url`) for callers in a later run.
+
+    With `skip_on_cancel` (the one-shot crawl), a cancel requested on the job
+    stops every page not fetched yet: it is marked "skipped" and not added to
+    `attempted`; fetches already in flight finish and are returned. Missions
+    leave it off: their stop is honoured at the next pass boundary, and a
+    skipped crawl would have the rest of the pass assess requirements
+    against sources that were never fetched."""
+    from jobs import update_url, add_log, inc_counter, is_cancelled
 
     browser_cfg = BrowserConfig(headless=True, browser_type="chromium")
     # Stealth options: a plain headless Chromium is trivially fingerprinted, and
@@ -121,6 +129,12 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         async def crawl_one(sr: SearchResult) -> Document | None:
             async with semaphore:
+                if skip_on_cancel and is_cancelled(job_id):
+                    update_url(job_id, sr.url, status="skipped")
+                    inc_counter(job_id, "crawl_done")
+                    add_log(job_id, "warn",
+                            f"skipped <code>{_esc(sr.url)}</code>: cancelled")
+                    return None
                 if attempted is not None:
                     attempted.add(sr.url)
                 update_url(job_id, sr.url, status="fetching")

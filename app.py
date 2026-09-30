@@ -23,9 +23,8 @@ import scheduler
 from config import (settings, save_overrides, known_models,
                     persistent_secret_key, active_api_key)
 from search import web_search
-from crawler import crawl_urls
 from storage import (
-    init_db, insert_document, insert_search, insert_extraction,
+    init_db, insert_search, insert_extraction,
     get_document, get_documents_by_search, get_all_documents,
     get_extractions_for_document, get_search_history,
     count_documents, count_searches, count_extractions, count_domains,
@@ -1155,9 +1154,12 @@ def mission_delete(mission_id):
         flash("Mission not found.", "error")
         return redirect(url_for("missions_list"))
     # Deleting a mission out from under its worker would leave the thread
-    # writing rows for a mission that no longer exists.
+    # writing rows for a mission that no longer exists. Only a live job means
+    # a worker: a finished trace still in memory behind an in-flight status is
+    # a stranded mission, and must stay deletable before its trace is evicted.
+    live = get_job(mission.job_id) if mission.job_id else None
     if mission.status in ("planning", "collecting", "synthesizing") \
-            and mission.job_id in get_in_memory_job_ids():
+            and live is not None and not live.done:
         flash("This mission is still running — stop it first, then delete.", "error")
         return redirect(url_for("mission_view", mission_id=mission_id))
     # A trace that never finished (e.g. a plan discarded at the gate) would

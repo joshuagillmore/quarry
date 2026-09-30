@@ -36,20 +36,20 @@ The flow crosses a **sync/async boundary** that shapes most of the code:
 - **Flask routes (`app.py`) are synchronous** but all storage and crawling is `async`. Routes call the `run_async(coro)` helper, which runs a coroutine to completion, spawning a thread-pool executor when an event loop is already running. Use `run_async()` for any DB call from a route — never `await` directly in a route.
 - **Background jobs run in daemon threads.** `POST /search` → `create_job()` + `run_job_in_background()` spins a thread that calls `asyncio.run(_run_job(...))`. `_run_job` is the orchestrator: search → crawl-with-progress → store → optional extract → mark done.
 - **The job store is in-memory global module state** (`_store`/`_lock`/`_recent_job_ids`). It holds the live URL stream, log lines, and the sidebar's "recent crawls" list. **It is wiped on process restart** — only the SQLite DB persists. The History page's "Live crawl" links auto-hide for jobs no longer in `_store` (`get_in_memory_job_ids`). All access goes through the module-level lock.
-- **A job's terminal state goes through one function.** `finish_job(job_id, stage="done", error=None)` stamps `Job.finished_at` and is the only place a job is marked over — on success, on a crawl error, and when a mission reaches its approval gate. **The gate releases the job's slot**: hitting `awaiting_approval` calls `finish_job`, so a mission idling at the gate waiting on a human doesn't count against the bounded job-store limit; `POST /missions/<id>/approve` then creates a **fresh** job (new job_id) for the collection phase rather than reusing the planning job's slot.
+- **A job's terminal state goes through `finish_job` or `finish_if_running`.** `finish_job(job_id, stage="done", error=None)` stamps `Job.finished_at` and is how a worker marks its job over — on success, on a crawl error, on a cancel, and when a mission reaches its approval gate. `finish_if_running(job_id, stage="error", error=None)` does the same write only if the job has not already finished (check and write under one lock hold); the crash/cleanup paths (`jobs._run_thread`, `agent_runner`'s thread wrapper) use it so they never overwrite a stage the worker set properly. `update_job(done=True)` is not a substitute: it leaves `finished_at` unset. **The gate releases the job's slot**: hitting `awaiting_approval` calls `finish_job`, so a mission idling at the gate waiting on a human doesn't count against the bounded job-store limit; `POST /missions/<id>/approve` then creates a **fresh** job (new job_id) for the collection phase rather than reusing the planning job's slot.
 
 ### Progress streaming
 
-The crawl page is driven by the SSE endpoint alone (`GET /api/job/<id>/stream`, capped at ~10 min) — there's no separate polling loop. Each event carries `log_total`, a monotonic count of every log line ever added to the job (not just what's currently buffered), so the frontend can tell what it's already seen across events without diffing. Once a job has been evicted from the in-memory store (see the bounded job store below), the stream ends with a `204` rather than an error — "gone" is an expected outcome for an old job, not a failure. `job_state()` is the single serialization point that converts a `Job` dataclass into the JSON the frontend consumes — keep it and the templates in sync.
+The crawl page is driven by the SSE endpoint alone (`GET /api/job/<id>/stream`, capped at ~10 min) — there's no separate polling loop. Each event carries `log_total`, a monotonic count of every log line ever added to the job (not just what's currently buffered), so the frontend can tell what it's already seen across events without diffing. A job can be evicted from the in-memory store (see the bounded job store below) or lost to a restart: if it is already gone when the stream opens, the endpoint answers `204` (the one status that stops EventSource reconnecting); if it disappears mid-stream, the stream sends `event: gone` and ends, and the page shows the same "no longer available" notice. Either way "gone" is an expected outcome for an old job, not a failure. `job_state()` is the single serialization point that converts a `Job` dataclass into the JSON the frontend consumes — keep it and the templates in sync.
 
 ### Two crawler functions — use the progress one
 
-`crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
+`crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. The one-shot crawl (`_run_job`) passes `skip_on_cancel=True`: a cancel marks every page not fetched yet `skipped`, keeps the pages already fetched, and ends the job `cancelled`. Missions leave it off, because their stop is honoured at the next pass boundary. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
 
 ### Storage (`storage.py`)
 
 - **No connection pool** — every function opens its own `aiosqlite.connect()`. `DB_PATH` is resolved once and cached at module level (`get_db_path`).
-- **`init_db()` is idempotent and self-migrating**: `CREATE TABLE IF NOT EXISTS`, an `ALTER TABLE ... ADD COLUMN job_id` wrapped in try/except, and an FTS5 virtual table `documents_fts`. If the FTS row count diverges from `documents`, it **rebuilds the whole FTS index**. It runs once via `app.initialize()` (see Deployment notes) rather than on every request.
+- **`init_db()` is idempotent and self-migrating**: `CREATE TABLE IF NOT EXISTS`, columns added to older tables through `_add_column` (which checks `PRAGMA table_info` first and only then runs `ALTER TABLE ... ADD COLUMN`, so a real ALTER failure surfaces instead of being swallowed), and an FTS5 virtual table `documents_fts`. If the FTS row count diverges from `documents`, it **rebuilds the whole FTS index**. It runs once via `app.initialize()` (see Deployment notes) rather than on every request.
 - Documents are keyed by UUID but **`UNIQUE(url, search_query)`**. Both the one-shot crawl and mission collection write through `upsert_document`, a single atomic `INSERT ... ON CONFLICT(url, search_query) DO UPDATE ... RETURNING id` — re-crawling the same URL under the same query updates the row **in place and keeps its id** rather than replacing it. `insert_document` is a thin alias that returns that same id and raises on error. FTS rows are deleted+reinserted alongside every document write to stay consistent.
 - Full-text search input is tokenized and quoted by `_build_fts_query` before hitting `MATCH` to avoid FTS5 syntax injection.
 - **Library listing is paginated at the SQL layer, not in Python.** `get_all_documents`/`get_documents_by_search` take `limit`/`offset`, and a `preview_chars` argument that — when set — has SQLite itself truncate the preview (`substr(coalesce(nullif(content_fit, ''), content_markdown), 1, ?)`; the `nullif` matters because the crawler stores a missing `fit_markdown` as `''`, not `NULL`) and drops `content_markdown` from the row entirely, so a Library page of cards never pulls full document bodies over the wire.
@@ -126,11 +126,16 @@ runs a **Mission** against a question using an intelligence-collection loop:
   and `assessment_confidence` columns on `requirements` feed the matrix's gap /
   satisfied callouts. This was the single biggest gap in the old UI.
 - **Citation numbering must match the brief, even after a restart.**
-  `brief.ordered_sources_for_mission(mission, docs)` is the one ordering both
-  the LLM prompt and the source rail use; `_synthesize` persists that exact
-  order to `missions.brief_sources_json` so re-rendering the mission page (or
-  restarting the process) can't silently renumber the source rail against a
-  different ordering than the one the brief text actually cites.
+  The LLM prompt numbers sources with `brief.ordered_sources(docs)`, and
+  `_synthesize` persists that exact order to `missions.brief_sources_json`.
+  The source rail uses the stored order (via
+  `brief.ordered_sources_for_mission`: stored ids still present, then any
+  documents the brief did not number), capped at `brief.MAX_BRIEF_SOURCES`,
+  so re-rendering the mission page (or restarting the process) can't silently
+  renumber the rail against a different ordering than the one the brief text
+  actually cites. Linkify is bounded by the count of stored ids still
+  present, so an out-of-range `[n]` stays plain text rather than binding to
+  an uncited document a later retask appended.
   `brief.linkify_citations()` turns `[n]` into `.cite` controls **after**
   `render_markdown` sanitization (it only ever injects markup built from an
   integer it re-serializes, so the sanitizer is never weakened or bypassed).
@@ -289,8 +294,10 @@ just falls through to it.
   `post_worker_init` calls it right after the single worker forks, so the
   scheduler and a clean DB are guaranteed before gunicorn reports the worker
   healthy, instead of racing the first inbound request through a lock.
-  `python app.py` (the dev server) still triggers it on the first request, the
-  way `ensure_db` used to.
+  `python app.py` (the dev server) calls `initialize()` itself before
+  `app.run` (with the reloader on, only in the serving child process).
+  `ensure_db`'s `@app.before_request` remains as a backstop and is a no-op
+  once `initialize()` has run.
 - Compose publishes on **`127.0.0.1` by default** (`QUARRY_BIND`) since there's no login unless `QUARRY_PASSWORD` is set; a healthcheck hits `/` every 30s.
 - This is a **single-user design**: the global job store and recent-crawls tracker are not safe for concurrent users.
 - Docker: `entrypoint.sh` runs as root only to `chown` the bind-mounted `data/`, then drops to the non-root `app` user (UID 1000) via `gosu`. The Dockerfile installs Chromium OS deps as root (`playwright install-deps`) *before* downloading the browser binary as `app`, because `crawl4ai-setup`'s own dep step needs root and fails silently otherwise.

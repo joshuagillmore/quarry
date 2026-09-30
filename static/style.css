@@ -1353,6 +1353,7 @@ h1.page-title em { font-style: italic; color: var(--accent); }
 }
 .url-status.done { color: var(--success); }
 .url-status.error { color: var(--danger); }
+.url-status.skipped { color: var(--fg-subtle); }
 
 .url-main { min-width: 0; }
 .url-title {

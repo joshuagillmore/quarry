@@ -91,6 +91,7 @@
     check: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 8 3.5 3.5L13 5"/></svg>',
     x: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5 12.5 12.5M12.5 3.5l-9 9"/></svg>',
     dot: '<span style="width:6px;height:6px;border-radius:999px;background:currentColor;display:block"></span>',
+    dash: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8h8"/></svg>',
     spinner: '<div class="spinner-sm"></div>',
   };
 
@@ -157,6 +158,7 @@
     if (u.status === 'done') statusEl.innerHTML = SVG.check;
     else if (u.status === 'error') statusEl.innerHTML = SVG.x;
     else if (u.status === 'fetching') statusEl.innerHTML = SVG.spinner;
+    else if (u.status === 'skipped') statusEl.innerHTML = SVG.dash;
     else statusEl.innerHTML = SVG.dot;
 
     row.querySelector('.url-title').textContent = u.title || u.url;
@@ -168,6 +170,9 @@
       meta.textContent = 'fetching…';
     } else if (u.status === 'error') {
       meta.innerHTML = `<span style="color:var(--danger)">error</span>`;
+    } else if (u.status === 'skipped') {
+      // Never fetched: the crawl was cancelled before this page's turn.
+      meta.textContent = 'skipped';
     } else {
       meta.textContent = 'queued';
     }

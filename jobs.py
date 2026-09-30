@@ -277,7 +277,8 @@ def request_cancel(job_id: str) -> bool:
     """Ask a running job to stop. Cooperative: a mission stops at the next
     pass boundary (the current pass finishes and the brief is still
     synthesized from whatever was collected); a one-shot crawl stops before
-    crawling, before extraction, or before its next document's extraction."""
+    crawling, before its next page's fetch (keeping the pages already
+    fetched), before extraction, or before its next document's extraction."""
     with _lock:
         j = _store.get(job_id)
         if not j or j.done:
@@ -383,7 +384,10 @@ async def _run_job(job_id: str) -> None:
         update_job(job_id, stage="crawl", crawl_total=len(search_results))
         add_log(job_id, "info", f"opening headless chromium · concurrency <em>4</em>")
 
-        documents = await crawl_urls_with_progress(search_results, job.query, job_id)
+        # A cancel during the crawl skips the pages not fetched yet; the ones
+        # already fetched are stored below and kept.
+        documents = await crawl_urls_with_progress(search_results, job.query, job_id,
+                                                   skip_on_cancel=True)
 
         # upsert_document returns the id that is authoritative for the
         # (url, query) pair — an earlier crawl's id on a re-crawl, not
@@ -411,10 +415,14 @@ async def _run_job(job_id: str) -> None:
         )
         await insert_search(search_record)
 
+        if is_cancelled(job_id):
+            note = f"kept {len(stored)} documents"
+            if job.extract and stored:
+                note += ", skipped extraction"
+            _cancelled(job_id, note)
+            return
+
         if job.extract and stored:
-            if is_cancelled(job_id):
-                _cancelled(job_id, f"kept {len(stored)} documents, skipped extraction")
-                return
             await _extract_all(job_id, job.extract_prompt, stored,
                                extract_from_document, insert_extraction)
             live = get_job(job_id)

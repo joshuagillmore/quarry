@@ -64,9 +64,17 @@ def _live_jobs():
 
 @pytest.fixture()
 def starts(app_mod, monkeypatch):
+    """Records (mission_id, the mission's job_id in the DB at that moment) for
+    each start_collection call: the worker reads the mission row as soon as
+    it starts, so the fresh job must already be on it."""
     calls = []
-    monkeypatch.setattr(app_mod, "start_collection", lambda mid: calls.append(mid))
+    monkeypatch.setattr(app_mod, "start_collection",
+                        lambda mid: calls.append((mid, _mission(mid).job_id)))
     return calls
+
+
+def _started(starts):
+    return [mid for mid, _job_id in starts]
 
 
 def _seed_agent(**kw):
@@ -293,7 +301,7 @@ def test_approve_twice_starts_one_collection(client, starts):
     assert r1.status_code == 302 and _path(r1) == "/missions/m1"
     r2 = client.post("/missions/m1/approve", data={})
     assert r2.status_code == 302 and _path(r2) == "/missions/m1"
-    assert starts == ["m1"]
+    assert _started(starts) == ["m1"]
     assert any("not awaiting approval" in m for m in _flashes(client))
     m = _mission()
     assert m.status == "collecting"
@@ -318,7 +326,7 @@ def test_concurrent_approvals_start_one_collection(client, app_mod, starts):
     for t in threads:
         t.join()
     assert codes == [302] * 4
-    assert starts == ["m1"]
+    assert _started(starts) == ["m1"]
     assert sum(1 for j in jobs._store.values() if not j.done) == 1
 
 
@@ -343,7 +351,7 @@ def test_approve_drop_all_but_add_one_proceeds(client, starts):
     reqs = list(_reqs().values())
     assert [r.title for r in reqs] == ["Brand new"]
     assert json.loads(reqs[0].next_queries_json) == ["Brand new"]
-    assert starts == ["m1"]
+    assert _started(starts) == ["m1"]
 
 
 def test_approve_explicit_empty_queries_fall_back_to_title(client, starts):
@@ -374,7 +382,7 @@ def test_approve_ignores_malformed_plan_rows(client, starts):
     assert set(reqs) == {"r0", "r1"}
     assert reqs["r0"].title == "Tidy"
     assert json.loads(reqs["r0"].next_queries_json) == ["a"]
-    assert starts == ["m1"]
+    assert _started(starts) == ["m1"]
 
 
 def test_approve_db_error_after_the_claim_reopens_the_gate(client, app_mod, starts, monkeypatch):
@@ -420,7 +428,7 @@ def test_approve_deeply_nested_plan_json_is_not_a_500(client, starts):
     assert r.status_code == 302 and _path(r) == "/missions/m1"
     # Unreadable edits are treated like JS-off: the plan is approved as drafted.
     assert _mission().status == "collecting"
-    assert starts == ["m1"]
+    assert _started(starts) == ["m1"]
     assert set(_reqs()) == {"r0", "r1"}
 
 
@@ -445,7 +453,11 @@ def test_approve_points_the_mission_at_a_fresh_job(client, starts):
     client.post("/missions/m1/approve", data={})
     new = _mission().job_id
     assert new and new != old
-    assert jobs.get_job(new) is not None
+    # The worker was started with the mission already pointing at the fresh,
+    # live job, not the finished planning trace.
+    assert starts == [("m1", new)]
+    job = jobs.get_job(new)
+    assert job is not None and not job.done
 
 
 def test_approve_unknown_mission(client, starts):
@@ -467,8 +479,11 @@ def test_retask_success(client, starts):
     assert json.loads(req.next_queries_json) == ["q0", "new angle"]
     m = _mission()
     assert m.status == "collecting"
-    assert jobs.get_job(m.job_id) is not None
-    assert starts == ["m1"]
+    # The worker was started with the mission already pointing at the fresh,
+    # live job.
+    assert m.job_id and starts == [("m1", m.job_id)]
+    job = jobs.get_job(m.job_id)
+    assert job is not None and not job.done
 
 
 def test_retask_when_busy_leaves_the_requirement_alone(client, app_mod, starts, monkeypatch):
@@ -576,6 +591,21 @@ def test_delete_refused_while_running(client):
     assert _path(r) == "/missions/m1"
     assert _mission() is not None
     assert not jobs.get_job(jid).done
+
+
+def test_delete_stranded_mission_whose_job_already_finished(client):
+    # The worker died after its job ended but before the mission row left
+    # `collecting`: the finished trace is still in memory, yet nothing is
+    # running, so the delete must not wait for the trace to be evicted.
+    jid = jobs.create_mission_job("Where is it?", 7)
+    jobs.finish_job(jid, stage="error", error="worker crashed")
+    stamped = jobs.get_job(jid).finished_at
+    _seed_mission(status="collecting", job_id=jid)
+    r = client.post("/missions/m1/delete")
+    assert _path(r) == "/missions"
+    assert _mission() is None
+    job = jobs.get_job(jid)
+    assert (job.stage, job.error, job.finished_at) == ("error", "worker crashed", stamped)
 
 
 def test_delete_finished_mission_leaves_done_job_alone(client):
@@ -943,8 +973,10 @@ def test_mission_page_numbers_sources_by_the_stored_order(client):
 def test_mission_rail_is_capped_like_the_brief(client, app_mod):
     import brief
     cited = ["doc25", "doc24", "doc23"]
-    # "gone" was cited once but its document no longer exists: skipped, so
-    # it neither shifts numbering nor widens the citation bound.
+    # "gone" was cited once but its document no longer exists: skipped. It is
+    # last in the stored order, so it shifts no number here and does not
+    # widen the citation bound. A missing id mid-list would shift every later
+    # rail number down by one against the brief's [n] (known limitation).
     _seed_briefed_mission(n_docs=25, stored_order=cited + ["gone"],
                           brief_md="See [1], [3], [4] and [21].")
     html = client.get("/missions/m1").get_data(as_text=True)

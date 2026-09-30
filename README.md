@@ -185,6 +185,7 @@ searches        one row per agent run, with job_id back-reference for trace look
 Designed for **single-user local use** behind a firewall. Some specifics:
 
 - **Optional password login.** By default there is no login and Docker publishes on `127.0.0.1` (`QUARRY_BIND`), so the app is reachable only from the host machine. Before widening `QUARRY_BIND`, set `QUARRY_PASSWORD` in `.env` — every page and API then requires sign-in (rate-limited, 30-day session, logout in the sidebar). The value can be a Werkzeug hash instead of plaintext. Even with a password set, prefer Tailscale/VPN over direct internet exposure.
+- **Host check (DNS-rebinding guard).** With no password set, any request whose `Host` is not `localhost`, `127.0.0.1` or `[::1]` gets a `400` unless that host is listed in `QUARRY_TRUSTED_HOSTS`. Browsing by a LAN name or IP (`http://my-box:5000`, `http://192.168.1.20:5000`) therefore needs that setting. With a password set, the allowlist applies only when `QUARRY_TRUSTED_HOSTS` is non-empty.
 - **Sessions survive restarts.** The signing key is generated once into `data/secret_key` (0600); set `FLASK_SECRET_KEY` to override.
 - **Response hardening:** `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` on every response.
 - **Behind TLS?** Set `QUARRY_BEHIND_PROXY=true` when a TLS-terminating reverse proxy fronts the app: it enables ProxyFix (correct client IPs for login rate limiting) and the `Secure` cookie flag. Your proxy needs to forward the original host and scheme — for nginx:
@@ -205,6 +206,11 @@ Designed for **single-user local use** behind a firewall. Some specifics:
 - **Prompt injection is possible**: the LLM extractor sees raw page content. Treat extraction output as suggestion, not ground truth. Don't pipe it into anything that auto-executes.
 - **CSRF is enforced without tokens.** Every POST is checked against `Sec-Fetch-Site` (rejecting anything other than `same-origin`/`same-site`/`none`) and, as a fallback, the `Origin` header must match the request's own host — a mismatch, or the `null` origin sandboxed iframes send, is rejected with a 403. Combined with the SameSite=Lax session cookie, that blocks the relevant cross-site POST scenarios without a token in every form.
 - **DDG returns external URLs only.** No allowlist on what the crawler will fetch; a crafted query could in theory point the crawler at a private network address. Out of scope today; consider an SSRF guard if you ever expose this.
+
+## Upgrading
+
+- **Everyone is signed out once on this release.** Login sessions are now bound to the password: the cookie carries a token derived from the signing key and `QUARRY_PASSWORD`, so cookies issued by earlier versions are invalid and each browser has to sign in again. Changing the password later signs every session out the same way.
+- **LAN access without a password now needs `QUARRY_TRUSTED_HOSTS`.** See the host check under Security posture.
 
 ## Notes & caveats
 

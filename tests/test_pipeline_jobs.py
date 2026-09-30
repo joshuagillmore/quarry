@@ -147,7 +147,7 @@ def _wire(monkeypatch, urls, crawl_hook=None, search_hook=None):
             search_hook()
         return [_sr(u) for u in urls]
 
-    async def fake_crawl(results, query, job_id, attempted=None):
+    async def fake_crawl(results, query, job_id, attempted=None, skip_on_cancel=False):
         if crawl_hook:
             crawl_hook(job_id)
         return [_doc(sr.url, query) for sr in results]
@@ -249,6 +249,72 @@ def test_cancel_before_extraction_keeps_stored_docs(monkeypatch):
     assert j.stage == "cancelled" and j.done
     assert calls == []
     assert len(j.document_ids) == 2, "crawled pages are still stored"
+
+
+class _Page:
+    """What crawl4ai's arun returns, for the real crawl_urls_with_progress."""
+
+    def __init__(self, url):
+        self.url = url
+        self.success = True
+        self.error_message = ""
+        self.markdown = type("MD", (), {"raw_markdown": "word " * 120,
+                                        "fit_markdown": "word " * 120})()
+        self.links = {"internal": [], "external": []}
+        self.metadata = {"title": "A real page"}
+        self.redirected_url = None
+
+
+def test_cancel_mid_crawl_skips_unfetched_pages_and_keeps_fetched_ones(monkeypatch):
+    """Extraction off, so the crawl is the last stage: a cancel during it
+    must stop the pages not fetched yet (marked skipped, never fetched), keep
+    the ones already fetched, and end the job cancelled rather than done."""
+    asyncio.run(storage.init_db())
+    urls = [f"http://m.example/{i}" for i in range(7)] + ["http://m.example/7?q=<x>"]
+    monkeypatch.setattr(search, "web_search",
+                        lambda query, max_results=5: [_sr(u) for u in urls])
+    holder = {}
+    fetched = []
+
+    class FakeCrawler:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def arun(self, url, config=None):
+            fetched.append(url)
+            if url == urls[0]:
+                jobs.request_cancel(holder["jid"])   # flipped mid-batch
+            await asyncio.sleep(0)
+            return _Page(url)
+
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", FakeCrawler)
+    holder["jid"] = jid = jobs.create_job("q", 8, False, "")
+    asyncio.run(jobs._run_job(jid))
+
+    j = jobs.get_job(jid)
+    assert j.done and j.stage == "cancelled", (j.stage, j.error)
+    status = {u.url: u.status for u in j.urls}
+    # Only fetches already holding one of the crawler's 4 slots when the
+    # cancel landed ran; every page queued behind them was skipped.
+    assert urls[0] in fetched and len(fetched) <= 4
+    assert {u for u, s in status.items() if s == "done"} == set(fetched)
+    assert {u for u, s in status.items() if s == "skipped"} == set(urls) - set(fetched)
+    assert j.crawl_done == len(urls), "skipped pages still complete the progress bar"
+    # What was fetched is stored and kept.
+    assert len(j.document_ids) == len(fetched)
+    stored = asyncio.run(storage.get_all_documents())
+    assert sorted(d.url for d in stored) == sorted(fetched)
+    # The skip is reported, escaped.
+    msgs = " ".join(entry.msg for entry in j.log)
+    assert "skipped <code>http://m.example/7?q=&lt;x&gt;</code>" in msgs
+    assert "<x>" not in msgs
+    assert f"kept {len(fetched)} documents" in msgs
 
 
 def test_cancel_between_document_extractions(monkeypatch):
