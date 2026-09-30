@@ -1,9 +1,16 @@
 """Suite-wide test isolation.
 
-Module import time (before any app module is imported): pin the environment so
-neither the developer's shell (an exported QUARRY_PASSWORD, say) nor the repo's
-.env can change what the tests see, and point DB_PATH -- and with it
-data/settings.json and data/secret_key -- at a throwaway session directory.
+Module import time (before any app module is imported): pin six environment
+keys over whatever the developer's shell exported (an exported QUARRY_PASSWORD,
+say), then reset the `config.settings` singleton to its declared defaults plus
+those pins, so values from the repo's .env never reach the code under test.
+DB_PATH -- and with it data/settings.json and data/secret_key -- points at a
+throwaway session directory.
+
+Not covered: os.environ itself still carries whatever config's load_dotenv()
+read from .env. That only matters to code that builds a fresh Settings() or
+reads os.environ directly; tests doing that clear the keys they exercise
+(see test_config.py).
 
 Per test (autouse fixture): a fresh SQLite file, a clean job store and login
 rate limiter, zero retry/backoff delays, and the settings singleton restored
@@ -51,9 +58,12 @@ os.environ.update(_PINNED_ENV)
 
 import config  # noqa: E402  -- must follow the environment pinning above
 
-# Settings ignores empty env values (env_ignore_empty), so an empty pin falls
-# through to the repo's .env file -- which on a dev box may well set a fast
-# model or a password. Pin those on the singleton too.
+# The singleton was built from env + the repo's .env (a dev box's provider,
+# fast model, API key...). Settings also ignores empty env values
+# (env_ignore_empty), so an empty pin alone would fall through to .env. Start
+# every field from its declared default, then apply the pins.
+for _name, _field in config.Settings.model_fields.items():
+    setattr(config.settings, _name, _field.get_default(call_default_factory=True))
 config.settings.quarry_password = ""
 config.settings.quarry_bind = "127.0.0.1"
 config.settings.quarry_behind_proxy = False

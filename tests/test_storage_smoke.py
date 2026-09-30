@@ -171,6 +171,27 @@ def test_preview_chars_truncates_and_drops_full_markdown():
     assert docs["d2"].title == "t" and docs["d2"].url == "http://x/2"
 
 
+def test_preview_falls_back_when_content_fit_is_an_empty_string():
+    """The crawler stores a missing fit_markdown as '' (never NULL), so the
+    preview must treat '' like NULL or every real Library card is blank."""
+    async def run():
+        await storage.init_db()
+        await storage.upsert_document(_doc("e1", url="http://x/e", query="E",
+                                           body="markdown body text", fit=""))
+    asyncio.run(run())
+    for docs in (asyncio.run(storage.get_all_documents(preview_chars=8)),
+                 asyncio.run(storage.get_documents_by_search("E", preview_chars=8))):
+        assert [(d.id, d.content_fit) for d in docs] == [("e1", "markdown")]
+
+
+def test_doc_meta_columns_match_the_schema():
+    """The preview SELECT lists columns by hand; a new documents column must
+    not silently go missing from Library pages."""
+    asyncio.run(storage.init_db())
+    listed = {c.strip() for c in storage._DOC_META_COLUMNS.split(",")}
+    assert listed == _columns("documents") - {"content_markdown", "content_fit"}
+
+
 def test_get_documents_by_search_pages_and_previews():
     _seed_three()
     assert [d.id for d in asyncio.run(storage.get_documents_by_search("A"))] == ["d2", "d1"]
@@ -309,6 +330,7 @@ def _index_column_sets(table):
 def test_init_db_creates_lookup_indexes():
     asyncio.run(storage.init_db())
     assert ("search_query", "crawled_at") in _index_column_sets("documents")
+    assert ("crawled_at",) in _index_column_sets("documents")
     assert ("document_id",) in _index_column_sets("extractions")
     assert ("mission_id",) in _index_column_sets("requirements")
     assert ("document_id",) in _index_column_sets("mission_documents")

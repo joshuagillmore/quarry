@@ -182,11 +182,14 @@ async def init_db():
             )
         """)
         # Lookup indexes for the hot filters and joins: the Library by
-        # collection, extractions per document, a mission's requirements,
-        # reverse document-to-mission links, and an agent's in-flight missions.
+        # collection and unfiltered (both paginate by crawled_at), extractions
+        # per document, a mission's requirements, reverse document-to-mission
+        # links, and an agent's in-flight missions.
         for _stmt in (
             "CREATE INDEX IF NOT EXISTS idx_documents_query_crawled "
             "ON documents(search_query, crawled_at)",
+            "CREATE INDEX IF NOT EXISTS idx_documents_crawled "
+            "ON documents(crawled_at)",
             "CREATE INDEX IF NOT EXISTS idx_extractions_document "
             "ON extractions(document_id)",
             "CREATE INDEX IF NOT EXISTS idx_requirements_mission "
@@ -315,13 +318,15 @@ async def _list_documents(where: str, where_args: tuple, limit: Optional[int],
 
     preview_chars set: content_fit carries only the first preview_chars of
     (content_fit, else content_markdown) and content_markdown is None, so a
-    listing page does not pull every full page body out of SQLite."""
+    listing page does not pull every full page body out of SQLite. The crawler
+    stores a missing fit_markdown as '' rather than NULL, hence the nullif."""
     args: list = []
     if preview_chars is None:
         cols = "*"
     else:
         cols = (f"{_DOC_META_COLUMNS}, "
-                "substr(coalesce(content_fit, content_markdown), 1, ?) AS content_fit, "
+                "substr(coalesce(nullif(content_fit, ''), content_markdown), 1, ?) "
+                "AS content_fit, "
                 "NULL AS content_markdown")
         args.append(max(0, int(preview_chars)))
     sql = f"SELECT {cols} FROM documents"

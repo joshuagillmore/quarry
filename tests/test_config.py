@@ -55,6 +55,17 @@ def test_new_settings_and_safe_defaults(tmp_path, clean_env):
     assert s.quarry_trusted_hosts == "a.example,b.example"
 
 
+def test_suite_settings_start_from_declared_defaults():
+    """conftest.py resets the singleton, so the repo's .env (which on a dev box
+    sets a provider, a fast model, a key...) cannot steer the suite. Only the
+    per-test DB path and the fixed test secret key differ from the defaults."""
+    pinned = {"db_path", "flask_secret_key"}
+    for name, field in config.Settings.model_fields.items():
+        if name in pinned:
+            continue
+        assert getattr(config.settings, name) == field.get_default(), name
+
+
 def _data_dir() -> str:
     return os.path.dirname(config.settings.db_path)
 
