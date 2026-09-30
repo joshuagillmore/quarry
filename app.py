@@ -936,11 +936,25 @@ def mission_view(mission_id):
     numbered = list(enumerate(ordered[:brief.MAX_BRIEF_SOURCES], 1))
     doc_number = {d.id: n for n, d in numbered}
 
+    # Which [n] may become links. With a stored order the brief numbered
+    # exactly those documents (the ones still present lead the rail), so an
+    # out-of-range [n] -- LLM noise in an old brief -- must stay text rather
+    # than bind to an uncited document a later retask appended.
+    cite_bound = len(numbered)
+    try:
+        stored = json.loads(mission.brief_sources_json or "null")
+    except (ValueError, RecursionError):
+        stored = None
+    if isinstance(stored, list):
+        present = {d.id for d in documents}
+        cited = {i for i in stored if isinstance(i, str) and i in present}
+        cite_bound = min(cite_bound, len(cited))
+
     # Sanitize first (never bypassed), then turn [n] into citation controls.
     brief_html = ""
     if mission.brief_markdown:
         brief_html = linkify_citations(
-            render_markdown(mission.brief_markdown), len(numbered))
+            render_markdown(mission.brief_markdown), cite_bound)
 
     # Sources per requirement, carrying their citation number where they have
     # one, plus the queries the agent ran/will run (stored as JSON).

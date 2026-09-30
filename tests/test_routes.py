@@ -943,8 +943,10 @@ def test_mission_page_numbers_sources_by_the_stored_order(client):
 def test_mission_rail_is_capped_like_the_brief(client, app_mod):
     import brief
     cited = ["doc25", "doc24", "doc23"]
-    _seed_briefed_mission(n_docs=25, stored_order=cited,
-                          brief_md="See [1], [3] and [21].")
+    # "gone" was cited once but its document no longer exists: skipped, so
+    # it neither shifts numbering nor widens the citation bound.
+    _seed_briefed_mission(n_docs=25, stored_order=cited + ["gone"],
+                          brief_md="See [1], [3], [4] and [21].")
     html = client.get("/missions/m1").get_data(as_text=True)
     rail = _rail(html)
     # Every uncited doc is appended after the stored order, but numbering
@@ -952,8 +954,19 @@ def test_mission_rail_is_capped_like_the_brief(client, app_mod):
     assert len(rail) == brief.MAX_BRIEF_SOURCES
     assert [d for _n, d in rail[:3]] == cited
     assert [n for n, _d in rail] == [str(i) for i in range(1, brief.MAX_BRIEF_SOURCES + 1)]
-    assert 'data-cite="3"' in html
+    assert 'data-cite="1"' in html and 'data-cite="3"' in html
+    # The brief cited 3 documents: [4] is rail entry 4, an uncited document a
+    # later retask added, so it must stay plain text rather than link there.
+    assert 'data-cite="4"' not in html and "[4]" in html
     assert 'data-cite="21"' not in html and "[21]" in html
+
+
+def test_mission_page_without_a_stored_order_links_every_numbered_source(client):
+    _seed_briefed_mission(n_docs=3, brief_md="See [1], [3] and [4].")
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert len(_rail(html)) == 3
+    assert 'data-cite="1"' in html and 'data-cite="3"' in html
+    assert 'data-cite="4"' not in html and "[4]" in html
 
 
 def test_mission_page_rerun_needs_the_agent(client):
