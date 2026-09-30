@@ -377,6 +377,53 @@ def test_approve_ignores_malformed_plan_rows(client, starts):
     assert starts == ["m1"]
 
 
+def test_approve_db_error_after_the_claim_reopens_the_gate(client, app_mod, starts, monkeypatch):
+    # e.g. SQLite "database is locked" while collection workers write.
+    import sqlite3
+    _seed_mission()
+
+    async def locked(_mission_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app_mod, "get_requirements_for_mission", locked)
+    r = client.post("/missions/m1/approve", data={})
+    assert r.status_code == 500
+    assert _mission().status == "awaiting_approval"   # not stranded in `collecting`
+    assert starts == []
+    assert _live_jobs() == []
+
+
+def test_approve_worker_start_failure_rolls_back(client, app_mod, monkeypatch):
+    gate_job = jobs.create_mission_job("Where is it?", 7)
+    jobs.finish_job(gate_job, stage="awaiting_approval")
+    _seed_mission(job_id=gate_job)
+
+    def cannot_start(_mission_id):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(app_mod, "start_collection", cannot_start)
+    r = client.post("/missions/m1/approve", data={})
+    assert r.status_code == 500
+    m = _mission()
+    assert m.status == "awaiting_approval"
+    assert m.job_id == gate_job                       # back on the planning trace
+    assert _live_jobs() == []                         # the minted job was released
+    [minted] = [j for j in jobs._store.values() if j.id != gate_job]
+    assert minted.stage == "error"
+
+
+def test_approve_deeply_nested_plan_json_is_not_a_500(client, starts):
+    # json.loads raises RecursionError (not JSONDecodeError) on this, and it
+    # is well under the form size limit.
+    _seed_mission()
+    r = client.post("/missions/m1/approve", data={"plan_json": "[" * 100000})
+    assert r.status_code == 302 and _path(r) == "/missions/m1"
+    # Unreadable edits are treated like JS-off: the plan is approved as drafted.
+    assert _mission().status == "collecting"
+    assert starts == ["m1"]
+    assert set(_reqs()) == {"r0", "r1"}
+
+
 def test_approve_when_busy_reverts_to_the_gate(client, app_mod, starts, monkeypatch):
     _seed_mission()
 
@@ -456,6 +503,46 @@ def test_retask_lost_race_releases_its_job(client, app_mod, starts, monkeypatch)
     # The job it minted first was finished for real, so it holds no slot.
     [job] = jobs._store.values()
     assert job.done and job.stage == "cancelled" and job.finished_at
+    assert _live_jobs() == []
+
+
+def test_retask_worker_start_failure_rolls_everything_back(client, app_mod, monkeypatch):
+    old = jobs.create_mission_job("Where is it?", 7)
+    jobs.finish_job(old, stage="done")
+    _seed_mission(status="error", job_id=old)
+    _run(storage.update_mission("m1", error="earlier failure"))
+    _run(storage.update_requirement("r0", status="unmet", attempts=3,
+                                    assessment_missing="gap", assessment_confidence="low"))
+
+    def cannot_start(_mission_id):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(app_mod, "start_collection", cannot_start)
+    r = client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert r.status_code == 500
+    m = _mission()
+    assert (m.status, m.job_id, m.error) == ("error", old, "earlier failure")
+    req = _reqs()["r0"]
+    assert (req.status, req.attempts, req.assessment_missing, req.assessment_confidence) == \
+        ("unmet", 3, "gap", "low")
+    assert json.loads(req.next_queries_json) == ["q0"]
+    assert _live_jobs() == []
+
+
+def test_retask_db_error_on_the_claim_releases_its_job(client, app_mod, starts, monkeypatch):
+    import sqlite3
+    _seed_mission(status="done")
+    _run(storage.update_requirement("r0", status="unmet", attempts=3))
+
+    async def locked(*_a):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app_mod, "claim_mission_status", locked)
+    r = client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert r.status_code == 500
+    assert _mission().status == "done"
+    assert (_reqs()["r0"].status, _reqs()["r0"].attempts) == ("unmet", 3)
+    assert starts == []
     assert _live_jobs() == []
 
 
@@ -612,22 +699,48 @@ def test_stream_ignores_clock_only_changes(client, app_mod, monkeypatch):
     assert json.loads(events[-1][len("data: "):])["done"] is True
 
 
+def test_stream_sends_keepalives_while_idle(client, app_mod, monkeypatch):
+    # With clock-only changes suppressed, a long extraction would otherwise
+    # leave the stream silent long enough for a proxy idle timeout to cut it.
+    jid = jobs.create_job("q", 5, False, "")
+    every = app_mod._SSE_KEEPALIVE_POLLS
+    ticks = []
+
+    class FakeTime:
+        def sleep(self, _s):
+            ticks.append(1)
+            if len(ticks) == 2 * every + 10:
+                jobs.finish_job(jid)
+
+    monkeypatch.setattr(app_mod, "time", FakeTime())
+    events = _events(client.get(f"/api/job/{jid}/stream").get_data(as_text=True))
+    assert every * 0.25 <= 15                          # about every 15 s
+    assert events.count(": keepalive") == 2
+    assert events[0].startswith("data: ") and events[-1].startswith("data: ")
+    assert json.loads(events[-1][len("data: "):])["done"] is True
+
+
 def test_api_job_passes_log_total_through(client):
     jid = jobs.create_job("q", 5, False, "")
-    jobs.add_log(jid, "info", "hello")
+    for i in range(250):
+        jobs.add_log(jid, "info", f"line {i}")
     state = client.get(f"/api/job/{jid}").get_json()
-    expected = jobs.job_state(jid)
-    assert state.keys() == expected.keys()
+    # `log` is the last-200 window; `log_total` keeps counting past it.
+    assert state["log_total"] == 250
+    assert len(state["log"]) == 200
+    assert state["log"][-1]["msg"] == "line 249"
+    assert state.keys() == jobs.job_state(jid).keys()
 
 
 def test_api_mission_trace_carries_log_total(client):
     jid = jobs.create_mission_job("Where is it?", 7)
-    jobs.add_log(jid, "info", "one")
-    jobs.add_log(jid, "info", "two")
+    for i in range(230):
+        jobs.add_log(jid, "info", f"line {i}")
     _seed_mission(status="awaiting_approval", job_id=jid)
     trace = client.get("/api/mission/m1").get_json()["trace"]
-    assert trace["log_total"] == jobs.job_state(jid).get("log_total", 2)
-    assert len(trace["log"]) == 2
+    assert trace["log_total"] == 230
+    assert len(trace["log"]) == 200
+    assert trace["log"][0]["msg"] == "line 30"
 
 
 # --- crawl cancel -------------------------------------------------------
@@ -659,8 +772,14 @@ def test_crawl_page_extract_label_is_json_encoded(client, monkeypatch):
     monkeypatch.setattr(config.settings, "llm_provider_fast", "ollama_chat/it's-a-model")
     jid = jobs.create_job("q", 5, True, "")
     html = client.get(f"/crawl/{jid}").get_data(as_text=True)
-    assert "const EXTRACT_MODEL = " in html
-    assert "'it's-a-model'" not in html
+    # Jinja's tojson escapes the quote, so the id cannot close a JS string.
+    assert 'const EXTRACT_MODEL = "it\\u0027s-a-model";' in html
+    # No fast tier: the label names the reasoning model the extractor falls
+    # back to, not the sidebar's "—".
+    monkeypatch.setattr(config.settings, "llm_provider_fast", "")
+    monkeypatch.setattr(config.settings, "llm_provider", "cohere/command-a-03-2025")
+    html = client.get(f"/crawl/{jid}").get_data(as_text=True)
+    assert 'const EXTRACT_MODEL = "command-a-03-2025";' in html
 
 
 # --- Library ------------------------------------------------------------
@@ -858,7 +977,9 @@ def test_gate_offers_discard(client):
 # --- templates use the log cursor ----------------------------------------
 
 @pytest.mark.parametrize("name", ["crawl.html", "mission.html"])
-def test_log_rendering_uses_the_monotonic_cursor(name):
+def test_log_cursor_template_strings_present(name):
+    """A source-text check of the template, not an execution of its JS: the
+    log renderer must key its cursor off log_total."""
     with open(f"templates/{name}", encoding="utf-8") as f:
         src = f.read()
     assert "log_total" in src

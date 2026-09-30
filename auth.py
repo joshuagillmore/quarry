@@ -20,6 +20,7 @@ Deliberately NOT a UI-editable setting: an unauthenticated visitor must never
 be able to set (or clear) the password through the Settings page.
 """
 import hashlib
+import heapq
 import hmac
 import threading
 import time
@@ -36,7 +37,7 @@ _secret_key = ""
 # --- login rate limiting (in-memory; single process by design) ---
 _MAX_FAILURES = 5
 _WINDOW_S = 15 * 60
-_SWEEP_OVER = 1024      # sweep aged-out IPs once this many are tracked
+_MAX_TRACKED_IPS = 1024  # hard cap on IPs the limiter remembers
 _failures: dict[str, list[float]] = {}
 _lock = threading.Lock()
 
@@ -86,12 +87,19 @@ def _recent_locked(ip: str, now: float) -> list[float]:
 
 
 def _sweep_locked(now: float) -> None:
-    """Caller holds _lock. Bound memory: forget IPs whose attempts all aged
-    out, so a spray of one-off source addresses cannot grow the dict."""
-    if len(_failures) <= _SWEEP_OVER:
+    """Caller holds _lock. Bound memory at _MAX_TRACKED_IPS: first forget IPs
+    whose attempts all aged out, then, if a burst of one-off sources (cheap
+    with IPv6) still overflows the cap inside the window, the IPs whose last
+    attempt is oldest. An attacker able to rotate that many addresses can
+    already sidestep a per-IP limit, so eviction gives nothing away."""
+    if len(_failures) <= _MAX_TRACKED_IPS:
         return
     for ip in [ip for ip, ts in _failures.items() if not ts or now - ts[-1] >= _WINDOW_S]:
         del _failures[ip]
+    excess = len(_failures) - _MAX_TRACKED_IPS
+    if excess > 0:
+        for ip in heapq.nsmallest(excess, _failures, key=lambda k: _failures[k][-1]):
+            del _failures[ip]
 
 
 def is_locked_out(ip: str) -> tuple[bool, int]:
@@ -115,8 +123,10 @@ def reserve_attempt(ip: str) -> tuple[bool, int]:
         recent = _recent_locked(ip, now)
         if len(recent) >= _MAX_FAILURES:
             return False, int(_WINDOW_S - (now - recent[0])) + 1
-        _sweep_locked(now)
         _failures[ip] = recent + [now]
+        # After recording: this IP now has the newest attempt, so the cap
+        # evicts older entries before the attempt being counted.
+        _sweep_locked(now)
     return True, 0
 
 

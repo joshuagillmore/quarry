@@ -408,6 +408,9 @@ def crawl_cancel(job_id):
 # Fields that change on every poll without anything having happened; left
 # out of the SSE change check so an idle job does not send a message 4x/s.
 _SSE_VOLATILE = ("elapsed", "finished_at")
+_SSE_POLL_S = 0.25
+# Unchanged polls before a keepalive comment: 60 x 0.25 s = 15 s of silence.
+_SSE_KEEPALIVE_POLLS = 60
 
 
 @app.route("/api/job/<job_id>")
@@ -427,6 +430,7 @@ def api_job_stream(job_id):
 
     def gen():
         last_hash = None
+        silent = 0
         # Cap the stream at ~10 minutes to bound resource use; the browser's
         # EventSource reconnects and resumes if the job is still running.
         for _ in range(2400):
@@ -439,9 +443,18 @@ def api_job_stream(job_id):
             if h != last_hash:
                 yield f"data: {json.dumps(state)}\n\n"
                 last_hash = h
+                silent = 0
+            else:
+                silent += 1
+                if silent >= _SSE_KEEPALIVE_POLLS:
+                    # An SSE comment line: EventSource ignores it, but it keeps
+                    # proxies with idle timeouts (often 60 s) from cutting a
+                    # stream that is quiet through a long extraction.
+                    yield ": keepalive\n\n"
+                    silent = 0
             if state.get("done"):
                 return
-            time.sleep(0.25)
+            time.sleep(_SSE_POLL_S)
 
     return Response(
         stream_with_context(gen()),
@@ -982,10 +995,14 @@ _MAX_PLAN_ROWS = 50   # a drafted plan is a handful of requirements
 def _plan_edits(raw: str) -> list[dict]:
     """The gate's plan_json, normalised: dict rows only (at most
     _MAX_PLAN_ROWS), `id` a str or None, `title` a bounded str, `queries` a
-    list of bounded strs or None when the row did not send one."""
+    list of bounded strs or None when the row did not send one.
+
+    Pure and never raises: an unreadable plan is treated like JS-off (no
+    edits). json.loads raises RecursionError, not a ValueError, on deeply
+    nested input such as '[' * 100000, which fits in a form post."""
     try:
         parsed = json.loads(raw) if raw else []
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return []
     rows = []
     for item in parsed[:_MAX_PLAN_ROWS] if isinstance(parsed, list) else []:
@@ -1004,12 +1021,31 @@ def _plan_edits(raw: str) -> list[dict]:
     return rows
 
 
+def _rollback(mission_id: str, undo: list) -> None:
+    """Run a failed transition's undo steps, newest first. Each step is
+    best-effort and logged on failure: this runs while another exception
+    (often the same locked database) is already propagating, and one failed
+    step must not skip the rest."""
+    for what, step in reversed(undo):
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001
+            print(f"[MISSION] {mission_id}: could not {what}: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+
+
 @app.route("/missions/<mission_id>/approve", methods=["POST"])
 def mission_approve(mission_id):
     mission = run_async(get_mission(mission_id))
     if not mission:
         flash("Mission not found.", "error")
         return redirect(url_for("missions_list"))
+    # The gate lets the user reword requirements, cut them, and edit the seeded
+    # queries. JS serializes that into plan_json; with JS off the field is empty
+    # and we approve the plan as drafted. Parsed before the claim: it is pure,
+    # so nothing about a bad payload can strand a claimed mission.
+    edits = _plan_edits(request.form.get("plan_json", "").strip())
+
     # Claim the transition before touching anything: of two concurrent
     # approvals (a double click, two tabs) exactly one moves the row, and only
     # that one edits the plan and starts a worker.
@@ -1017,26 +1053,23 @@ def mission_approve(mission_id):
         flash("This mission is not awaiting approval.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
 
-    def back_to_gate():
-        run_async(claim_mission_status(mission_id, "collecting", "awaiting_approval"))
-
-    # The gate lets the user reword requirements, cut them, and edit the seeded
-    # queries. JS serializes that into plan_json; with JS off the field is empty
-    # and we approve the plan as drafted.
-    existing = {r.id: r for r in run_async(get_requirements_for_mission(mission_id))}
-    edits = _plan_edits(request.form.get("plan_json", "").strip())
-    drop_ids = {row["id"] for row in edits if row["dropped"] and row["id"] in existing}
-    additions = [row for row in edits
-                 if not row["dropped"] and row["id"] not in existing and row["title"]]
-    # Decided before anything is deleted, so an all-dropped plan changes nothing.
-    kept = len(existing) - len(drop_ids) + len(additions)
-    if kept == 0:
-        back_to_gate()
-        flash("A plan needs at least one requirement — nothing was approved.", "error")
-        return redirect(url_for("mission_view", mission_id=mission_id))
-
-    job_id = None
+    # From here on, any failure must undo the claim: a mission left in
+    # `collecting` with no worker cannot be stopped or deleted until restart.
+    undo = [("reopen the gate", lambda: run_async(
+        claim_mission_status(mission_id, "collecting", "awaiting_approval")))]
     try:
+        existing = {r.id: r for r in run_async(get_requirements_for_mission(mission_id))}
+        drop_ids = {row["id"] for row in edits if row["dropped"] and row["id"] in existing}
+        additions = [row for row in edits
+                     if not row["dropped"] and row["id"] not in existing and row["title"]]
+        # Decided before anything is deleted, so an all-dropped plan changes
+        # nothing.
+        kept = len(existing) - len(drop_ids) + len(additions)
+        if kept == 0:
+            _rollback(mission_id, undo)
+            flash("A plan needs at least one requirement — nothing was approved.", "error")
+            return redirect(url_for("mission_view", mission_id=mission_id))
+
         for rid in drop_ids:
             run_async(delete_requirement(rid))
         for row in edits:
@@ -1065,19 +1098,20 @@ def mission_approve(mission_id):
         # The planning trace finished at the gate; collection gets its own.
         job_id = create_mission_job(mission.question,
                                     _budget_max_sources(_mission_budget(mission)))
+        undo.append(("release the new job", lambda: jobs.finish_job(
+            job_id, stage="error", error="approval failed")))
         run_async(update_mission(mission_id, job_id=job_id))
+        undo.append(("restore the planning trace", lambda: run_async(
+            update_mission(mission_id, job_id=mission.job_id))))
+        start_collection(mission_id)
     except JobLimitReached as e:
-        back_to_gate()
+        _rollback(mission_id, undo)
         flash(f"Busy: {e}.", "error")
         return redirect(url_for("mission_view", mission_id=mission_id))
-    except Exception:
-        # Never strand the mission in `collecting` with no worker behind it.
-        if job_id:
-            jobs.finish_job(job_id, stage="error", error="approval failed")
-        back_to_gate()
+    except BaseException:
+        _rollback(mission_id, undo)
         raise
 
-    start_collection(mission_id)
     msg = f"Plan approved — collecting against {kept} requirements."
     if drop_ids:
         msg += f" {len(drop_ids)} dropped."
@@ -1167,25 +1201,41 @@ def requirement_retask(mission_id, req_id):
     except JobLimitReached as e:
         flash(f"Busy: {e}.", "error")
         return redirect(url_for("mission_view", mission_id=mission_id))
-    # Then claim the transition from the status we saw, so a concurrent
-    # re-task (or approve) cannot start a second worker.
-    if not run_async(claim_mission_status(mission_id, mission.status, "collecting")):
-        jobs.finish_job(job_id, stage="cancelled")
-        flash("This mission changed state in the meantime — nothing was re-tasked.", "info")
-        return redirect(url_for("mission_view", mission_id=mission_id))
+    # From here on, any failure undoes what was done so far, newest first:
+    # the job holds a slot, and a claimed mission with no worker behind it
+    # cannot be stopped or deleted until restart.
+    undo = [("release the new job", lambda: jobs.finish_job(
+        job_id, stage="error", error="re-task failed"))]
     try:
+        # Then claim the transition from the status we saw, so a concurrent
+        # re-task (or approve) cannot start a second worker.
+        if not run_async(claim_mission_status(mission_id, mission.status, "collecting")):
+            jobs.finish_job(job_id, stage="cancelled")
+            flash("This mission changed state in the meantime — nothing was re-tasked.",
+                  "info")
+            return redirect(url_for("mission_view", mission_id=mission_id))
+        undo.append((f"restore status {mission.status}", lambda: run_async(
+            claim_mission_status(mission_id, "collecting", mission.status))))
+        run_async(update_mission(mission_id, job_id=job_id, error=None))
+        undo.append(("restore the previous trace", lambda: run_async(update_mission(
+            mission_id, job_id=mission.job_id, error=mission.error))))
         # A fresh attempt budget — the user explicitly asked for another round.
         run_async(update_requirement(
             req_id, status="pending", attempts=0, accepted_by_user=0,
             next_queries_json=json.dumps(queries[-8:]),
             assessment_missing="", assessment_confidence="",
         ))
-        run_async(update_mission(mission_id, job_id=job_id, error=None))
-    except Exception:
-        jobs.finish_job(job_id, stage="error", error="re-task failed")
-        run_async(claim_mission_status(mission_id, "collecting", mission.status))
+        undo.append(("restore the requirement", lambda: run_async(update_requirement(
+            req_id, status=req.status, attempts=req.attempts,
+            accepted_by_user=req.accepted_by_user,
+            next_queries_json=req.next_queries_json,
+            assessment_missing=req.assessment_missing,
+            assessment_confidence=req.assessment_confidence,
+        ))))
+        start_collection(mission_id)
+    except BaseException:
+        _rollback(mission_id, undo)
         raise
-    start_collection(mission_id)
     flash(f"Re-tasking “{req.title}” with a fresh attempt budget.", "success")
     return redirect(url_for("mission_view", mission_id=mission_id))
 

@@ -231,12 +231,69 @@ def test_clear_failures_and_empty_entries_are_dropped():
 
 
 def test_concurrent_attempts_all_count(client, monkeypatch):
-    # Attempts in flight (reserved, not yet verified) count toward the lockout.
+    """Real threads: parallel wrong-password POSTs from one IP. Attempts are
+    reserved atomically before verification, so exactly _MAX_FAILURES of them
+    reach the password check and the rest are refused, however they
+    interleave (check-then-record let a burst through the gap)."""
+    import threading
+
+    import app as app_mod
     _enable(monkeypatch)
-    for _ in range(auth._MAX_FAILURES):
-        auth.reserve_attempt("127.0.0.1")
-    r = client.post("/login", data={"password": "hunter2-quarry"})
-    assert r.status_code == 429
+    extra = 7
+    n = auth._MAX_FAILURES + extra
+    barrier = threading.Barrier(n)
+    codes = []
+
+    def worker():
+        c = app_mod.app.test_client()
+        barrier.wait()
+        codes.append(c.post("/login", data={"password": "wrong"}).status_code)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(codes) == [401] * auth._MAX_FAILURES + [429] * extra
+    # Even the right password is refused while the burst holds the window.
+    assert client.post("/login", data={"password": "hunter2-quarry"}).status_code == 429
+
+
+def test_reserve_attempt_is_atomic_across_threads():
+    import threading
+    n = 40
+    barrier = threading.Barrier(n)
+    allowed = []
+
+    def worker():
+        barrier.wait()
+        allowed.append(auth.reserve_attempt("10.9.9.9")[0])
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert allowed.count(True) == auth._MAX_FAILURES
+    assert len(auth._failures["10.9.9.9"]) == auth._MAX_FAILURES
+
+
+def test_tracked_ips_are_capped_inside_the_window():
+    # A burst of one-off sources (IPv6 makes these cheap) must not grow the
+    # table until the entries age out: past the cap, the IPs whose last
+    # attempt is oldest are forgotten.
+    import time
+    cap = auth._MAX_TRACKED_IPS
+    now = time.time()
+    with auth._lock:
+        for i in range(cap + 100):
+            auth._failures[f"2001:db8::{i:x}"] = [now - 600 + i * 0.001]  # all in-window
+    ok, _ = auth.reserve_attempt("198.51.100.7")
+    assert ok
+    assert len(auth._failures) <= cap
+    assert "198.51.100.7" in auth._failures
+    assert "2001:db8::0" not in auth._failures                 # oldest evicted
+    assert f"2001:db8::{cap + 99:x}" in auth._failures         # newest kept
 
 
 def test_successful_login_clears_the_counter(client, monkeypatch):
