@@ -2,8 +2,8 @@
 
 Two background entry points, split by the human approval gate:
 
-    start_planning(mission_id)   -> plan, then status=awaiting_approval
-    start_collection(mission_id) -> collect/assess/re-task loop, then brief
+    start_planning(mission_id, job_id)   -> plan, then status=awaiting_approval
+    start_collection(mission_id, job_id) -> collect/assess/re-task loop, then brief
 
 Both run in daemon threads (one asyncio loop each) and stream progress into the
 in-memory job store so the existing live-log / SSE machinery works unchanged.
@@ -18,22 +18,28 @@ from datetime import datetime, timezone
 from html import escape as _esc
 
 import jobs
+from config import settings
 from jobs import JobUrl, EXTRACT_CONCURRENCY
-from search import web_search
+from search import web_search_ex
 from crawler import crawl_urls_with_progress
 from agent_planner import build_collection_plan
 from agent_assessor import assess_requirement
-from brief import synthesize_brief, ordered_sources
+from brief import synthesize_brief, ordered_sources, brief_warnings
 from extractor import extract_from_document
 from storage import (
     get_agent, get_mission, update_mission,
     insert_requirement, update_requirement, get_requirements_for_mission,
     upsert_document, link_mission_document, insert_extraction,
     get_requirement_documents, get_mission_documents,
-    get_latest_finished_mission,
+    get_latest_finished_mission, get_mission_llm_usage,
 )
 
 PER_QUERY_RESULTS = 5
+# Per-requirement search history kept in requirements.search_stats_json.
+SEARCH_STATS_KEEP = 40
+
+STOPPED_BY_USER = "stopped by user"
+TOKEN_BUDGET_REACHED = "token budget reached"
 
 
 def _now() -> str:
@@ -42,12 +48,17 @@ def _now() -> str:
 
 # --- Thread launchers ---
 
-def start_planning(mission_id: str) -> None:
-    threading.Thread(target=_thread, args=(_run_planning, mission_id), daemon=True).start()
+def start_planning(mission_id: str, job_id: str | None = None) -> None:
+    """Plan on a daemon thread. `job_id` is the live job this worker owns and
+    must finish; give it whenever the caller created one."""
+    threading.Thread(target=_thread, args=(_run_planning, mission_id, job_id),
+                     daemon=True).start()
 
 
-def start_collection(mission_id: str) -> None:
-    threading.Thread(target=_thread, args=(_run_collection, mission_id), daemon=True).start()
+def start_collection(mission_id: str, job_id: str | None = None) -> None:
+    """Collect on a daemon thread; `job_id` as for start_planning."""
+    threading.Thread(target=_thread, args=(_run_collection, mission_id, job_id),
+                     daemon=True).start()
 
 
 def _mission_job_id(mission_id: str):
@@ -59,14 +70,22 @@ def _mission_job_id(mission_id: str):
     return mission.job_id if mission else None
 
 
-def _thread(coro_fn, mission_id: str) -> None:
+def _thread(coro_fn, mission_id: str, job_id: str | None = None) -> None:
     """Thread body for both stages. The mission's live job always ends in a
     terminal stage — on a crash (any BaseException, not just Exception), and
     on a path that returns without finishing it — so a dead worker never
-    holds one of the job store's MAX_ACTIVE_JOBS slots."""
+    holds one of the job store's MAX_ACTIVE_JOBS slots.
+
+    With `job_id`, that job is the one finished, whatever the mission row
+    says by then: the row may be gone (the mission was deleted, so there is
+    nothing to look the job up from) or may already point at a newer job
+    that another worker owns (a retask), which must not be ended here.
+    Without it, the job is looked up from the mission row."""
+    given = job_id
     # Read up front as well as at the end: if the crash was the database
     # going away, the lookup in `finally` fails too.
-    job_id = _mission_job_id(mission_id)
+    if not given:
+        job_id = _mission_job_id(mission_id)
     failure = None
     try:
         asyncio.run(coro_fn(mission_id))
@@ -79,7 +98,8 @@ def _thread(coro_fn, mission_id: str) -> None:
         except BaseException:  # noqa: BLE001
             traceback.print_exc()
     finally:
-        job_id = _mission_job_id(mission_id) or job_id
+        if not given:
+            job_id = _mission_job_id(mission_id) or job_id
         if job_id:
             if failure:
                 jobs.add_log(job_id, "err", f"worker crashed: {_esc(failure)}")
@@ -148,6 +168,41 @@ async def _run_planning(mission_id: str) -> None:
 
 # --- Stage 2: collection loop ---
 
+def _token_budget(budget: dict) -> int:
+    """The mission's LLM token budget: its own max_llm_tokens, else (unset,
+    null or junk) the setting. 0 or less means unlimited."""
+    raw = budget.get("max_llm_tokens")
+    if raw is None:
+        raw = settings.max_llm_tokens
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return max(0, int(settings.max_llm_tokens or 0))
+
+
+async def _stop_reason(mission_id: str, job_id, token_budget: int,
+                       mid_pass: bool) -> str | None:
+    """Why collection must stop now, or None to carry on. Checked at every
+    pass boundary and again before each requirement, so a Stop click or a
+    spent token budget costs at most the requirement already in flight. The
+    reason is logged here once; the caller breaks out and the requirements
+    never reached say why (see the end of _run_collection)."""
+    if job_id and jobs.is_cancelled(job_id):
+        jobs.add_log(job_id, "warn",
+                     "stop requested — skipping the rest of this pass" if mid_pass
+                     else "stop requested — writing the brief from what was collected")
+        return STOPPED_BY_USER
+    if token_budget > 0:
+        usage = await get_mission_llm_usage(mission_id)
+        used = usage["prompt_tokens"] + usage["completion_tokens"]
+        if used > token_budget:
+            if job_id:
+                jobs.add_log(job_id, "warn",
+                             f"{TOKEN_BUDGET_REACHED} · {used:,} of {token_budget:,} tokens used")
+            return TOKEN_BUDGET_REACHED
+    return None
+
+
 async def _run_collection(mission_id: str) -> None:
     mission = await get_mission(mission_id)
     if not mission:
@@ -158,6 +213,7 @@ async def _run_collection(mission_id: str) -> None:
     max_passes = int(budget.get("max_passes", agent.default_max_passes if agent else 4))
     max_sources = int(budget.get("max_sources", agent.default_max_sources if agent else 30))
     per_req_attempts = int(budget.get("per_req_attempts", agent.default_per_req_attempts if agent else 3))
+    token_budget = _token_budget(budget)
 
     await update_mission(mission_id, status="collecting")
     if job_id:
@@ -196,11 +252,12 @@ async def _run_collection(mission_id: str) -> None:
         pending = [r for r in reqs if r.status == "pending"]
         if not pending:
             break
-        # Cooperative stop: requested from the mission page between passes, so
-        # the collected sources are still written up into a brief.
-        if job_id and jobs.is_cancelled(job_id):
-            jobs.add_log(job_id, "warn", "stop requested — finishing after this pass")
-            stop_reason = "stopped by user"
+        # Cooperative stop (from the mission page) and the token budget are
+        # checked here and before each requirement below; either way the
+        # collected sources are still written up into a brief.
+        halt = await _stop_reason(mission_id, job_id, token_budget, mid_pass=False)
+        if halt:
+            stop_reason = halt
             break
         if job_id:
             jobs.update_job(job_id, pass_num=pass_num)
@@ -210,11 +267,15 @@ async def _run_collection(mission_id: str) -> None:
         for req in pending:
             if len(collected) >= max_sources:
                 break
+            halt = await _stop_reason(mission_id, job_id, token_budget, mid_pass=True)
+            if halt:
+                break
             try:
                 await _collect_one(
                     mission, req, collected, job_urls, job_id,
                     max_sources, per_req_cap, per_req_attempts,
                     attempted=attempted, known=known, aliases=aliases,
+                    pass_num=pass_num,
                 )
             except Exception as e:  # noqa: BLE001
                 # Isolate a requirement's failure: burn one of its attempts and
@@ -231,6 +292,9 @@ async def _run_collection(mission_id: str) -> None:
                     jobs.add_log(job_id, "err",
                                  f"error on <em>{_esc(req.title)}</em>: {_esc(type(e).__name__)}")
 
+        if halt:
+            stop_reason = halt
+            break
         if len(collected) >= max_sources:
             if job_id:
                 jobs.add_log(job_id, "warn", "source budget reached")
@@ -267,11 +331,36 @@ def _other_names(doc) -> list[str]:
     return [n for n in names if isinstance(n, str) and n and n != doc.url]
 
 
+def _search_stats(req) -> list:
+    """The requirement's stored search history, or [] when unset or corrupt."""
+    try:
+        stats = json.loads(req.search_stats_json or "[]")
+    except (TypeError, ValueError):
+        return []
+    return stats if isinstance(stats, list) else []
+
+
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def _search_note(entries: list[dict]) -> str:
+    """One line for the assessor: what this pass's searches returned, e.g.
+    "Search coverage this pass: 3 queries, 11 results (brave)". Engine
+    names come from the configured backend list, never from a page."""
+    total = sum(e["results"] for e in entries)
+    engines = list(dict.fromkeys(e["engine"] for e in entries if e["engine"]))
+    return (f"Search coverage this pass: {_count(len(entries), 'query', 'queries')}, "
+            f"{_count(total, 'result', 'results')} "
+            f"({', '.join(engines) if engines else 'no engine answered'})")
+
+
 async def _collect_one(mission, req, collected, job_urls, job_id,
                        max_sources, per_req_cap, per_req_attempts,
                        attempted: set[str] | None = None,
                        known: dict[str, str] | None = None,
-                       aliases: dict[str, str] | None = None) -> None:
+                       aliases: dict[str, str] | None = None,
+                       pass_num: int = 1) -> None:
     """Search, crawl and assess a single requirement. Raising here costs this
     requirement an attempt, not the mission.
 
@@ -296,14 +385,22 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
     if job_id:
         jobs.add_log(job_id, "info", f"collecting: <em>{_esc(req.title)}</em>")
 
-    # Search across this requirement's queries.
+    # Search across this requirement's queries, recording what each one
+    # returned and which engine answered (a zero-result query included:
+    # that is the signal) before anything else can fail.
     results = []
     seen_q_urls: set[str] = set()
+    this_pass: list[dict] = []
     for q in queries:
-        for sr in await asyncio.to_thread(web_search, q, PER_QUERY_RESULTS):
+        found, engine = await asyncio.to_thread(web_search_ex, q, PER_QUERY_RESULTS)
+        this_pass.append({"pass": pass_num, "query": q, "engine": engine,
+                          "results": len(found)})
+        for sr in found:
             if sr.url not in seen_q_urls:
                 seen_q_urls.add(sr.url)
                 results.append(sr)
+    await update_requirement(req.id, search_stats_json=json.dumps(
+        (_search_stats(req) + this_pass)[-SEARCH_STATS_KEEP:]))
 
     # New URLs to crawl, bounded by this requirement's fair share and the
     # remaining global source budget.
@@ -339,7 +436,8 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
             await link_mission_document(mission_id, req.id, doc_id)
 
     req_docs = await get_requirement_documents(mission_id, req.id)
-    assessment = await asyncio.to_thread(assess_requirement, req, req_docs)
+    assessment = await asyncio.to_thread(assess_requirement, req, req_docs,
+                                         search_note=_search_note(this_pass))
     attempts = req.attempts + 1
 
     if assessment.satisfied:
@@ -384,7 +482,7 @@ async def _extract_sources(mission_id: str, prompt: str, job_id) -> None:
 
     async def one(doc):
         async with sem:
-            return await asyncio.to_thread(extract_from_document, doc, prompt)
+            return await asyncio.to_thread(extract_from_document, doc, prompt, mission_id)
 
     results = await asyncio.gather(*(one(d) for d in docs), return_exceptions=True)
 
@@ -400,6 +498,24 @@ async def _extract_sources(mission_id: str, prompt: str, job_id) -> None:
             done += 1
     if job_id:
         jobs.add_log(job_id, "ok", f"extraction complete · <em>{done}/{len(docs)}</em>")
+
+
+def _check_brief(mission, requirements, docs, brief_md: str, job_id) -> str | None:
+    """brief_warnings as the JSON stored with the brief, logged as a count.
+    `mission` carries the source order the brief was numbered with. A
+    checker failure is logged and stored as None (not checked) rather than
+    costing the mission the brief it has already paid for."""
+    try:
+        warnings = brief_warnings(mission, requirements, docs, brief_md)
+    except Exception as e:  # noqa: BLE001 - the brief matters more than its checks
+        traceback.print_exc()
+        if job_id:
+            jobs.add_log(job_id, "warn", f"brief checks failed: {_esc(type(e).__name__)}")
+        return None
+    if job_id:
+        jobs.add_log(job_id, "warn" if warnings else "info",
+                     f"brief checks: {len(warnings)} warning(s)")
+    return json.dumps(warnings)
 
 
 async def _synthesize(mission_id: str, agent, job_id) -> None:
@@ -437,11 +553,15 @@ async def _synthesize(mission_id: str, agent, job_id) -> None:
     # synthesize_brief numbers `docs` with this same ordered_sources call.
     ordered = ordered_sources(docs)
     brief_md = await asyncio.to_thread(synthesize_brief, mission, requirements, docs, new_urls)
+    sources_json = json.dumps([d.id for d in ordered])
+    warnings_json = _check_brief(mission.model_copy(update={"brief_sources_json": sources_json}),
+                                 requirements, docs, brief_md, job_id)
 
     n_sat = sum(1 for r in requirements if r.status == "satisfied")
     await update_mission(
         mission_id, status="done", brief_markdown=brief_md,
-        brief_sources_json=json.dumps([d.id for d in ordered]), finished_at=_now(),
+        brief_sources_json=sources_json, brief_warnings_json=warnings_json,
+        finished_at=_now(),
     )
     if job_id:
         jobs.add_log(job_id, "ok",

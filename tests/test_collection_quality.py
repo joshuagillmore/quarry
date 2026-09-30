@@ -153,3 +153,32 @@ def test_no_sleep_after_the_final_rate_limited_attempt(monkeypatch):
     assert search.web_search("q", 3) == []
     # One backoff between an engine's two attempts; none after its last.
     assert rec.sleeps == [1.5, 1.5]
+
+
+# ---------- web_search_ex: which engine answered ----------
+
+def test_web_search_ex_reports_the_engine_that_answered(monkeypatch):
+    monkeypatch.setattr(search.settings, "search_backends", "auto,brave,bing")
+
+    def fake_rows(query, max_results, backend):
+        if backend == "auto":
+            raise RuntimeError("engine down")
+        return [_row("http://ok/1")] if backend == "brave" else []
+
+    monkeypatch.setattr(search, "_rows", fake_rows)
+    results, engine = search.web_search_ex("q", 3)
+    assert [r.url for r in results] == ["http://ok/1"]
+    assert engine == "brave"
+
+
+def test_web_search_ex_engine_is_none_when_nothing_answered(monkeypatch):
+    monkeypatch.setattr(search.settings, "search_backends", "auto,brave")
+    monkeypatch.setattr(search, "_rows", lambda q, m, b: [])
+    assert search.web_search_ex("q", 3) == ([], None)
+
+
+def test_web_search_wraps_web_search_ex(monkeypatch):
+    monkeypatch.setattr(search.settings, "search_backends", "auto")
+    monkeypatch.setattr(search, "_rows", lambda q, m, b: [_row("http://a/1")])
+    assert [r.url for r in search.web_search("q", 3)] == ["http://a/1"]
+    assert [r.url for r in search.web_search_ex("q", 3)[0]] == ["http://a/1"]

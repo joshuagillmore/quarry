@@ -274,8 +274,8 @@ def set_document_ids(job_id: str, ids: list[str]) -> None:
 
 
 def request_cancel(job_id: str) -> bool:
-    """Ask a running job to stop. Cooperative: a mission stops at the next
-    pass boundary (the current pass finishes and the brief is still
+    """Ask a running job to stop. Cooperative: a mission stops before its
+    next requirement (the one in flight finishes, and the brief is still
     synthesized from whatever was collected); a one-shot crawl stops before
     crawling, before its next page's fetch (keeping the pages already
     fetched), before extraction, or before its next document's extraction."""
@@ -314,6 +314,8 @@ def job_state(job_id: str) -> Optional[dict]:
             "extract_total": j.extract_total,
             "extract_done": j.extract_done,
             "urls": [asdict(u) for u in j.urls],
+            # Pages a cancel stopped before they were fetched (crawl page).
+            "skipped": sum(1 for u in j.urls if u.status == "skipped"),
             "log": [asdict(l) for l in j.log[-200:]],
             "done": j.done,
             "error": j.error,

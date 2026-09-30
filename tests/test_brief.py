@@ -87,11 +87,25 @@ def _mission_with(order):
                    brief_sources_json=order)
 
 
+def _ids(slots):
+    return [d.id if d is not None else None for d in slots]
+
+
 def test_ordered_sources_for_mission_honours_stored_order():
+    """Every stored entry keeps its slot, so [n] still means the n-th stored
+    id: a missing id (and a repeat, which only a corrupt row could hold) is
+    a None slot rather than a shift of every later number."""
     a, junk, c = _sdoc("a", 500), _sdoc("junk", 5), _sdoc("c", 500)
     m = _mission_with(json.dumps(["c", "gone", "a", "c"]))
     out = brief.ordered_sources_for_mission(m, [a, junk, c])
-    assert [d.id for d in out] == ["c", "a", "junk"]
+    assert _ids(out) == ["c", None, "a", None, "junk"]
+
+
+def test_missing_stored_source_is_a_none_slot_and_later_numbers_hold():
+    a, b = _sdoc("a", 500), _sdoc("b", 500)
+    m = _mission_with(json.dumps(["a", "deleted", "b"]))
+    out = brief.ordered_sources_for_mission(m, [b, a])
+    assert _ids(out) == ["a", None, "b"], "[3] must still be b"
 
 
 def test_ordered_sources_for_mission_appends_rest_in_ordered_sources_order():
@@ -196,3 +210,81 @@ def test_linkify_grouped_citations_become_one_button_each():
     assert out.count("<button") == 1 and "999" in out
     # A wholly out-of-range group is left untouched, like a single bad marker.
     assert linkify_citations("<p>[7,8]</p>", 5) == "<p>[7,8]</p>"
+
+
+# ---------- telemetry tags ----------
+
+def test_brief_tags_its_call_with_purpose_and_mission(monkeypatch):
+    seen = {}
+
+    def fake_chat(persona, prompt, **k):
+        seen.update(k)
+        return "## Summary\nok"
+
+    monkeypatch.setattr(brief, "chat", fake_chat)
+    brief.synthesize_brief(_mission(), [_req("satisfied")], [_doc("u1")], set())
+    assert (seen["purpose"], seen["mission_id"]) == ("brief", "m")
+
+
+# ---------- brief quality checks ----------
+
+_LONG_UNCITED = ("Battery packs lose capacity fastest when they are held at a high "
+                 "state of charge in hot climates.")
+
+
+def _kinds(warnings):
+    return [w["kind"] for w in warnings]
+
+
+def _battery_req():
+    return Requirement(id="rb", mission_id="m", title="Lithium battery degradation",
+                       status="satisfied")
+
+
+def test_uncited_long_paragraph_and_bullet_are_flagged():
+    md = ("## Summary\n" + _LONG_UNCITED + "\n\n"
+          "## Key Findings\n"
+          "- " + _LONG_UNCITED + "\n"
+          "- " + _LONG_UNCITED + " [1]\n"
+          "- Short uncited bullet.\n")
+    w = brief.brief_warnings(_mission(), [_battery_req()], [_sdoc("a", 500)], md)
+    assert _kinds(w) == ["uncited_paragraph", "uncited_paragraph"]
+    assert all(set(x) == {"kind", "detail"} for x in w)
+    assert "Battery packs" in w[0]["detail"]
+
+
+def test_cited_and_short_text_and_headings_are_not_flagged():
+    md = ("## A heading that is long enough to pass eighty characters easily, but is a heading\n"
+          + _LONG_UNCITED + " [2, 3]\n\nToo short to matter.\n")
+    w = brief.brief_warnings(_mission(), [_battery_req()],
+                             [_sdoc("a", 500), _sdoc("b", 500), _sdoc("c", 500)], md)
+    assert w == []
+
+
+def test_coverage_section_is_not_held_to_citations():
+    """Coverage & Gaps is commentary on the requirements, not a claim
+    drawn from a source."""
+    md = "## Coverage & Gaps\n" + _LONG_UNCITED + "\n"
+    assert brief.brief_warnings(_mission(), [_battery_req()], [], md) == []
+
+
+def test_citing_a_junk_source_is_flagged_once():
+    docs = [_sdoc("junk", 5), _sdoc("good", 500)]   # numbered good=[1], junk=[2]
+    md = "Battery findings [1] and [2]; again [1, 2]."
+    w = brief.brief_warnings(_mission(), [_battery_req()], docs, md)
+    assert _kinds(w) == ["junk_citation"]
+    assert w[0]["detail"].startswith("[2]")
+
+
+def test_citing_a_removed_source_is_not_junk():
+    m = _mission_with(json.dumps(["gone", "a"]))
+    w = brief.brief_warnings(m, [_battery_req()], [_sdoc("a", 500)], "Battery [1] and [2].")
+    assert w == []
+
+
+def test_requirement_the_brief_never_mentions_is_flagged():
+    reqs = [_battery_req(),
+            Requirement(id="rs", mission_id="m", title="Sodium supply chains"),
+            Requirement(id="rx", mission_id="m", title="GDP up?")]  # no key terms
+    w = brief.brief_warnings(_mission(), reqs, [], "Battery lifetimes [1].")
+    assert w == [{"kind": "requirement_unmentioned", "detail": "Sodium supply chains"}]

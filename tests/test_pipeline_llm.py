@@ -78,7 +78,7 @@ def test_permanent_fast_error_still_falls_back(monkeypatch):
         calls.append(model)
         if model.startswith("ollama"):
             raise not_found("model not found")
-        return "ok"
+        return "ok", (0, 0)
 
     monkeypatch.setattr(llm, "_complete", fake)
     assert llm.chat("s", "u", tier="fast") == "ok"

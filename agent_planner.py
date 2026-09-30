@@ -19,7 +19,8 @@ def build_collection_plan(agent: Agent, mission_id: str, question: str) -> list[
     """Call the LLM to decompose the question into requirements. Returns
     Requirement objects (not yet persisted). Raises ValueError if the model
     produced nothing usable."""
-    parsed, _raw = chat_json(agent.persona_prompt, build_plan_prompt(question), max_tokens=1500)
+    parsed, _raw = chat_json(agent.persona_prompt, build_plan_prompt(question), max_tokens=1500,
+                             purpose="plan", mission_id=mission_id)
 
     items = []
     if parsed and isinstance(parsed.get("requirements"), list):

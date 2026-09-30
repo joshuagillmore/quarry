@@ -82,6 +82,17 @@ def test_job_state_elapsed_freezes_at_finish():
     assert 49 <= s2["elapsed"] <= 52
 
 
+def test_job_state_counts_skipped_urls():
+    """The crawl page shows how many pages a cancel skipped."""
+    jid = jobs.create_job("q", 5, False, "")
+    jobs.add_urls(jid, [jobs.JobUrl(url=f"http://s.example/{i}") for i in range(4)])
+    assert jobs.job_state(jid)["skipped"] == 0
+    jobs.update_url(jid, "http://s.example/1", status="skipped")
+    jobs.update_url(jid, "http://s.example/2", status="skipped")
+    jobs.update_url(jid, "http://s.example/3", status="error")
+    assert jobs.job_state(jid)["skipped"] == 2
+
+
 def test_prune_ttl_keys_on_finished_at():
     """A long job that only just finished must not be evicted as 'old'."""
     jid = jobs.create_job("long", 5, False, "")

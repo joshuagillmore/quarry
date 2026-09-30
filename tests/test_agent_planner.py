@@ -61,3 +61,15 @@ def test_plan_non_string_text_fields_become_empty(monkeypatch):
     r = agent_planner.build_collection_plan(_agent(), "m1", "q")[0]
     assert (r.description, r.rationale) == ("", "")
     assert json.loads(r.next_queries_json) == ["good"]
+
+
+def test_planner_tags_its_call_with_purpose_and_mission(monkeypatch):
+    seen = {}
+
+    def fake(s, u, **k):
+        seen.update(k)
+        return {"requirements": [{"title": "T"}]}, "raw"
+
+    monkeypatch.setattr(agent_planner, "chat_json", fake)
+    agent_planner.build_collection_plan(_agent(), "m1", "q")
+    assert (seen["purpose"], seen["mission_id"]) == ("plan", "m1")

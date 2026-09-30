@@ -36,7 +36,10 @@ def _parse_output(text: str):
 def extract_from_document(
     doc: Document,
     custom_prompt: str = "",
+    mission_id: Optional[str] = None,
 ) -> Optional[ExtractedData]:
+    """One LLM extraction over `doc`. `mission_id` charges the call to a
+    mission in the llm_calls telemetry (None for a one-shot crawl)."""
     prompt = custom_prompt or DEFAULT_PROMPT
 
     content = doc.content_fit or doc.content_markdown
@@ -62,7 +65,8 @@ def extract_from_document(
         # chat_ex reports which model actually answered (the fast tier falls
         # back to the reasoning model when e.g. Ollama is down) so the stored
         # extraction row is labeled with the true producer.
-        result_text, model = chat_ex(system, user, temperature=0.0, max_tokens=2000, tier="fast")
+        result_text, model = chat_ex(system, user, temperature=0.0, max_tokens=2000, tier="fast",
+                                     purpose="extract", mission_id=mission_id)
         print(f"[EXTRACT] Got response ({len(result_text)} chars)", file=sys.stderr, flush=True)
 
         parsed = _parse_output(result_text)
