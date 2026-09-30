@@ -1620,7 +1620,7 @@ h1.page-title em { font-style: italic; color: var(--accent); }
 .agent-budget{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:10px 18px;border-top:1px solid var(--border);background:var(--bg-subtle)}
 .agent-budget-k{font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--fg-subtle);font-weight:500;margin-right:2px}
 .budget-chip{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:10.5px;color:var(--fg-subtle);padding:2px 7px;border-radius:6px;background:var(--bg-inset);border:1px solid var(--border)}
-.agent-ask{padding:12px 18px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:center}
+.agent-ask{padding:12px 18px;border-top:1px solid var(--border);display:flex;gap:8px;align-items:stretch}
 .agent-ask input{flex:1;background:var(--bg-inset);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-family:var(--font-serif);font-size:14.5px;color:var(--fg)}
 .agent-ask input::placeholder{font-style:italic;color:var(--fg-subtle)}
 .agent-ask input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);background:var(--bg-raised)}
@@ -1694,3 +1694,57 @@ h1.page-title em { font-style: italic; color: var(--accent); }
 /* Library pagination. */
 .lib-pager{display:flex;align-items:center;justify-content:center;gap:12px;margin:22px 0 8px}
 .lib-pager-info{font-family:var(--font-mono);font-size:12px;color:var(--fg-subtle)}
+
+/* ---------- Mission telemetry: LLM tokens ---------- */
+.tele-sub{display:block;font-family:var(--font-mono);font-size:10px;color:var(--fg-subtle);margin-top:2px;white-space:nowrap}
+.tele-tokens[title]{cursor:help}
+.mission-compare{margin-left:auto}
+
+/* ---------- Brief checks: automated warnings shown above a brief ---------- */
+.brief-checks{border-bottom:1px solid var(--border);background:var(--accent-soft);padding:12px 20px}
+.brief-checks-k{display:flex;align-items:center;gap:7px;font-size:11px;font-weight:600;color:oklch(.42 .14 65);text-transform:uppercase;letter-spacing:.05em}
+[data-theme="dark"] .brief-checks-k{color:oklch(.9 .1 65)}
+.brief-checks-k .ico{width:12px;height:12px}
+.brief-checks-sub{font-size:12px;color:var(--fg-muted);margin:3px 0 8px}
+.brief-checks ul{list-style:none;margin:0;padding:0;display:grid;gap:5px}
+.bcheck{display:flex;gap:8px;align-items:baseline;font-size:12.5px;line-height:1.5;color:var(--fg)}
+.bcheck-k{flex-shrink:0;font-family:var(--font-mono);font-size:10.5px;padding:1px 7px;border-radius:999px;border:1px solid var(--accent-border);background:var(--bg-raised);color:var(--fg-muted);white-space:nowrap}
+.bcheck-d{min-width:0;overflow-wrap:anywhere}
+
+/* ---------- Source rail: a cited source no longer in the Library ---------- */
+.src-gone{cursor:default;opacity:.62}
+.src-gone .src-t{font-style:italic;font-weight:400}
+
+/* ---------- Requirement detail: what each search pass returned ---------- */
+.search-stats{list-style:none;margin:0 0 4px;padding:0;display:grid;gap:3px}
+.search-stat{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);padding:3px 8px;border-radius:6px;background:var(--bg-raised);border:1px solid var(--border)}
+.search-stat.zero{color:var(--danger);background:var(--danger-soft);border-color:color-mix(in oklch,var(--danger) 45%,var(--border))}
+
+/* ---------- Compare runs ---------- */
+.cmp-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start;margin-bottom:22px}
+.cmp-col .brief-head{flex-wrap:wrap}
+.cmp-col .brief-body{max-width:none}
+.cmp-q{padding:14px 24px 0;font-family:var(--font-serif);font-style:italic;font-size:17px;line-height:1.3;color:var(--fg-muted)}
+.cmp-empty{padding:18px 24px;font-size:13px;color:var(--fg-subtle)}
+.cmp-lists{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.cmp-list{background:var(--bg-raised);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.cmp-list-head{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border);background:var(--bg-subtle);font-size:12.5px;font-weight:600}
+.cmp-list-head .n{margin-left:auto;font-family:var(--font-mono);font-size:11px;font-weight:400;color:var(--fg-subtle)}
+.cmp-list[data-cmp="new"] .cmp-list-head .n{color:var(--success)}
+.cmp-list[data-cmp="dropped"] .cmp-list-head .n{color:var(--danger)}
+.cmp-list ul{list-style:none;margin:0;padding:6px}
+.cmp-item{display:grid;gap:2px;padding:8px;border-radius:8px;text-decoration:none;color:inherit}
+.cmp-item:hover{background:var(--bg-subtle)}
+.cmp-item-t{font-size:12.5px;font-weight:500;line-height:1.4;overflow-wrap:anywhere}
+.cmp-item-u{font-family:var(--font-mono);font-size:10px;color:var(--fg-subtle);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmp-list .cmp-empty{padding:14px}
+@media (max-width:1100px){.cmp-grid,.cmp-lists{grid-template-columns:1fr}}
+
+/* ---------- Agents page: run controls ----------
+   Full-height submit buttons with a 36px minimum hit area (they were 32px
+   and 26px), and room below the last card so the fixed tweaks button never
+   sits on top of them. */
+.agent-go{min-height:36px;height:auto;justify-content:center}
+.agent-sched{padding:0 18px 12px;margin:0}
+.agent-sched .agent-go{width:100%}
+.page-agents{padding-bottom:88px}

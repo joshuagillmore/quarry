@@ -80,6 +80,12 @@
               <label class="ag-label">Tries/req</label>
               <input type="number" class="select" style="width:84px;" name="per_req_attempts" id="agTries" min="1" max="6" value="{{ agents[0].default_per_req_attempts }}">
             </div>
+            <div class="ag-field">
+              <label class="ag-label" for="agTokens">LLM tokens</label>
+              <input type="number" class="select" style="width:112px;" name="max_llm_tokens" id="agTokens"
+                     min="0" max="5000000" value="{{ default_max_llm_tokens | default(0) }}"
+                     title="Stop collecting once this mission's LLM calls have used this many tokens (prompt + completion). 0 = no limit.">
+            </div>
           </div>
           {% else %}
           <label>Agentic Crawl</label>

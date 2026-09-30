@@ -65,10 +65,13 @@
     {% if mission_filter %}<input type="hidden" name="mission" value="{{ mission_filter }}">{% endif %}
     <div class="lib-search">
       <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12.5a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11ZM11 11l3.5 3.5"/></svg>
-      {# Deliberately not pre-filled with the full-text query: the client-side
-         filter only sees titles/snippets, so re-applying the query here would
-         hide the full-text matches whose hit is in the body. #}
-      <input id="libSearch" name="q" placeholder="Filter titles… (Enter for full-text content search)">
+      {# One input: typing filters the cards on this page; Enter submits it as
+         `q` for a full-text search of page bodies. It shows the current `q`;
+         the script below never re-applies a full-text query as a filter, since
+         the client only sees titles/snippets and would hide matches whose hit
+         is in the body. #}
+      <input id="libSearch" name="q" value="{{ lib_query }}" maxlength="200" autocomplete="off"
+             placeholder="Filter this page… (Enter searches full text)" aria-label="Filter or search the Library">
       <button type="button" id="libClear" class="btn btn-sm btn-ghost hidden">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5 12.5 12.5M12.5 3.5l-9 9"/></svg>
       </button>
@@ -156,6 +159,9 @@
   const grid = document.getElementById('libGrid');
   if (!grid) return;
   const PAGE_NOTE = {{ ((' on this page · ' ~ total ~ ' in all') if pager else '')|tojson }};
+  // Set only when the cards are full-text matches for it (see the input).
+  const FTS_QUERY = {{ full_text_query|tojson }};
+  const CLEAR_URL = {{ (url_for('documents_list', search=search_filter) if search_filter else url_for('documents_list'))|tojson }};
   const cards = Array.from(grid.querySelectorAll('.doc-card'));
   const search = document.getElementById('libSearch');
   const clear = document.getElementById('libClear');
@@ -172,10 +178,12 @@
   const ageWindow = { day: 864e5, week: 7*864e5, month: 30*864e5 };
 
   function apply() {
-    const q = (search.value || '').toLowerCase().trim();
+    const typed = (search.value || '').toLowerCase().trim();
+    // The full-text query the server already applied is not a title filter.
+    const q = FTS_QUERY && typed === FTS_QUERY.toLowerCase().trim() ? '' : typed;
     const age = ageSel.value;
     const wr = wordsSel.value;
-    clear.classList.toggle('hidden', !q);
+    clear.classList.toggle('hidden', !typed);
 
     let visible = 0;
     const shown = [];
@@ -211,7 +219,12 @@
   }
 
   search.addEventListener('input', apply);
-  clear.addEventListener('click', () => { search.value = ''; apply(); });
+  clear.addEventListener('click', () => {
+    // Clearing a full-text search reloads without it; a plain filter just empties.
+    if (FTS_QUERY) { window.location.href = CLEAR_URL; return; }
+    search.value = '';
+    apply();
+  });
   ageSel.addEventListener('change', apply);
   wordsSel.addEventListener('change', apply);
   sortSel.addEventListener('change', apply);

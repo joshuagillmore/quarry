@@ -64,17 +64,19 @@ def _live_jobs():
 
 @pytest.fixture()
 def starts(app_mod, monkeypatch):
-    """Records (mission_id, the mission's job_id in the DB at that moment) for
-    each start_collection call: the worker reads the mission row as soon as
-    it starts, so the fresh job must already be on it."""
+    """Records (mission_id, the mission's job_id in the DB at that moment,
+    the job_id handed to the worker) for each start_collection call: the
+    worker reads the mission row as soon as it starts, so the fresh job must
+    already be on it, and the route passes that same job so the worker
+    finishes it on every exit path."""
     calls = []
     monkeypatch.setattr(app_mod, "start_collection",
-                        lambda mid: calls.append((mid, _mission(mid).job_id)))
+                        lambda mid, job_id=None: calls.append((mid, _mission(mid).job_id, job_id)))
     return calls
 
 
 def _started(starts):
-    return [mid for mid, _job_id in starts]
+    return [mid for mid, _db_job_id, _passed_job_id in starts]
 
 
 def _seed_agent(**kw):
@@ -119,9 +121,11 @@ def _reqs(mid="m1"):
 def test_every_endpoint_requires_login(client, app_mod, monkeypatch):
     monkeypatch.setattr(config.settings, "quarry_password", PW)
     checked = 0
+    swept = set()
     for rule in app_mod.app.url_map.iter_rules():
         if rule.endpoint in ("login", "static"):
             continue
+        swept.add(rule.rule)
         with app_mod.app.test_request_context():
             url = flask.url_for(rule.endpoint, **{a: "x" for a in rule.arguments})
         for method in sorted(rule.methods - {"HEAD", "OPTIONS"}):
@@ -133,7 +137,8 @@ def test_every_endpoint_requires_login(client, app_mod, monkeypatch):
                 assert r.status_code == 302, (method, url, r.status_code)
                 assert _path(r) == "/login", (method, url, r.headers["Location"])
             checked += 1
-    assert checked >= 30, "the sweep should cover every route"
+    assert checked >= 31, "the sweep should cover every route"
+    assert "/missions/<mission_id>/compare" in swept
 
 
 def test_settings_page_cannot_set_or_clear_the_password(client, monkeypatch):
@@ -406,7 +411,7 @@ def test_approve_worker_start_failure_rolls_back(client, app_mod, monkeypatch):
     jobs.finish_job(gate_job, stage="awaiting_approval")
     _seed_mission(job_id=gate_job)
 
-    def cannot_start(_mission_id):
+    def cannot_start(_mission_id, _job_id=None):
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(app_mod, "start_collection", cannot_start)
@@ -454,8 +459,8 @@ def test_approve_points_the_mission_at_a_fresh_job(client, starts):
     new = _mission().job_id
     assert new and new != old
     # The worker was started with the mission already pointing at the fresh,
-    # live job, not the finished planning trace.
-    assert starts == [("m1", new)]
+    # live job, not the finished planning trace, and was handed that job.
+    assert starts == [("m1", new, new)]
     job = jobs.get_job(new)
     assert job is not None and not job.done
 
@@ -480,8 +485,8 @@ def test_retask_success(client, starts):
     m = _mission()
     assert m.status == "collecting"
     # The worker was started with the mission already pointing at the fresh,
-    # live job.
-    assert m.job_id and starts == [("m1", m.job_id)]
+    # live job, and was handed that job.
+    assert m.job_id and starts == [("m1", m.job_id, m.job_id)]
     job = jobs.get_job(m.job_id)
     assert job is not None and not job.done
 
@@ -529,7 +534,7 @@ def test_retask_worker_start_failure_rolls_everything_back(client, app_mod, monk
     _run(storage.update_requirement("r0", status="unmet", attempts=3,
                                     assessment_missing="gap", assessment_confidence="low"))
 
-    def cannot_start(_mission_id):
+    def cannot_start(_mission_id, _job_id=None):
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(app_mod, "start_collection", cannot_start)
@@ -627,7 +632,8 @@ def plannings(monkeypatch):
     worker thread it would start is replaced."""
     import agent_runner
     calls = []
-    monkeypatch.setattr(agent_runner, "start_planning", lambda mid: calls.append(mid))
+    monkeypatch.setattr(agent_runner, "start_planning",
+                        lambda mid, job_id=None: calls.append(mid))
     return calls
 
 
@@ -875,12 +881,44 @@ def test_small_library_has_no_pager(client):
     assert "showing" not in html
 
 
-def test_full_text_query_does_not_seed_the_title_filter(client):
+def _lib_input(html):
+    tags = re.findall(r'<input[^>]*id="libSearch"[^>]*>', html)
+    assert len(tags) == 1, "the Library has exactly one search input"
+    return tags[0]
+
+
+def test_full_text_query_seeds_the_one_input_without_refiltering(client):
     _seed_docs(3)
     html = client.get("/documents?q=ordinary").get_data(as_text=True)
-    tag = re.search(r'<input[^>]*id="libSearch"[^>]*>', html).group(0)
-    assert "ordinary" not in tag
+    tag = _lib_input(html)
+    # Typing filters this page; Enter submits the same input as `q`.
+    assert 'name="q"' in tag and 'value="ordinary"' in tag
+    assert re.search(r'<form[^>]*method="get"[^>]*action="/documents"', html)
+    # The seeded value is the server's full-text query. The client filter
+    # sees only titles/snippets, so re-applying it would hide matches whose
+    # hit is in the body: the page tells the script which value to skip.
+    assert 'const FTS_QUERY = "ordinary";' in html
     assert _cards(html) == 3
+
+
+def test_library_without_a_query_leaves_the_input_empty(client):
+    _seed_docs(2)
+    html = client.get("/documents").get_data(as_text=True)
+    assert 'value=""' in _lib_input(html)
+    assert 'const FTS_QUERY = "";' in html
+
+
+def test_library_query_inside_a_mission_filters_client_side(client):
+    # The mission listing takes precedence over full-text search, so `q` is
+    # not an FTS result set there: the input carries it and the client
+    # filter applies it, and the page does not claim FTS "matches".
+    _seed_briefed_mission()
+    html = client.get("/documents?mission=m1&q=ordinary").get_data(as_text=True)
+    assert 'value="ordinary"' in _lib_input(html)
+    assert 'const FTS_QUERY = "";' in html
+    assert "Sources from mission" in html
+    assert "match" not in re.search(r'<p class="page-sub">(.*?)</p>', html, re.S).group(1)
+    assert _cards(html) == 2
 
 
 def test_library_cards_use_the_preview_snippet(client):
@@ -962,6 +1000,11 @@ def _rail(html):
     return re.findall(r'data-src="(\d+)" href="/document/(doc\d+)"', html)
 
 
+def _rail_numbers(html):
+    """Every numbered rail slot, available or removed, in page order."""
+    return [int(n) for n in re.findall(r'class="src(?: src-gone)?" data-src="(\d+)"', html)]
+
+
 def test_mission_page_numbers_sources_by_the_stored_order(client):
     _seed_briefed_mission(stored_order=["doc02", "doc01"])
     html = client.get("/missions/m1").get_data(as_text=True)
@@ -973,24 +1016,55 @@ def test_mission_page_numbers_sources_by_the_stored_order(client):
 def test_mission_rail_is_capped_like_the_brief(client, app_mod):
     import brief
     cited = ["doc25", "doc24", "doc23"]
-    # "gone" was cited once but its document no longer exists: skipped. It is
-    # last in the stored order, so it shifts no number here and does not
-    # widen the citation bound. A missing id mid-list would shift every later
-    # rail number down by one against the brief's [n] (known limitation).
+    # "gone" was cited once but its document no longer exists. It is last in
+    # the stored order, so whether brief.ordered_sources_for_mission skips it
+    # or keeps its slot as a removed source, it shifts no number and does not
+    # widen the citation bound. (A gap mid-list: see the removed-slot tests.)
     _seed_briefed_mission(n_docs=25, stored_order=cited + ["gone"],
                           brief_md="See [1], [3], [4] and [21].")
     html = client.get("/missions/m1").get_data(as_text=True)
     rail = _rail(html)
     # Every uncited doc is appended after the stored order, but numbering
     # stops where a brief's citations can reach.
-    assert len(rail) == brief.MAX_BRIEF_SOURCES
+    assert _rail_numbers(html) == list(range(1, brief.MAX_BRIEF_SOURCES + 1))
     assert [d for _n, d in rail[:3]] == cited
-    assert [n for n, _d in rail] == [str(i) for i in range(1, brief.MAX_BRIEF_SOURCES + 1)]
     assert 'data-cite="1"' in html and 'data-cite="3"' in html
-    # The brief cited 3 documents: [4] is rail entry 4, an uncited document a
-    # later retask added, so it must stay plain text rather than link there.
+    # The brief cited 3 documents that still exist: [4] is the removed slot
+    # or an uncited document a later retask added, so it stays plain text.
     assert 'data-cite="4"' not in html and "[4]" in html
     assert 'data-cite="21"' not in html and "[21]" in html
+
+
+def test_mission_rail_keeps_a_removed_source_in_its_slot(client):
+    # brief.ordered_sources_for_mission keeps a stored id whose document is
+    # gone as a None slot, so later numbers do not shift.
+    _seed_briefed_mission(n_docs=3, stored_order=["doc01", "gone", "doc02"],
+                          brief_md="See [1], [2], [3] and [4].")
+    html = client.get("/missions/m1").get_data(as_text=True)
+    # Numbers never shift: doc02 stays [3], the number the brief gave it.
+    assert _rail(html) == [("1", "doc01"), ("3", "doc02"), ("4", "doc03")]
+    assert _rail_numbers(html) == [1, 2, 3, 4]
+    assert re.search(r'<div class="src src-gone" data-src="2"', html)
+    assert "source no longer available" in html
+    # Every stored slot up to the last surviving one is citable ([2] lights
+    # the removed row); [4] is an uncited document appended later.
+    for n in (1, 2, 3):
+        assert f'data-cite="{n}"' in html
+    assert 'data-cite="4"' not in html and "[4]" in html
+    # Requirement source lists carry the same numbers.
+    assert re.search(r'href="/document/doc02"[^>]*>\s*<span class="req-src-n">\[3\]</span>', html)
+    assert re.search(r'href="/document/doc03"[^>]*>\s*<span class="req-src-n">\[4\]</span>', html)
+
+
+def test_mission_rail_trailing_removed_slot_does_not_widen_the_bound(client):
+    _seed_briefed_mission(n_docs=2, stored_order=["gone", "doc01", "doc02", "gone-too"],
+                          brief_md="See [1], [2], [3] and [4].")
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert _rail(html) == [("2", "doc01"), ("3", "doc02")]
+    assert _rail_numbers(html) == [1, 2, 3, 4]
+    for n in (1, 2, 3):
+        assert f'data-cite="{n}"' in html
+    assert 'data-cite="4"' not in html and "[4]" in html
 
 
 def test_mission_page_without_a_stored_order_links_every_numbered_source(client):
@@ -1017,6 +1091,228 @@ def test_gate_offers_discard(client):
     assert 'id="discardForm"' in html
     assert 'action="/missions/m1/delete"' in html
     assert 'form="discardForm"' in html
+
+
+# --- mission page: brief checks -------------------------------------------
+
+def _brief_checks(html):
+    m = re.search(r'<div class="brief-checks"[^>]*>(.*?)</ul>', html, re.S)
+    return m.group(1) if m else None
+
+
+def test_mission_page_shows_brief_checks_above_the_brief(client):
+    _seed_briefed_mission()
+    _run(storage.update_mission("m1", brief_warnings_json=json.dumps([
+        {"kind": "uncited_paragraph", "detail": "<script>alert(1)</script> A long claim"},
+        {"kind": "junk_citation", "detail": "[2] cites a block page"},
+        {"kind": "requirement_unmentioned", "detail": "Req 1"},
+        {"kind": "<b>novel</b>", "detail": "a kind this page has no label for"},
+        "not a dict", ["nor", "this"], {"kind": 7, "detail": None},
+    ])))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    box = _brief_checks(html)
+    assert box is not None
+    assert html.index('class="brief-checks"') < html.index('id="briefBody"')
+    assert "Brief checks" in box
+    assert box.count('class="bcheck"') == 4
+    for label in ("Uncited claim", "Cites an unusable source", "Requirement not addressed"):
+        assert label in box
+    # Everything the LLM or a page could influence is escaped.
+    assert "&lt;script&gt;alert(1)&lt;/script&gt; A long claim" in box
+    assert "<script>alert(1)" not in html
+    assert "&lt;b&gt;novel&lt;/b&gt;" in box
+
+
+@pytest.mark.parametrize("raw", [None, "[]", "{not json", '{"kind": "x"}', "[1, 2]"])
+def test_mission_page_without_brief_checks(client, raw):
+    _seed_briefed_mission()
+    if raw is not None:
+        _run(storage.update_mission("m1", brief_warnings_json=raw))
+    r = client.get("/missions/m1")
+    assert r.status_code == 200
+    assert _brief_checks(r.get_data(as_text=True)) is None
+
+
+# --- mission page: LLM token telemetry -----------------------------------
+
+def _seed_llm_calls(mission_id="m1"):
+    from models import LlmCall
+
+    async def go():
+        for purpose, prompt, completion in (("plan", 1000, 200),
+                                            ("assess", 400, 100), ("assess", 400, 100)):
+            await storage.insert_llm_call(LlmCall(
+                purpose=purpose, tier="reasoning", model="cohere/command-a",
+                mission_id=mission_id, prompt_tokens=prompt, completion_tokens=completion))
+        # Another mission's usage never counts.
+        await storage.insert_llm_call(LlmCall(
+            purpose="plan", tier="reasoning", model="cohere/command-a",
+            mission_id="other", prompt_tokens=9000, completion_tokens=9000))
+    _run(go())
+
+
+def test_mission_page_shows_llm_tokens(client):
+    _seed_mission(status="done")
+    _run(storage.update_mission("m1", budget_json=json.dumps(
+        {"max_sources": 7, "max_llm_tokens": 50000})))
+    _seed_llm_calls()
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "LLM tokens" in html
+    assert "<span data-tele-tokens>2,200</span> <small>/ 50,000</small>" in html
+    assert 'data-tele-tokens-bar style="width:4%"' in html
+    # By purpose: compact on the cell, exact in its hover title.
+    assert re.search(r'<small class="tele-sub">\s*plan 1.2k · assess 1k\s*</small>', html)
+    assert "plan: 1 call, 1,000 prompt + 200 completion" in html
+    assert "assess: 2 calls, 800 prompt + 200 completion" in html
+
+
+def test_mission_page_token_cap_defaults_to_the_setting(client, monkeypatch):
+    _seed_mission(status="done")          # its budget sets no max_llm_tokens
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 9000)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "<span data-tele-tokens>0</span> <small>/ 9,000</small>" in html
+    assert "none recorded" in html
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 0)   # unlimited
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "<span data-tele-tokens>0</span></div>" in html
+    assert "<span data-tele-tokens-bar" not in html
+
+
+def test_api_mission_reports_llm_tokens(client):
+    _seed_mission(status="collecting")
+    assert client.get("/api/mission/m1").get_json()["llm_tokens"] == 0
+    _seed_llm_calls()
+    assert client.get("/api/mission/m1").get_json()["llm_tokens"] == 2200
+
+
+def test_mission_poll_updates_the_token_cell():
+    with open("templates/mission.html", encoding="utf-8") as f:
+        src = f.read()
+    assert "'[data-tele-tokens]'" in src and "s.llm_tokens" in src
+
+
+# --- mission page: search signals -----------------------------------------
+
+def test_requirement_detail_shows_search_signals(client):
+    _seed_mission(status="done")
+    _run(storage.update_requirement("r0", search_stats_json=json.dumps([
+        {"pass": 1, "query": "a", "engine": "brave", "results": 5},
+        {"pass": 1, "query": "b", "engine": "brave", "results": 6},
+        {"pass": 1, "query": "c", "engine": "bing", "results": 0},
+        {"pass": 2, "query": "d", "engine": None, "results": 0},
+        {"pass": 2, "query": "e", "engine": None, "results": 0},
+        "junk", {"query": "no pass"}, {"pass": "x", "results": 3},
+    ])))
+    _run(storage.update_requirement("r1", search_stats_json="{not json"))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    rows = re.findall(r'<li class="search-stat( zero)?">\s*(.*?)\s*</li>', html, re.S)
+    assert rows == [
+        ("", "pass 1 · 3 queries · 11 results · brave, bing"),
+        (" zero", "pass 2 · 2 queries · 0 results · no engine answered"),
+    ]
+
+
+def test_search_signal_engine_names_are_escaped(client):
+    _seed_mission(status="done")
+    _run(storage.update_requirement("r0", search_stats_json=json.dumps([
+        {"pass": 1, "query": "q", "engine": "<i>x</i>", "results": 1}])))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "pass 1 · 1 query · 1 result · &lt;i&gt;x&lt;/i&gt;" in html
+
+
+# --- run form: token budget and job hand-off ------------------------------
+
+@pytest.mark.parametrize("raw, want", [
+    ("12345", 12345), ("9999999", 5_000_000), ("-3", 0), ("0", 0),
+    ("abc", 777), ("", 777), (None, 777),
+])
+def test_agent_run_stores_a_token_budget(client, app_mod, monkeypatch, raw, want):
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 777)
+    monkeypatch.setattr(app_mod, "start_planning", lambda mid, job_id=None: None)
+    _seed_agent()
+    form = {"question": "Where is it?"}
+    if raw is not None:
+        form["max_llm_tokens"] = raw
+    client.post("/agents/a1/run", data=form)
+    [m] = _run(storage.list_missions())
+    assert json.loads(m.budget_json)["max_llm_tokens"] == want
+
+
+def test_agent_run_hands_its_job_to_the_planner(client, app_mod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_mod, "start_planning",
+                        lambda mid, job_id=None: calls.append((mid, job_id)))
+    _seed_agent()
+    r = client.post("/agents/a1/run", data={"question": "Where is it?"})
+    [m] = _run(storage.list_missions())
+    assert _path(r) == f"/missions/{m.id}"
+    assert m.job_id and calls == [(m.id, m.job_id)]
+    assert not jobs.get_job(m.job_id).done
+
+
+def test_run_form_offers_a_token_budget(client, monkeypatch):
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 250000)
+    _seed_agent()
+    html = client.get("/").get_data(as_text=True)
+    tag = re.search(r'<input[^>]*name="max_llm_tokens"[^>]*>', html).group(0)
+    assert 'value="250000"' in tag
+    assert 'min="0"' in tag and 'max="5000000"' in tag
+
+
+# --- crawl page: skipped count --------------------------------------------
+
+def _crawl_job(n_done, n_skipped, n_total):
+    jid = jobs.create_job("q", n_total, False, "")
+    urls = [f"https://s{i}.example/" for i in range(n_total)]
+    jobs.add_urls(jid, [jobs.JobUrl(url=u) for u in urls])
+    for u in urls[:n_done]:
+        jobs.update_url(jid, u, status="done")
+    for u in urls[n_done:n_done + n_skipped]:
+        jobs.update_url(jid, u, status="skipped")
+    # The crawler counts a skipped page as processed (crawl_done).
+    jobs.update_job(jid, crawl_total=n_total, crawl_done=n_done + n_skipped)
+    jobs.finish_job(jid, stage="cancelled" if n_skipped else "done")
+    return jid
+
+
+def _url_meta(html):
+    return re.search(r'id="urlMeta">([^<]*)<', html).group(1).strip()
+
+
+def test_crawl_page_shows_skipped_separately(client):
+    jid = _crawl_job(n_done=6, n_skipped=2, n_total=8)
+    assert jobs.job_state(jid)["skipped"] == 2
+    html = client.get(f"/crawl/{jid}").get_data(as_text=True)
+    assert _url_meta(html) == "6/8 crawled · 2 skipped"
+
+
+def test_crawl_page_without_skips_says_nothing_about_them(client):
+    jid = _crawl_job(n_done=3, n_skipped=0, n_total=3)
+    html = client.get(f"/crawl/{jid}").get_data(as_text=True)
+    assert _url_meta(html) == "3/3 crawled"
+
+
+def test_crawl_page_live_update_uses_the_skipped_count():
+    with open("templates/crawl.html", encoding="utf-8") as f:
+        src = f.read()
+    assert "s.skipped" in src and "' skipped'" in src
+
+
+# --- agents page ----------------------------------------------------------
+
+def test_agents_page_run_buttons_are_full_height_submits(client):
+    _seed_agent(schedule_question="What changed overnight?", schedule_cron="0 7 * * *")
+    html = client.get("/agents").get_data(as_text=True)
+    ask = re.search(r'<form class="agent-ask" method="post" action="/agents/a1/run">(.*?)</form>',
+                    html, re.S).group(1)
+    # Enter in the question submits this form; the button is its submit.
+    assert re.search(r'<input type="text" name="question"', ask)
+    assert re.search(r'<button type="submit" class="btn btn-accent agent-go"', ask)
+    sched = re.search(r'<form class="agent-sched" method="post" action="/agents/a1/run-scheduled">'
+                      r'(.*?)</form>', html, re.S).group(1)
+    assert re.search(r'<button type="submit" class="btn agent-go"', sched)
+    # Room below the last card so the fixed tweaks button never covers them.
+    assert 'class="page page-agents"' in html
 
 
 # --- templates use the log cursor ----------------------------------------

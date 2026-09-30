@@ -6,6 +6,19 @@
   <span class="sep">/</span><span class="cur">Live crawl</span>
 {% endblock %}
 
+{# The URL stream's summary line, from the same job_state the stream sends.
+   The crawler counts a skipped page (never fetched: cancelled first) as
+   processed, so "crawled" is processed minus skipped. #}
+{% set st = state or {} %}
+{% set skipped = st.get('skipped') or 0 %}
+{% set url_meta -%}
+  {%- if st.get('crawl_total') -%}
+    {{ [0, (st.get('crawl_done') or 0) - skipped] | max }}/{{ st.crawl_total }} crawled
+    {%- if skipped %} · {{ skipped }} skipped{% endif %}
+    {%- if not st.get('done') %} · {{ st.urls | selectattr('status', 'equalto', 'fetching') | list | length }} in flight{% endif %}
+  {%- else -%}waiting…{%- endif -%}
+{%- endset %}
+
 {% block content %}
 <div class="page page-wide">
   <div class="crawl-wrap">
@@ -67,7 +80,7 @@
         <div class="stream-head">
           <span class="live-dot"></span>
           <strong style="color: var(--fg)">URL stream</strong>
-          <span style="margin-left: auto" class="mono" id="urlMeta">waiting…</span>
+          <span style="margin-left: auto" class="mono" id="urlMeta">{{ url_meta }}</span>
         </div>
         <div id="urlList"></div>
       </div>
@@ -230,8 +243,14 @@
     });
     renderedUrls = s.urls.length;
 
+    // A skipped page (cancelled before its turn) counts toward crawl_done
+    // but was never fetched: show it separately, and only when there is one.
     const inFlight = s.urls.filter(u => u.status === 'fetching').length;
-    urlMeta.textContent = `${s.crawl_done}/${s.crawl_total} crawled · ${inFlight} in flight`;
+    const skipped = s.skipped || 0;
+    const meta = [`${Math.max(0, s.crawl_done - skipped)}/${s.crawl_total} crawled`];
+    if (skipped) meta.push(skipped + ' skipped');
+    if (!s.done) meta.push(`${inFlight} in flight`);
+    urlMeta.textContent = meta.join(' · ');
 
     // `log` is a sliding window over the job's log; `log_total` counts every
     // line ever added, so the cursor survives the window moving.
