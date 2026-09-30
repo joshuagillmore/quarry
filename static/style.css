@@ -1680,3 +1680,16 @@ h1.page-title em { font-style: italic; color: var(--accent); }
 /* ---------- Library card footer ----------
    The date/word-count tokens must never break mid-value ("2026-07-" / "28"). */
 .doc-card-foot .nowrap{white-space:nowrap;flex-shrink:0}
+
+/* ---------- Web-layer review fixes ---------- */
+/* .qadd sets display:inline-flex, which beats the UA's [hidden] rule; the
+   gate hides the "+ query" button while its input is open. */
+.qadd[hidden]{display:none}
+/* Approve is disabled while nothing is kept and while it submits. */
+.btn:disabled{opacity:.5;cursor:not-allowed}
+/* Crawl page: the stage that was running when the job failed. */
+.stage[data-state="error"] .stage-num{background:var(--danger);color:white}
+.stage[data-state="error"] .stage-title{color:var(--danger)}
+/* Library pagination. */
+.lib-pager{display:flex;align-items:center;justify-content:center;gap:12px;margin:22px 0 8px}
+.lib-pager-info{font-family:var(--font-mono);font-size:12px;color:var(--fg-subtle)}

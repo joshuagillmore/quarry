@@ -122,9 +122,9 @@
       {% if insecure_exposure %}
       <div style="margin:16px 32px 0;padding:10px 14px;border:1px solid var(--danger);background:var(--danger-soft);border-radius:10px;font-size:13px;color:var(--fg);">
         <strong style="color:var(--danger)">Exposed without a password.</strong>
-        QUARRY_BIND publishes this app beyond localhost but QUARRY_PASSWORD is not set —
-        anyone on the network can run crawls and spend your LLM quota. Set a password in
-        <code>.env</code> or revert QUARRY_BIND to <code>127.0.0.1</code>.
+        {{ exposure_reason or 'This app is reachable beyond localhost' }}, but QUARRY_PASSWORD
+        is not set — anyone who can reach it can run crawls and spend your LLM quota. Set a
+        password in <code>.env</code> or keep the app on <code>127.0.0.1</code>.
       </div>
       {% endif %}
       {% with messages = get_flashed_messages(with_categories=true) %}
@@ -188,9 +188,21 @@
   </div>
 
   <script>
-    // Tweaks
+    // Tweaks. Storage can be unavailable (privacy mode, blocked site data)
+    // or hold junk from an older version: every read, parse and write is
+    // guarded so the rest of this script -- the loading overlay, the extract
+    // toggle -- still runs.
     const html = document.documentElement;
-    const tweaks = JSON.parse(localStorage.getItem('quarry_tweaks') || '{"theme":"light","accent":"amber","density":"comfortable"}');
+    const TWEAK_DEFAULTS = {theme: 'light', accent: 'amber', density: 'comfortable'};
+    let tweaks = Object.assign({}, TWEAK_DEFAULTS);
+    try {
+      const saved = JSON.parse(localStorage.getItem('quarry_tweaks') || '{}');
+      if (saved && typeof saved === 'object') {
+        for (const k of Object.keys(TWEAK_DEFAULTS)) {
+          if (typeof saved[k] === 'string') tweaks[k] = saved[k];
+        }
+      }
+    } catch (e) { /* keep the defaults */ }
 
     function applyTweaks() {
       html.setAttribute('data-theme', tweaks.theme);
@@ -201,9 +213,24 @@
       document.querySelectorAll('[data-tweak="accent"] .swatch').forEach(b => b.classList.toggle('active', b.dataset.value === tweaks.accent));
       document.querySelectorAll('[data-tweak="density"] .tweak-opt').forEach(b => b.classList.toggle('active', b.dataset.value === tweaks.density));
 
-      localStorage.setItem('quarry_tweaks', JSON.stringify(tweaks));
+      try { localStorage.setItem('quarry_tweaks', JSON.stringify(tweaks)); } catch (e) { /* not persisted */ }
     }
     applyTweaks();
+
+    // Submit handlers mark what they disable with data-busy and start the
+    // overlay's text rotation; the back button can restore this page from
+    // the bfcache in exactly that state, so undo it.
+    let overlayTimer = null;
+    window.addEventListener('pageshow', (ev) => {
+      if (!ev.persisted) return;
+      document.getElementById('loadingOverlay').classList.add('hidden');
+      if (overlayTimer) { clearInterval(overlayTimer); overlayTimer = null; }
+      document.querySelectorAll('button[data-busy]').forEach(b => {
+        b.disabled = false;
+        b.style.opacity = '';
+        delete b.dataset.busy;
+      });
+    });
 
     document.getElementById('tweaksToggle').onclick = () => {
       document.getElementById('tweaksPanel').classList.remove('hidden');
@@ -255,7 +282,8 @@
           // Animate the loading text
           const steps = ['Searching the web...', 'Crawling pages...', 'Converting to markdown...', 'Storing documents...'];
           let step = 0;
-          setInterval(() => {
+          if (overlayTimer) clearInterval(overlayTimer);
+          overlayTimer = setInterval(() => {
             step = (step + 1) % steps.length;
             text.textContent = steps[step];
           }, 3000);
@@ -272,7 +300,7 @@
           text.textContent = 'Running LLM extraction...';
           sub.textContent = 'Sending document to Cohere for structured extraction';
           const btn = form.querySelector('button[type="submit"]');
-          if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
+          if (btn) { btn.disabled = true; btn.dataset.busy = '1'; btn.style.opacity = '0.5'; }
         });
       });
     });

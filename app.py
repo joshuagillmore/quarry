@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
+import hmac
 import json
+import math
 import os
 import re
 import sys
@@ -8,11 +10,16 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 from flask import (Flask, Response, render_template, request, redirect,
                    url_for, flash, session, stream_with_context)
+from werkzeug.exceptions import SecurityError
 
 import auth
+import brief
+import jobs
+import scheduler
 from config import (settings, save_overrides, known_models,
                     persistent_secret_key, active_api_key)
 from search import web_search
@@ -31,6 +38,7 @@ from storage import (
     insert_requirement, update_requirement, delete_requirement,
     get_requirement_documents, get_agent_track_records,
     reconcile_interrupted_missions, delete_mission,
+    claim_mission_status, agent_has_active_mission,
 )
 from jobs import (
     create_job, get_job, job_state, run_job_in_background,
@@ -38,10 +46,9 @@ from jobs import (
     request_cancel, JobLimitReached,
 )
 from agent_runner import start_planning, start_collection
-from brief import ordered_sources, linkify_citations
+from brief import linkify_citations
 from scheduler import (start_scheduler, sync_agent_jobs, validate_cron,
-                       describe_next_run, scheduled_jobs,
-                       run_scheduled_agent_now)
+                       describe_next_run, scheduled_jobs)
 from markdown_render import render_markdown, to_plain_text, snippet
 from models import SearchRecord, Agent, Mission, Requirement
 from prompt_templates import build_persona
@@ -50,6 +57,7 @@ app = Flask(__name__)
 # Stable across restarts (generated once into the data volume) so login
 # sessions and flash messages survive a redeploy.
 app.secret_key = persistent_secret_key()
+auth.configure(app.secret_key)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
@@ -64,18 +72,62 @@ if settings.quarry_behind_proxy:
     app.config["SESSION_COOKIE_SECURE"] = True
 
 
-def insecure_exposure() -> bool:
-    """True when the compose publish interface is non-loopback but no password
-    is set — the one-line footgun the security audit flagged."""
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def _trusted_hosts() -> list[str] | None:
+    """Host-header allowlist; Flask 3.1's TRUSTED_HOSTS answers any other
+    Host with 400. Always on while auth is off, where it is the DNS-rebinding
+    guard: a hostile page that rebinds its own name to 127.0.0.1 still sends
+    that name as Host. With a password set it applies only when the operator
+    lists hosts in QUARRY_TRUSTED_HOSTS."""
+    extra = [h.strip() for h in (settings.quarry_trusted_hosts or "").split(",")
+             if h.strip()]
+    if auth.enabled() and not extra:
+        return None
+    return ["localhost", "127.0.0.1", "[::1]"] + extra
+
+
+app.config["TRUSTED_HOSTS"] = _trusted_hosts()
+
+# Set by __main__ to the dev server's bind address; stays None under gunicorn.
+_dev_server_host: str | None = None
+
+
+def dev_server_exposed(host: str) -> bool:
+    """True when the Flask dev server (python app.py) would bind beyond
+    loopback with no password set."""
+    return (host or "").strip() not in _LOOPBACK_HOSTS and not auth.enabled()
+
+
+def exposure_reason() -> str:
+    """Why this instance is reachable beyond localhost without a password,
+    or '' when it is not (the footgun the security audit flagged)."""
+    if auth.enabled():
+        return ""
     bind = (settings.quarry_bind or "127.0.0.1").strip()
-    return bind not in ("127.0.0.1", "localhost", "::1", "") and not auth.enabled()
+    if bind not in _LOOPBACK_HOSTS + ("",):
+        return f"QUARRY_BIND={bind} publishes this app beyond localhost"
+    if settings.quarry_behind_proxy:
+        return "QUARRY_BEHIND_PROXY=true serves this app through a reverse proxy"
+    if _dev_server_host is not None and dev_server_exposed(_dev_server_host):
+        return f"FLASK_HOST={_dev_server_host} binds the dev server beyond localhost"
+    return ""
 
 
-if insecure_exposure():
-    print("=" * 70 + f"\n[SECURITY] QUARRY_BIND={settings.quarry_bind} exposes this app "
-          "beyond localhost WITHOUT a password.\n[SECURITY] Set QUARRY_PASSWORD in .env "
-          "or revert QUARRY_BIND to 127.0.0.1.\n" + "=" * 70,
+def insecure_exposure() -> bool:
+    return bool(exposure_reason())
+
+
+def _warn_exposure(reason: str) -> None:
+    print("=" * 70 + f"\n[SECURITY] {reason} WITHOUT a password.\n"
+          "[SECURITY] Set QUARRY_PASSWORD in .env, or keep the app on "
+          "127.0.0.1.\n" + "=" * 70,
           file=sys.stderr, flush=True)
+
+
+if exposure_reason():
+    _warn_exposure(exposure_reason())
 
 
 @app.context_processor
@@ -102,6 +154,7 @@ def inject_globals():
             previous_jobs=sidebar["previous"],
             auth_enabled=auth.enabled(),
             insecure_exposure=insecure_exposure(),
+            exposure_reason=exposure_reason(),
         )
     except Exception:
         return dict(
@@ -111,6 +164,7 @@ def inject_globals():
             live_job=None, previous_jobs=[],
             auth_enabled=auth.enabled(),
             insecure_exposure=insecure_exposure(),
+            exposure_reason=exposure_reason(),
         )
 
 
@@ -140,6 +194,16 @@ def _static_cache_bust(endpoint, values):
 
 
 @app.before_request
+def reject_untrusted_host():
+    """Flask records a Host outside TRUSTED_HOSTS as a routing exception but
+    still runs before_request hooks before raising it. Registered first, so a
+    rebinding request gets its 400 before DB init or the login redirect (which
+    cannot even build a URL without the unbuilt URL adapter) runs."""
+    if isinstance(request.routing_exception, SecurityError):
+        raise request.routing_exception
+
+
+@app.before_request
 def block_cross_site_posts():
     """CSRF defense via origin checking (no tokens needed): browsers label
     cross-site requests with Sec-Fetch-Site / a mismatching Origin, so a
@@ -163,26 +227,61 @@ def block_cross_site_posts():
 _init_db_lock = threading.Lock()
 
 
+def initialize() -> None:
+    """One-time process startup: create/migrate the schema, fail missions
+    orphaned by a previous process, start the scheduler.
+
+    Idempotent and locked (double-checked), so gunicorn's post_worker_init
+    can call it eagerly and the first request's ensure_db is then a no-op;
+    concurrent first requests never run init_db (and its FTS rebuild) twice.
+    """
+    if getattr(app, "_db_initialized", False):
+        return
+    with _init_db_lock:
+        if getattr(app, "_db_initialized", False):
+            return
+        run_async(init_db())
+        # Safe here: no collection worker can be running yet in this process,
+        # so any mission still in an in-flight state is one whose thread died
+        # with a previous process.
+        stale = run_async(reconcile_interrupted_missions())
+        if stale:
+            print(f"[STARTUP] marked {stale} interrupted mission(s) as failed",
+                  file=sys.stderr, flush=True)
+        # Started after the DB exists. Safe under the single gunicorn worker;
+        # the Flask reloader would otherwise start two.
+        if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+            start_scheduler()
+        app._db_initialized = True
+
+
 @app.before_request
 def ensure_db():
-    # Double-checked lock: under gunicorn's threaded worker, concurrent first
-    # requests must not run init_db (and its FTS rebuild) twice in parallel.
-    if not getattr(app, '_db_initialized', False):
-        with _init_db_lock:
-            if not getattr(app, '_db_initialized', False):
-                run_async(init_db())
-                # Safe here: no collection worker can be running yet in this
-                # process, so any mission still in an in-flight state is one
-                # whose thread died with a previous process.
-                stale = run_async(reconcile_interrupted_missions())
-                if stale:
-                    print(f"[STARTUP] marked {stale} interrupted mission(s) as failed",
-                          file=sys.stderr, flush=True)
-                # Started after the DB exists. Safe under the single gunicorn
-                # worker; the Flask reloader would otherwise start two.
-                if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-                    start_scheduler()
-                app._db_initialized = True
+    initialize()
+
+
+def _session_authed() -> bool:
+    """The session carries the token for the current secret key + password.
+    A bare True (older versions) or a token from before a password change
+    does not count."""
+    tok = session.get("authed")
+    return isinstance(tok, str) and hmac.compare_digest(tok, auth.session_token())
+
+
+_SAFE_NEXT = re.compile(r"/(?![/\\])[^\s\\]*")
+
+
+def _safe_next(nxt: str) -> str:
+    """A post-login redirect target, only ever a path on this site. Rejects
+    anything a browser could normalise into another origin: '//host',
+    '/\\host', and '/<tab>/host' (browsers strip tabs and newlines, and read
+    backslashes as slashes)."""
+    nxt = nxt or ""
+    if _SAFE_NEXT.fullmatch(nxt):
+        parts = urlsplit(nxt)
+        if not parts.scheme and not parts.netloc:
+            return nxt
+    return url_for("index")
 
 
 @app.before_request
@@ -194,7 +293,7 @@ def require_login():
         return None
     if request.endpoint in ("login", "static"):
         return None
-    if session.get("authed"):
+    if _session_authed():
         return None
     if request.path.startswith("/api/"):
         return {"error": "authentication required"}, 401
@@ -212,28 +311,26 @@ def security_headers(resp):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if not auth.enabled() or session.get("authed"):
+    if not auth.enabled() or _session_authed():
         return redirect(url_for("index"))
 
     if request.method == "POST":
         ip = request.remote_addr or "unknown"
-        locked, wait_s = auth.is_locked_out(ip)
-        if locked:
+        # Counted before verifying, atomically with the lockout check, so
+        # parallel guesses cannot all get through the gap between the two.
+        allowed, wait_s = auth.reserve_attempt(ip)
+        if not allowed:
             flash(f"Too many attempts — try again in {wait_s // 60 + 1} minute(s).", "error")
             return render_template("login.html"), 429
 
         if auth.verify_password(request.form.get("password", "")):
             auth.clear_failures(ip)
             session.clear()  # fresh session id state on privilege change
-            session["authed"] = True
+            session["authed"] = auth.session_token()
             session.permanent = True
-            nxt = request.form.get("next", "")
             # Only ever redirect within this app (no open redirect).
-            if not nxt.startswith("/") or nxt.startswith("//"):
-                nxt = url_for("index")
-            return redirect(nxt)
+            return redirect(_safe_next(request.values.get("next", "")))
 
-        auth.record_failure(ip)
         flash("Wrong password.", "error")
         return render_template("login.html"), 401
 
@@ -293,6 +390,22 @@ def crawl_view(job_id):
     return render_template("crawl.html", job=job)
 
 
+@app.route("/crawl/<job_id>/cancel", methods=["POST"])
+def crawl_cancel(job_id):
+    """Cooperative: the job checks for this between stages and between
+    documents, then finishes as `cancelled` with what it already stored."""
+    if request_cancel(job_id):
+        flash("Cancelling — the crawl stops at its next checkpoint.", "info")
+    else:
+        flash("This crawl is not running.", "info")
+    return redirect(url_for("crawl_view", job_id=job_id))
+
+
+# Fields that change on every poll without anything having happened; left
+# out of the SSE change check so an idle job does not send a message 4x/s.
+_SSE_VOLATILE = ("elapsed", "finished_at")
+
+
 @app.route("/api/job/<job_id>")
 def api_job(job_id):
     state = job_state(job_id)
@@ -303,18 +416,24 @@ def api_job(job_id):
 
 @app.route("/api/job/<job_id>/stream")
 def api_job_stream(job_id):
+    # 204 is the one answer that makes EventSource stop reconnecting: a job
+    # that is gone (finished trace evicted, process restarted) stays gone.
+    if job_state(job_id) is None:
+        return Response(status=204)
+
     def gen():
         last_hash = None
-        # Cap the stream at ~10 minutes to bound resource use
+        # Cap the stream at ~10 minutes to bound resource use; the browser's
+        # EventSource reconnects and resumes if the job is still running.
         for _ in range(2400):
             state = job_state(job_id)
             if not state:
-                yield 'event: error\ndata: {"error":"not found"}\n\n'
+                yield "event: gone\ndata: {}\n\n"
                 return
-            payload = json.dumps(state)
-            h = hashlib.md5(payload.encode()).hexdigest()
+            stable = {k: v for k, v in state.items() if k not in _SSE_VOLATILE}
+            h = hashlib.md5(json.dumps(stable, sort_keys=True).encode()).hexdigest()
             if h != last_hash:
-                yield f"data: {payload}\n\n"
+                yield f"data: {json.dumps(state)}\n\n"
                 last_hash = h
             if state.get("done"):
                 return
@@ -465,24 +584,62 @@ def history():
     )
 
 
+PAGE_SIZE = 60
+# Card previews need only the opening of each page, not the whole body.
+PREVIEW_CHARS = 4000
+
+
 @app.route("/documents")
 def documents_list():
     search_filter = request.args.get("search", "").strip()
     mission_filter = request.args.get("mission", "").strip()
     full_text = request.args.get("q", "").strip()[:200]
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
 
     mission_obj = None
+    total = None  # set only for the paged listings
     if mission_filter:
         # Mission filter takes precedence; full-text within a mission is handled
-        # client-side by the title filter.
+        # client-side by the title filter. Unpaged: a mission is bounded by
+        # its source budget.
         mission_obj = run_async(get_mission(mission_filter))
         documents = run_async(get_mission_documents(mission_filter))
     elif full_text:
         documents = run_async(search_documents_fts(full_text, search_filter or None))
-    elif search_filter:
-        documents = run_async(get_documents_by_search(search_filter))
     else:
-        documents = run_async(get_all_documents())
+        if search_filter:
+            # No COUNT helper for one collection in storage: count metadata
+            # rows (preview_chars=0 keeps every page body out of the result).
+            total = len(run_async(get_documents_by_search(search_filter, preview_chars=0)))
+        else:
+            total = run_async(count_documents())
+        page = min(page, max(1, math.ceil(total / PAGE_SIZE)))
+        paging = dict(limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE,
+                      preview_chars=PREVIEW_CHARS)
+        if search_filter:
+            documents = run_async(get_documents_by_search(search_filter, **paging))
+        else:
+            documents = run_async(get_all_documents(**paging))
+
+    pager = None
+    if total is not None and total > PAGE_SIZE:
+        def page_url(n):
+            args = {"page": n}
+            if search_filter:
+                args["search"] = search_filter
+            return url_for("documents_list", **args)
+
+        first = (page - 1) * PAGE_SIZE + 1
+        pager = {
+            "first": first,
+            "last": first + len(documents) - 1,
+            "total": total,
+            "prev_url": page_url(page - 1) if page > 1 else None,
+            "next_url": page_url(page + 1) if page * PAGE_SIZE < total else None,
+        }
 
     ext_ids = run_async(get_doc_ids_with_extractions())
     domain_counts = {}
@@ -512,6 +669,8 @@ def documents_list():
         full_text_query=full_text,
         search_queries=search_queries,
         missions=missions,
+        pager=pager,
+        total=total if total is not None else len(documents),
     )
 
 
@@ -526,14 +685,29 @@ def agents_list():
                            next_runs=next_runs, active_page="agents")
 
 
+_AGENT_FORM_FIELDS = {
+    "name": 120, "expertise": 500, "max_sources": 10, "max_passes": 10,
+    "per_req_attempts": 10, "schedule_cron": 120, "schedule_question": 500,
+    "persona_prompt": 5000,
+}
+
+
+def _agent_form_error(agent, message: str):
+    """Re-render the form with what the user typed and why it was refused,
+    rather than redirecting to an empty form. Values are bounded like the
+    fields they came from; Jinja autoescapes them."""
+    values = {k: request.form.get(k, "")[:n] for k, n in _AGENT_FORM_FIELDS.items()}
+    return render_template("agent_form.html", agent=agent, form=values,
+                           error=message, active_page="agents"), 400
+
+
 @app.route("/agents/new", methods=["GET", "POST"])
 def agent_new():
     if request.method == "POST":
         name = request.form.get("name", "").strip()[:120]
         expertise = request.form.get("expertise", "").strip()[:500]
         if not name or not expertise:
-            flash("Name and area of expertise are required.", "error")
-            return redirect(url_for("agent_new"))
+            return _agent_form_error(None, "Name and area of expertise are required.")
 
         def _clamp(field, default, lo, hi):
             try:
@@ -550,8 +724,8 @@ def agent_new():
         cron = request.form.get("schedule_cron", "").strip()[:120]
         ok, err = validate_cron(cron)
         if not ok:
-            flash(f"That schedule isn't a valid cron expression: {err}", "error")
-            return redirect(url_for("agent_new"))
+            return _agent_form_error(
+                None, f"That schedule isn't a valid cron expression: {err}")
         sched_q = request.form.get("schedule_question", "").strip()[:500]
 
         agent = Agent(
@@ -580,8 +754,7 @@ def agent_edit(agent_id):
         name = request.form.get("name", "").strip()[:120]
         expertise = request.form.get("expertise", "").strip()[:500]
         if not name or not expertise:
-            flash("Name and area of expertise are required.", "error")
-            return redirect(url_for("agent_edit", agent_id=agent_id))
+            return _agent_form_error(agent, "Name and area of expertise are required.")
 
         def _clamp(field, default, lo, hi):
             try:
@@ -596,8 +769,8 @@ def agent_edit(agent_id):
         cron = request.form.get("schedule_cron", "").strip()[:120]
         ok, err = validate_cron(cron)
         if not ok:
-            flash(f"That schedule isn't a valid cron expression: {err}", "error")
-            return redirect(url_for("agent_edit", agent_id=agent_id))
+            return _agent_form_error(
+                agent, f"That schedule isn't a valid cron expression: {err}")
         sched_q = request.form.get("schedule_question", "").strip()[:500]
 
         run_async(update_agent(
@@ -627,10 +800,24 @@ def agent_run_scheduled(agent_id):
     if not (agent.schedule_question or "").strip():
         flash("Set a standing question before running the schedule.", "error")
         return redirect(url_for("agent_edit", agent_id=agent_id))
-    run_scheduled_agent_now(agent_id)
+    try:
+        mission_id = scheduler.launch_scheduled_mission(agent_id)
+    except JobLimitReached as e:
+        flash(f"Busy: {e}.", "error")
+        return redirect(url_for("agents_list"))
+    if mission_id is None:
+        if not agent.active:
+            why = f"{agent.name} is inactive, so its schedule does not run."
+        elif run_async(agent_has_active_mission(agent_id)):
+            why = (f"{agent.name} already has a mission running — "
+                   "wait for it to finish, then run again.")
+        else:
+            why = f"{agent.name}'s scheduled question could not be started."
+        flash(f"Nothing started: {why}", "info")
+        return redirect(url_for("agents_list"))
     flash(f"Running {agent.name}'s scheduled question now — it approves its own plan.",
           "success")
-    return redirect(url_for("missions_list"))
+    return redirect(url_for("mission_view", mission_id=mission_id))
 
 
 @app.route("/agents/<agent_id>/delete", methods=["POST"])
@@ -723,9 +910,10 @@ def mission_view(mission_id):
     agent = run_async(get_agent(mission.agent_id))
     ext_ids = run_async(get_doc_ids_with_extractions())
 
-    # Number the sources exactly as brief.py numbered them for the LLM, so the
-    # [n] markers in the brief bind to the right rail entry.
-    numbered = list(enumerate(ordered_sources(documents), 1))
+    # Number the sources exactly as brief.py numbered them for the LLM (the
+    # order stored with the brief when there is one), so the [n] markers in
+    # the brief bind to the right rail entry.
+    numbered = list(enumerate(brief.ordered_sources_for_mission(mission, documents), 1))
     doc_number = {d.id: n for n, d in numbered}
 
     # Sanitize first (never bypassed), then turn [n] into citation controls.
@@ -766,69 +954,126 @@ def mission_view(mission_id):
     )
 
 
+def _mission_budget(mission) -> dict:
+    try:
+        budget = json.loads(mission.budget_json or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return budget if isinstance(budget, dict) else {}
+
+
+def _budget_max_sources(budget: dict) -> int:
+    try:
+        return max(1, int(budget.get("max_sources", 30)))
+    except (TypeError, ValueError):
+        return 30
+
+
+_MAX_PLAN_ROWS = 50   # a drafted plan is a handful of requirements
+
+
+def _plan_edits(raw: str) -> list[dict]:
+    """The gate's plan_json, normalised: dict rows only (at most
+    _MAX_PLAN_ROWS), `id` a str or None, `title` a bounded str, `queries` a
+    list of bounded strs or None when the row did not send one."""
+    try:
+        parsed = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return []
+    rows = []
+    for item in parsed[:_MAX_PLAN_ROWS] if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        rid, title, desc = item.get("id"), item.get("title"), item.get("description")
+        queries = item.get("queries")
+        rows.append({
+            "id": rid if isinstance(rid, str) else None,
+            "title": title.strip()[:200] if isinstance(title, str) else "",
+            "description": desc.strip()[:1000] if isinstance(desc, str) else "",
+            "queries": ([q.strip()[:300] for q in queries if isinstance(q, str) and q.strip()][:8]
+                        if isinstance(queries, list) else None),
+            "dropped": bool(item.get("dropped")),
+        })
+    return rows
+
+
 @app.route("/missions/<mission_id>/approve", methods=["POST"])
 def mission_approve(mission_id):
     mission = run_async(get_mission(mission_id))
     if not mission:
         flash("Mission not found.", "error")
         return redirect(url_for("missions_list"))
-    if mission.status != "awaiting_approval":
+    # Claim the transition before touching anything: of two concurrent
+    # approvals (a double click, two tabs) exactly one moves the row, and only
+    # that one edits the plan and starts a worker.
+    if not run_async(claim_mission_status(mission_id, "awaiting_approval", "collecting")):
         flash("This mission is not awaiting approval.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
+
+    def back_to_gate():
+        run_async(claim_mission_status(mission_id, "collecting", "awaiting_approval"))
 
     # The gate lets the user reword requirements, cut them, and edit the seeded
     # queries. JS serializes that into plan_json; with JS off the field is empty
     # and we approve the plan as drafted.
-    dropped = 0
-    raw_plan = request.form.get("plan_json", "").strip()
-    if raw_plan:
-        try:
-            edits = json.loads(raw_plan)
-        except json.JSONDecodeError:
-            edits = []
-        existing = {r.id: r for r in run_async(get_requirements_for_mission(mission_id))}
-        for item in edits if isinstance(edits, list) else []:
-            if not isinstance(item, dict):
-                continue
-            rid = item.get("id")
-            if item.get("dropped"):
-                if rid in existing:
-                    run_async(delete_requirement(rid))
-                    dropped += 1
-                continue
-            title = (item.get("title") or "").strip()[:200]
-            queries = [q.strip()[:300] for q in (item.get("queries") or [])
-                       if isinstance(q, str) and q.strip()][:8]
-            if rid in existing:
-                fields = {}
-                if title:
-                    fields["title"] = title
-                if queries:
-                    fields["next_queries_json"] = json.dumps(queries)
-                if fields:
-                    run_async(update_requirement(rid, **fields))
-            elif title:
-                # A requirement the user added at the gate.
-                run_async(insert_requirement(Requirement(
-                    id=str(uuid.uuid4()), mission_id=mission_id, title=title,
-                    description=(item.get("description") or "").strip()[:1000],
-                    rationale="Added by you at the approval gate.",
-                    status="pending", attempts=0,
-                    next_queries_json=json.dumps(queries or [title]),
-                )))
-
-    remaining = run_async(get_requirements_for_mission(mission_id))
-    if not remaining:
+    existing = {r.id: r for r in run_async(get_requirements_for_mission(mission_id))}
+    edits = _plan_edits(request.form.get("plan_json", "").strip())
+    drop_ids = {row["id"] for row in edits if row["dropped"] and row["id"] in existing}
+    additions = [row for row in edits
+                 if not row["dropped"] and row["id"] not in existing and row["title"]]
+    # Decided before anything is deleted, so an all-dropped plan changes nothing.
+    kept = len(existing) - len(drop_ids) + len(additions)
+    if kept == 0:
+        back_to_gate()
         flash("A plan needs at least one requirement — nothing was approved.", "error")
         return redirect(url_for("mission_view", mission_id=mission_id))
 
-    # Flip status before spawning the worker so the redirect renders the
-    # collecting view immediately (avoids briefly re-showing the approve card).
-    run_async(update_mission(mission_id, status="collecting"))
+    job_id = None
+    try:
+        for rid in drop_ids:
+            run_async(delete_requirement(rid))
+        for row in edits:
+            if row["dropped"]:
+                continue
+            if row["id"] in existing:
+                fields = {}
+                if row["title"]:
+                    fields["title"] = row["title"]
+                if row["queries"] is not None:
+                    # An explicitly emptied query list means "search for the
+                    # requirement itself", not "keep the queries I removed".
+                    fields["next_queries_json"] = json.dumps(
+                        row["queries"] or [row["title"] or existing[row["id"]].title])
+                if fields:
+                    run_async(update_requirement(row["id"], **fields))
+            elif row["title"]:
+                # A requirement the user added at the gate.
+                run_async(insert_requirement(Requirement(
+                    id=str(uuid.uuid4()), mission_id=mission_id, title=row["title"],
+                    description=row["description"],
+                    rationale="Added by you at the approval gate.",
+                    status="pending", attempts=0,
+                    next_queries_json=json.dumps(row["queries"] or [row["title"]]),
+                )))
+        # The planning trace finished at the gate; collection gets its own.
+        job_id = create_mission_job(mission.question,
+                                    _budget_max_sources(_mission_budget(mission)))
+        run_async(update_mission(mission_id, job_id=job_id))
+    except JobLimitReached as e:
+        back_to_gate()
+        flash(f"Busy: {e}.", "error")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    except Exception:
+        # Never strand the mission in `collecting` with no worker behind it.
+        if job_id:
+            jobs.finish_job(job_id, stage="error", error="approval failed")
+        back_to_gate()
+        raise
+
     start_collection(mission_id)
-    msg = f"Plan approved — collecting against {len(remaining)} requirements."
-    if dropped:
-        msg += f" {dropped} dropped."
+    msg = f"Plan approved — collecting against {kept} requirements."
+    if drop_ids:
+        msg += f" {len(drop_ids)} dropped."
     flash(msg, "success")
     return redirect(url_for("mission_view", mission_id=mission_id))
 
@@ -860,6 +1105,12 @@ def mission_delete(mission_id):
             and mission.job_id in get_in_memory_job_ids():
         flash("This mission is still running — stop it first, then delete.", "error")
         return redirect(url_for("mission_view", mission_id=mission_id))
+    # A trace that never finished (e.g. a plan discarded at the gate) would
+    # otherwise keep holding a job slot after its mission is gone.
+    if mission.job_id:
+        job = get_job(mission.job_id)
+        if job is not None and not job.done:
+            jobs.finish_job(mission.job_id, stage="cancelled")
     run_async(delete_mission(mission_id))
     flash("Mission deleted. Its collected sources are still in the Library.", "success")
     return redirect(url_for("missions_list"))
@@ -875,6 +1126,9 @@ def requirement_retask(mission_id, req_id):
         return redirect(url_for("missions_list"))
     if mission.status in ("planning", "collecting", "synthesizing"):
         flash("The agent is still working — wait for it to finish before re-tasking.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    if mission.status == "awaiting_approval":
+        flash("Approve the plan first — re-tasking is for a mission that has finished.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
 
     req = next((r for r in run_async(get_requirements_for_mission(mission_id))
@@ -892,29 +1146,38 @@ def requirement_retask(mission_id, req_id):
         queries = json.loads(req.next_queries_json or "[]")
     except json.JSONDecodeError:
         queries = []
+    if not isinstance(queries, list):
+        queries = []
     if query not in queries:
         queries.append(query)
 
-    # A fresh attempt budget — the user explicitly asked for another round.
-    run_async(update_requirement(
-        req_id, status="pending", attempts=0, accepted_by_user=0,
-        next_queries_json=json.dumps(queries[-8:]),
-        assessment_missing="", assessment_confidence="",
-    ))
-
-    # The old live trace is gone once the process restarts, so give the re-run
-    # its own job and point the mission at it.
-    budget = {}
+    # The job first (the old live trace is gone once the process restarts, so
+    # the re-run gets its own): if the queue is full, nothing about the
+    # mission or the requirement has changed yet.
     try:
-        budget = json.loads(mission.budget_json or "{}")
-    except json.JSONDecodeError:
-        pass
-    try:
-        job_id = create_mission_job(mission.question, int(budget.get("max_sources", 30)))
+        job_id = create_mission_job(mission.question,
+                                    _budget_max_sources(_mission_budget(mission)))
     except JobLimitReached as e:
         flash(f"Busy: {e}.", "error")
         return redirect(url_for("mission_view", mission_id=mission_id))
-    run_async(update_mission(mission_id, status="collecting", job_id=job_id, error=None))
+    # Then claim the transition from the status we saw, so a concurrent
+    # re-task (or approve) cannot start a second worker.
+    if not run_async(claim_mission_status(mission_id, mission.status, "collecting")):
+        jobs.finish_job(job_id, stage="cancelled")
+        flash("This mission changed state in the meantime — nothing was re-tasked.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    try:
+        # A fresh attempt budget — the user explicitly asked for another round.
+        run_async(update_requirement(
+            req_id, status="pending", attempts=0, accepted_by_user=0,
+            next_queries_json=json.dumps(queries[-8:]),
+            assessment_missing="", assessment_confidence="",
+        ))
+        run_async(update_mission(mission_id, job_id=job_id, error=None))
+    except Exception:
+        jobs.finish_job(job_id, stage="error", error="re-task failed")
+        run_async(claim_mission_status(mission_id, "collecting", mission.status))
+        raise
     start_collection(mission_id)
     flash(f"Re-tasking “{req.title}” with a fresh attempt budget.", "success")
     return redirect(url_for("mission_view", mission_id=mission_id))
@@ -982,7 +1245,11 @@ def api_mission(mission_id):
         if js:
             state["trace"] = {
                 "stage": js["stage"], "elapsed": js["elapsed"],
-                "log": js["log"], "urls": js["urls"],
+                "log": js["log"],
+                # Monotonic count of every log line: `log` is a sliding
+                # window, so the page's render cursor keys off this.
+                "log_total": js.get("log_total", len(js["log"])),
+                "urls": js["urls"],
                 "pass_num": js["pass_num"], "sources_used": js["sources_used"],
                 "cancel_requested": js["cancel_requested"],
             }
@@ -1017,6 +1284,15 @@ def settings_page():
 
 
 if __name__ == "__main__":
+    app.debug = settings.flask_debug
+    _dev_server_host = settings.flask_host
+    if dev_server_exposed(_dev_server_host):
+        _warn_exposure(f"FLASK_HOST={_dev_server_host} binds the dev server "
+                       "beyond localhost")
+    # The reloader's parent process only watches files and re-spawns the
+    # child (WERKZEUG_RUN_MAIN=true), which serves; initialise there only.
+    if not (app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true"):
+        initialize()
     app.run(
         host=settings.flask_host,
         port=settings.flask_port,

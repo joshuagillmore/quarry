@@ -5,9 +5,18 @@
   <span class="sep">/</span><span class="cur">{{ 'Edit' if agent else 'New' }}</span>
 {% endblock %}
 
+{# After a refused submit, `form` holds what was typed; otherwise fields
+   show the saved agent (edit) or the defaults (new). #}
+{% macro val(field, saved, default='') -%}
+  {%- if form is defined and form -%}{{ form.get(field, '') }}
+  {%- elif agent -%}{{ saved if saved is not none else '' }}
+  {%- else -%}{{ default }}{%- endif -%}
+{%- endmacro %}
+
 {% block content %}
 <div class="page">
   <h1 style="margin:0 0 16px;">{{ 'Edit agent' if agent else 'New expert agent' }}</h1>
+  {% if error %}<div class="flash error" style="max-width:680px;">{{ error }}</div>{% endif %}
 
   <form method="post" action="{{ ('/agents/' ~ agent.id ~ '/edit') if agent else '/agents/new' }}"
         class="card" style="padding:24px;display:grid;gap:18px;max-width:680px;">
@@ -15,14 +24,14 @@
       <label class="tweak-label" for="name">Name</label>
       <input id="name" name="name" class="input" maxlength="120" required
              placeholder="e.g. Astrophysics Analyst" style="width:100%;"
-             value="{{ agent.name if agent else '' }}">
+             value="{{ val('name', agent.name if agent) }}">
     </div>
 
     <div>
       <label class="tweak-label" for="expertise">Area of expertise</label>
       <input id="expertise" name="expertise" class="input" maxlength="500" required
              placeholder="e.g. observational astrophysics and cosmology" style="width:100%;"
-             value="{{ agent.expertise if agent else '' }}">
+             value="{{ val('expertise', agent.expertise if agent) }}">
       <p style="margin:6px 0 0;color:var(--fg-subtle);font-size:12px;">
         This seeds the agent's collection-manager persona (intelligence-style
         PIR → EEI → SIR planning). Leave the override below blank to
@@ -34,17 +43,17 @@
       <div>
         <label class="tweak-label" for="max_sources">Max sources</label>
         <input id="max_sources" name="max_sources" class="input" type="number"
-               min="1" max="100" value="{{ agent.default_max_sources if agent else 30 }}" style="width:100%;">
+               min="1" max="100" value="{{ val('max_sources', agent.default_max_sources if agent, 30) }}" style="width:100%;">
       </div>
       <div>
         <label class="tweak-label" for="max_passes">Max passes</label>
         <input id="max_passes" name="max_passes" class="input" type="number"
-               min="1" max="10" value="{{ agent.default_max_passes if agent else 4 }}" style="width:100%;">
+               min="1" max="10" value="{{ val('max_passes', agent.default_max_passes if agent, 4) }}" style="width:100%;">
       </div>
       <div>
         <label class="tweak-label" for="per_req_attempts">Tries / requirement</label>
         <input id="per_req_attempts" name="per_req_attempts" class="input" type="number"
-               min="1" max="6" value="{{ agent.default_per_req_attempts if agent else 3 }}" style="width:100%;">
+               min="1" max="6" value="{{ val('per_req_attempts', agent.default_per_req_attempts if agent, 3) }}" style="width:100%;">
       </div>
     </div>
     <p style="margin:-6px 0 0;color:var(--fg-subtle);font-size:12px;">
@@ -60,7 +69,7 @@
         <input id="schedule_cron" name="schedule_cron" class="input" maxlength="120"
                placeholder="e.g. 0 7 * * *  (07:00 UTC daily) — leave blank for manual only"
                style="width:100%;font-family:var(--font-mono);"
-               value="{{ agent.schedule_cron or '' if agent else '' }}">
+               value="{{ val('schedule_cron', agent.schedule_cron if agent) }}">
         <p style="margin:6px 0 0;color:var(--fg-subtle);font-size:12px;">
           Five fields, UTC: minute hour day month weekday. A scheduled run has
           nobody to approve its plan, so it <strong>auto-approves</strong> and
@@ -72,7 +81,7 @@
         <input id="schedule_question" name="schedule_question" class="input" maxlength="500"
                placeholder="What should it research on every run?"
                style="width:100%;"
-               value="{{ agent.schedule_question or '' if agent else '' }}">
+               value="{{ val('schedule_question', agent.schedule_question if agent) }}">
         <p style="margin:6px 0 0;color:var(--fg-subtle);font-size:12px;">
           Required for a schedule to fire. Each run's brief leads with what is
           new since the previous run of this question.
@@ -86,7 +95,7 @@
       </summary>
       <textarea name="persona_prompt" rows="8" maxlength="5000"
                 placeholder="Leave blank to auto-generate from the area of expertise."
-                style="width:100%;margin-top:10px;" class="input">{{ agent.persona_prompt if agent else '' }}</textarea>
+                style="width:100%;margin-top:10px;" class="input">{{ val('persona_prompt', agent.persona_prompt if agent) }}</textarea>
     </details>
 
     <div style="display:flex;gap:10px;">

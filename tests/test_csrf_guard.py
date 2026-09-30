@@ -34,14 +34,30 @@ def test_cross_site_fetch_metadata_blocked(tmp_path):
 
 def test_same_origin_and_headerless_posts_pass(tmp_path):
     client = _client(tmp_path)
-    # Non-browser client (no Origin / Sec-Fetch-Site): passes the guard,
-    # reaches the route (unknown agent -> redirect, not 403).
+    # Non-browser client (no Origin / Sec-Fetch-Site): passes the guard and
+    # reaches the route. The route's own "unknown agent" redirect to /agents
+    # proves it ran -- a bare 302 could just as well be the login gate.
     r = client.post("/agents/nonexistent/run", data={"question": "q"})
     assert r.status_code == 302
+    assert r.headers["Location"] == "/agents"
     # Same-origin browser post: Origin matches Host.
     r = client.post("/agents/nonexistent/run", data={"question": "q"},
                     headers={"Origin": "http://localhost",
                              "Sec-Fetch-Site": "same-origin"})
     assert r.status_code == 302
+    assert r.headers["Location"] == "/agents"
+    # Same-site (a sibling subdomain) and user-initiated ("none") also pass.
+    for sfs in ("same-site", "none"):
+        r = client.post("/agents/nonexistent/run", data={"question": "q"},
+                        headers={"Sec-Fetch-Site": sfs})
+        assert r.headers["Location"] == "/agents", sfs
     # GETs are never blocked.
     assert client.get("/").status_code == 200
+
+
+def test_mismatched_origin_port_blocked(tmp_path):
+    # Same hostname, different port is a different origin.
+    client = _client(tmp_path)
+    r = client.post("/search", data={"query": "x"},
+                    headers={"Origin": "http://localhost:6666"})
+    assert r.status_code == 403
