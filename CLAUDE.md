@@ -50,9 +50,9 @@ The crawl page is driven by the SSE endpoint alone (`GET /api/job/<id>/stream`, 
 
 - **No connection pool** — every function opens its own `aiosqlite.connect()`. `DB_PATH` is resolved once and cached at module level (`get_db_path`).
 - **`init_db()` is idempotent and self-migrating**: `CREATE TABLE IF NOT EXISTS`, an `ALTER TABLE ... ADD COLUMN job_id` wrapped in try/except, and an FTS5 virtual table `documents_fts`. If the FTS row count diverges from `documents`, it **rebuilds the whole FTS index**. It runs once via `app.initialize()` (see Deployment notes) rather than on every request.
-- Documents are keyed by UUID but **`UNIQUE(url, search_query)`** — re-crawling the same URL under the same query replaces the row (`INSERT OR REPLACE`). FTS rows are deleted+reinserted alongside every document write to stay consistent.
+- Documents are keyed by UUID but **`UNIQUE(url, search_query)`**. Both the one-shot crawl and mission collection write through `upsert_document`, a single atomic `INSERT ... ON CONFLICT(url, search_query) DO UPDATE ... RETURNING id` — re-crawling the same URL under the same query updates the row **in place and keeps its id** rather than replacing it. `insert_document` is a thin alias that returns that same id and raises on error. FTS rows are deleted+reinserted alongside every document write to stay consistent.
 - Full-text search input is tokenized and quoted by `_build_fts_query` before hitting `MATCH` to avoid FTS5 syntax injection.
-- **Library listing is paginated at the SQL layer, not in Python.** `get_all_documents`/`get_documents_by_search` take `limit`/`offset`, and a `preview_chars` argument that — when set — has SQLite itself truncate `content_fit` (`substr(coalesce(content_fit, content_markdown), 1, preview_chars)`) and drops `content_markdown` from the row entirely, so a Library page of cards never pulls full document bodies over the wire.
+- **Library listing is paginated at the SQL layer, not in Python.** `get_all_documents`/`get_documents_by_search` take `limit`/`offset`, and a `preview_chars` argument that — when set — has SQLite itself truncate the preview (`substr(coalesce(nullif(content_fit, ''), content_markdown), 1, ?)`; the `nullif` matters because the crawler stores a missing `fit_markdown` as `''`, not `NULL`) and drops `content_markdown` from the row entirely, so a Library page of cards never pulls full document bodies over the wire.
 
 ### LLM extraction (`extractor.py`)
 
@@ -265,7 +265,7 @@ web-researcher:/tmp/x.py && docker compose exec -T web-researcher python
   has no private-IP blocklist (inputs come from search engines; container +
   loopback bind bound the risk); no CSP (inline scripts everywhere; bleach is
   the XSS control). Never write `.env` with PowerShell `-Encoding utf8` — the
-  BOM corrupts the first key (pydantic then rejects `﻿COHERE_API_KEY`).
+  BOM corrupts the first key (pydantic then rejects `﻿LLM_API_KEY`).
 
 ## Config
 
@@ -291,6 +291,6 @@ just falls through to it.
   healthy, instead of racing the first inbound request through a lock.
   `python app.py` (the dev server) still triggers it on the first request, the
   way `ensure_db` used to.
-- Compose publishes on **`127.0.0.1` by default** (`QUARRY_BIND`) because the app has no auth; a healthcheck hits `/` every 30s.
+- Compose publishes on **`127.0.0.1` by default** (`QUARRY_BIND`) since there's no login unless `QUARRY_PASSWORD` is set; a healthcheck hits `/` every 30s.
 - This is a **single-user design**: the global job store and recent-crawls tracker are not safe for concurrent users.
 - Docker: `entrypoint.sh` runs as root only to `chown` the bind-mounted `data/`, then drops to the non-root `app` user (UID 1000) via `gosu`. The Dockerfile installs Chromium OS deps as root (`playwright install-deps`) *before* downloading the browser binary as `app`, because `crawl4ai-setup`'s own dep step needs root and fails silently otherwise.
