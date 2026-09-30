@@ -3,7 +3,8 @@ import json
 import aiosqlite
 from datetime import datetime, timezone
 from typing import Optional
-from models import Document, ExtractedData, SearchRecord, Agent, Mission, Requirement
+from models import (Document, ExtractedData, SearchRecord, Agent, Mission,
+                    Requirement, LlmCall)
 
 DB_PATH = None
 
@@ -21,13 +22,13 @@ _AGENT_COLUMNS = frozenset({
 })
 _MISSION_COLUMNS = frozenset({
     "agent_id", "question", "status", "plan_json", "budget_json",
-    "brief_markdown", "brief_sources_json", "job_id", "parent_mission_id",
-    "error", "created_at", "started_at", "finished_at",
+    "brief_markdown", "brief_sources_json", "brief_warnings_json", "job_id",
+    "parent_mission_id", "error", "created_at", "started_at", "finished_at",
 })
 _REQUIREMENT_COLUMNS = frozenset({
     "mission_id", "title", "description", "rationale", "status", "attempts",
     "next_queries_json", "satisfied_doc_ids_json", "assessment_missing",
-    "assessment_confidence", "accepted_by_user",
+    "assessment_confidence", "accepted_by_user", "search_stats_json",
 })
 
 
@@ -140,6 +141,7 @@ async def init_db():
                 budget_json TEXT,
                 brief_markdown TEXT,
                 brief_sources_json TEXT,
+                brief_warnings_json TEXT,
                 job_id TEXT,
                 parent_mission_id TEXT,
                 error TEXT,
@@ -148,8 +150,10 @@ async def init_db():
                 finished_at TEXT
             )
         """)
-        # The citation order the brief was written against (see models.Mission).
+        # The citation order the brief was written against, and the quality
+        # checks run on it (see models.Mission).
         await _add_column(db, "missions", "brief_sources_json", "TEXT")
+        await _add_column(db, "missions", "brief_warnings_json", "TEXT")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS requirements (
                 id TEXT PRIMARY KEY,
@@ -163,15 +167,18 @@ async def init_db():
                 satisfied_doc_ids_json TEXT,
                 assessment_missing TEXT,
                 assessment_confidence TEXT,
-                accepted_by_user INTEGER DEFAULT 0
+                accepted_by_user INTEGER DEFAULT 0,
+                search_stats_json TEXT
             )
         """)
         # The assessor's gap reasoning was previously computed and discarded;
-        # these columns persist it for the requirements matrix. ALTERs are for
+        # these columns persist it for the requirements matrix, and
+        # search_stats_json records what each search returned. ALTERs are for
         # DBs created before the columns existed.
         for _col, _type in (("assessment_missing", "TEXT"),
                             ("assessment_confidence", "TEXT"),
-                            ("accepted_by_user", "INTEGER DEFAULT 0")):
+                            ("accepted_by_user", "INTEGER DEFAULT 0"),
+                            ("search_stats_json", "TEXT")):
             await _add_column(db, "requirements", _col, _type)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS mission_documents (
@@ -181,10 +188,26 @@ async def init_db():
                 PRIMARY KEY (mission_id, requirement_id, document_id)
             )
         """)
+        # One row per LLM provider call that returned (llm.chat_ex records
+        # them). mission_id is NULL for calls outside a mission, and is not a
+        # foreign key: a call can finish after its mission was deleted.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS llm_calls (
+                id TEXT PRIMARY KEY,
+                mission_id TEXT,
+                purpose TEXT,
+                tier TEXT,
+                model TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                duration_ms INTEGER,
+                created_at TEXT
+            )
+        """)
         # Lookup indexes for the hot filters and joins: the Library by
         # collection and unfiltered (both paginate by crawled_at), extractions
         # per document, a mission's requirements, reverse document-to-mission
-        # links, and an agent's in-flight missions.
+        # links, an agent's in-flight missions, and a mission's LLM usage.
         for _stmt in (
             "CREATE INDEX IF NOT EXISTS idx_documents_query_crawled "
             "ON documents(search_query, crawled_at)",
@@ -198,6 +221,8 @@ async def init_db():
             "ON mission_documents(document_id)",
             "CREATE INDEX IF NOT EXISTS idx_missions_agent_status "
             "ON missions(agent_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_mission "
+            "ON llm_calls(mission_id)",
         ):
             await db.execute(_stmt)
 
@@ -580,13 +605,13 @@ async def insert_mission(mission: Mission) -> bool:
         await db.execute(
             """INSERT INTO missions
                (id, agent_id, question, status, plan_json, budget_json,
-                brief_markdown, brief_sources_json, job_id,
+                brief_markdown, brief_sources_json, brief_warnings_json, job_id,
                 parent_mission_id, error, created_at, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mission.id, mission.agent_id, mission.question, mission.status,
              mission.plan_json, mission.budget_json, mission.brief_markdown,
-             mission.brief_sources_json, mission.job_id,
-             mission.parent_mission_id, mission.error,
+             mission.brief_sources_json, mission.brief_warnings_json,
+             mission.job_id, mission.parent_mission_id, mission.error,
              mission.created_at, mission.started_at, mission.finished_at),
         )
         await db.commit()
@@ -676,12 +701,14 @@ async def reconcile_interrupted_missions() -> int:
 
 
 async def delete_mission(mission_id: str) -> None:
-    """Delete a mission and its plan. Crawled documents are left in the library
-    — they are shared with searches and other missions."""
+    """Delete a mission, its plan and its LLM usage rows. Crawled documents
+    are left in the library — they are shared with searches and other
+    missions."""
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
         await db.execute("DELETE FROM mission_documents WHERE mission_id = ?", (mission_id,))
         await db.execute("DELETE FROM requirements WHERE mission_id = ?", (mission_id,))
+        await db.execute("DELETE FROM llm_calls WHERE mission_id = ?", (mission_id,))
         await db.execute("DELETE FROM missions WHERE id = ?", (mission_id,))
         await db.commit()
 
@@ -779,12 +806,14 @@ async def insert_requirement(req: Requirement) -> bool:
             """INSERT INTO requirements
                (id, mission_id, title, description, rationale, status,
                 attempts, next_queries_json, satisfied_doc_ids_json,
-                assessment_missing, assessment_confidence, accepted_by_user)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                assessment_missing, assessment_confidence, accepted_by_user,
+                search_stats_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (req.id, req.mission_id, req.title, req.description, req.rationale,
              req.status, req.attempts, req.next_queries_json,
              req.satisfied_doc_ids_json, req.assessment_missing,
-             req.assessment_confidence, req.accepted_by_user),
+             req.assessment_confidence, req.accepted_by_user,
+             req.search_stats_json),
         )
         await db.commit()
         return True
@@ -852,6 +881,15 @@ async def get_mission_documents(mission_id: str) -> list[Document]:
             return [Document(**dict(row)) for row in rows]
 
 
+async def get_mission_pair_documents(mission_id: str, parent_id: str
+                                     ) -> tuple[list[Document], list[Document]]:
+    """The documents of a mission and of its parent run, for the compare
+    view. Each list is exactly what get_mission_documents returns for that
+    mission (same query, same ordering); a missing mission yields []."""
+    return (await get_mission_documents(mission_id),
+            await get_mission_documents(parent_id))
+
+
 async def get_requirement_documents(mission_id: str, requirement_id: str) -> list[Document]:
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
@@ -879,3 +917,50 @@ async def get_prior_mission_urls(mission_id: str) -> set[str]:
         ) as cur:
             rows = await cur.fetchall()
             return {row[0] for row in rows}
+
+
+# --- LLM call telemetry ---
+
+async def insert_llm_call(call: LlmCall) -> None:
+    """Record one LLM provider call. Raises on failure; the recording site
+    (llm.chat_ex) decides that telemetry must never fail the call itself."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """INSERT INTO llm_calls
+               (id, mission_id, purpose, tier, model, prompt_tokens,
+                completion_tokens, duration_ms, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (call.id, call.mission_id, call.purpose, call.tier, call.model,
+             call.prompt_tokens, call.completion_tokens, call.duration_ms,
+             call.created_at),
+        )
+        await db.commit()
+
+
+async def get_mission_llm_usage(mission_id: str) -> dict:
+    """A mission's LLM usage: call count and token sums overall and per
+    purpose. A mission with no recorded calls (or no such mission) gets zeros
+    and an empty by_purpose; NULL token columns count as 0."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            """SELECT purpose, COUNT(*),
+                      COALESCE(SUM(prompt_tokens), 0),
+                      COALESCE(SUM(completion_tokens), 0)
+               FROM llm_calls WHERE mission_id = ?
+               GROUP BY purpose ORDER BY purpose""",
+            (mission_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    by_purpose = {
+        purpose: {"calls": int(calls), "prompt_tokens": int(prompt),
+                  "completion_tokens": int(completion)}
+        for purpose, calls, prompt, completion in rows
+    }
+    return {
+        "calls": sum(p["calls"] for p in by_purpose.values()),
+        "prompt_tokens": sum(p["prompt_tokens"] for p in by_purpose.values()),
+        "completion_tokens": sum(p["completion_tokens"] for p in by_purpose.values()),
+        "by_purpose": by_purpose,
+    }

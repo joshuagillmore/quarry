@@ -13,7 +13,10 @@ import config
 # been loaded into os.environ by config's load_dotenv(), and real env vars
 # outrank the env file, so each test clears the ones it exercises.
 _KEYS = ("CRAWL_TIMEOUT", "OPENAI_API_KEY", "LLM_TIMEOUT_S",
-         "QUARRY_TRUSTED_HOSTS", "FLASK_HOST")
+         "QUARRY_TRUSTED_HOSTS", "FLASK_HOST", "MAX_LLM_TOKENS", "CRAWL_FALLBACK")
+
+_ENV_EXAMPLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            ".env.example")
 
 
 @pytest.fixture()
@@ -53,6 +56,33 @@ def test_new_settings_and_safe_defaults(tmp_path, clean_env):
     s = config.Settings(_env_file=path)
     assert s.llm_timeout_s == 45
     assert s.quarry_trusted_hosts == "a.example,b.example"
+
+
+def test_token_budget_and_crawl_fallback_settings(tmp_path, clean_env):
+    s = config.Settings(_env_file=None)
+    assert s.max_llm_tokens == 0          # 0 = no per-mission token budget
+    assert s.crawl_fallback is True
+
+    path = _env_file(tmp_path, "MAX_LLM_TOKENS=250000\nCRAWL_FALLBACK=false\n")
+    s = config.Settings(_env_file=path)
+    assert s.max_llm_tokens == 250000
+    assert s.crawl_fallback is False
+
+    # An empty value means "use the default", as for every other key.
+    path = _env_file(tmp_path, "MAX_LLM_TOKENS=\nCRAWL_FALLBACK=\n")
+    s = config.Settings(_env_file=path)
+    assert s.max_llm_tokens == 0 and s.crawl_fallback is True
+
+
+def test_env_example_documents_the_new_settings_with_their_defaults(clean_env):
+    """.env.example is copied to .env verbatim, so each documented key must be
+    present and parse to the code default."""
+    with open(_ENV_EXAMPLE, encoding="utf-8") as f:
+        keys = {line.split("=", 1)[0] for line in f.read().splitlines()
+                if "=" in line and not line.lstrip().startswith("#")}
+    assert {"MAX_LLM_TOKENS", "CRAWL_FALLBACK"} <= keys
+    s = config.Settings(_env_file=_ENV_EXAMPLE)
+    assert s.max_llm_tokens == 0 and s.crawl_fallback is True
 
 
 def test_suite_settings_start_from_declared_defaults():

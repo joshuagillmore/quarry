@@ -1,4 +1,6 @@
-from datetime import datetime
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel
 
@@ -42,6 +44,9 @@ class Requirement(BaseModel):
     # Set when the user overrides the assessor and accepts a gap as-is, so the
     # UI can say so instead of implying the assessor was satisfied.
     accepted_by_user: int = 0
+    # JSON list of {"pass": int, "query": str, "engine": str|null,
+    # "results": int}, one entry per search run for this requirement.
+    search_stats_json: Optional[str] = None
 
 
 class Mission(BaseModel):
@@ -56,6 +61,9 @@ class Mission(BaseModel):
     # JSON list[str] of document ids in the exact order the brief's [n]
     # citations were numbered, so the source rail always matches the text.
     brief_sources_json: Optional[str] = None
+    # JSON list of {"kind": str, "detail": str}: quality checks run on the
+    # brief after synthesis (uncited paragraphs, junk citations, ...).
+    brief_warnings_json: Optional[str] = None
     job_id: Optional[str] = None
     parent_mission_id: Optional[str] = None  # Phase 2 delta lineage
     error: Optional[str] = None
@@ -94,3 +102,21 @@ class SearchRecord(BaseModel):
     executed_at: str
     result_count: int
     job_id: Optional[str] = None
+
+
+@dataclass(kw_only=True)
+class LlmCall:
+    """One LLM provider call that returned: what it was for, which model
+    actually answered, the tokens the provider reported, and how long it took.
+    `mission_id` is None for calls outside a mission (one-shot extraction).
+    Keyword-only, so a positional call cannot silently swap two fields."""
+    purpose: str   # plan | assess | brief | extract | chat
+    tier: str      # reasoning | fast (the tier requested, not who answered)
+    model: str     # the model id that actually produced the response
+    mission_id: Optional[str] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    duration_ms: int = 0
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat())
