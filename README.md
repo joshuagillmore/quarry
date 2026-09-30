@@ -45,7 +45,9 @@ python app.py
 from this machine; widening it is covered by the exposure guard below. `.env` tolerates unknown
 keys (a vendor's own `OPENAI_API_KEY`-style variables) and a leading UTF-8 BOM, so re-saving it
 from an editor that adds one won't break config parsing. Never write it with PowerShell's
-`-Encoding utf8`, though — that adds a BOM *and* corrupts the first key.
+`-Encoding utf8`, though — that adds a BOM *and* corrupts the first key. An explicitly empty
+exported environment variable (e.g. `export LLM_PROVIDER_FAST=`) no longer overrides a non-empty
+value already set in `.env` — empty now means "not set", not "clear this".
 
 ## Running tests
 

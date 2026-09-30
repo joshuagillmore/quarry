@@ -271,6 +271,12 @@ web-researcher:/tmp/x.py && docker compose exec -T web-researcher python
 
 All settings come from `.env` via Pydantic Settings (`config.py`). The singleton `settings` is imported across modules. Key vars: `LLM_API_KEY` (legacy alias `COHERE_API_KEY`), `LLM_PROVIDER`, `LLM_PROVIDER_FAST`, `OLLAMA_API_BASE`, `DB_PATH` (default `data/research.db`), `CRAWL_TIMEOUT` (ms), `LLM_TIMEOUT_S` (per-call LLM timeout, seconds, default 120), `FLASK_HOST/PORT/DEBUG` (`FLASK_HOST` defaults to `127.0.0.1`), `FLASK_SECRET_KEY`, `QUARRY_BIND` (compose-level publish interface), `QUARRY_TRUSTED_HOSTS` (extra Host-header names accepted beyond localhost). Never set `FLASK_DEBUG=true` on a network-reachable host (Werkzeug console is an RCE primitive).
 
+`.env` tolerates unknown keys (`extra="ignore"` — a vendor's own `OPENAI_API_KEY`-style variables
+are fine) and a leading UTF-8 BOM. `env_ignore_empty=True` changes precedence: an explicitly empty
+value — in `.env` or in the process environment — is treated as "not set" rather than "clear this",
+so an exported `LLM_PROVIDER_FAST=` no longer overrides a non-empty value already in `.env`; it
+just falls through to it.
+
 **UI-editable overrides:** the Settings page (`/settings`) persists `llm_provider`, `llm_provider_fast`, `ollama_api_base`, `llm_api_key` (legacy `cohere_api_key` still read), and `search_max_results` to `data/settings.json` (`config.save_overrides`), which is layered over `.env` at import (`load_overrides`) and mutated live on save — **`settings.json` wins over `.env`** for those keys. `known_models()` accumulates every model id ever saved so the Settings dropdowns never lose a previously used value.
 
 ## Deployment notes
