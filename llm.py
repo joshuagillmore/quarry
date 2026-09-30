@@ -133,15 +133,27 @@ def chat(system: str, user: str, temperature: float = 0.0,
     return text
 
 
-def _as_object(candidate: str) -> Optional[dict]:
+_NOT_JSON = object()
+
+
+def _loads(candidate: str):
+    """json.loads, or _NOT_JSON when the candidate is not valid JSON."""
     try:
-        value = json.loads(candidate)
+        return json.loads(candidate)
     except (ValueError, RecursionError):
-        return None
-    return value if isinstance(value, dict) else None
+        return _NOT_JSON
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def json_candidates(text: str) -> list[str]:
+    """The strings model output most plausibly meant as its JSON answer, in
+    order: the whole (stripped) text, then each ``` fence body."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    return [text] + [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -152,17 +164,18 @@ def _extract_json(text: str) -> Optional[dict]:
     Tries, in order: the whole text; each ```json fence; then a scan that
     decodes from every `{` and takes the first complete object (so prose
     with stray braces before the object, or a list before it, still works —
-    a greedy first-`{`-to-last-`}` grab would not)."""
-    text = (text or "").strip()
-    if not text:
+    a greedy first-`{`-to-last-`}` grab would not). When the whole text or a
+    fence is valid JSON but not an object (e.g. an array of objects), that is
+    the answer and it is not one: None, rather than an element fished out of
+    it."""
+    candidates = json_candidates(text)
+    if not candidates:
         return None
-    found = _as_object(text)
-    if found is not None:
-        return found
-    for fenced in _FENCE_RE.finditer(text):
-        found = _as_object(fenced.group(1).strip())
-        if found is not None:
-            return found
+    for candidate in candidates:
+        value = _loads(candidate)
+        if value is not _NOT_JSON:
+            return value if isinstance(value, dict) else None
+    text = candidates[0]
     decoder = json.JSONDecoder()
     start = text.find("{")
     while start != -1:

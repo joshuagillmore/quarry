@@ -135,3 +135,51 @@ def test_empty_completion_gives_the_coverage_only_brief(monkeypatch):
     out = brief.synthesize_brief(_mission(), [_req("satisfied")], [_doc("u1")], set())
     assert "Coverage & Gaps" in out
     assert "EmptyCompletion" in out
+
+
+# ---------- linkify vs. raw `>` inside sanitized attribute values ----------
+
+from html.parser import HTMLParser  # noqa: E402
+
+import pytest  # noqa: E402
+
+from markdown_render import render_markdown  # noqa: E402
+
+
+class _Tags(HTMLParser):
+    def __init__(self, html):
+        super().__init__(convert_charrefs=True)
+        self.attrs, self.buttons = [], 0
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "button":
+            self.buttons += 1
+        else:
+            self.attrs.append((tag, attrs))
+
+
+@pytest.mark.parametrize("md,min_buttons", [
+    ('See <a href="https://x/" title="a > [1]">link</a> and [1].', 1),
+    ('A <a href="https://x/?a>b[1]">link</a> then [1].', 1),
+    ('<img src="https://x/i.png" alt="a > [1]"> after [1]', 0),
+])
+def test_linkify_never_splices_into_a_sanitized_attribute(md, min_buttons):
+    """bleach leaves `>` raw inside attribute values, so a tag must not be
+    taken to end at the first `>`."""
+    html = render_markdown(md)
+    out = brief.linkify_citations(html, 5)
+    after = _Tags(out)
+    assert after.attrs == _Tags(html).attrs, "no existing attribute may change"
+    assert after.buttons >= min_buttons
+    for _tag, attrs in after.attrs:
+        assert all("cite" not in (v or "") for _k, v in attrs)
+
+
+def test_linkify_quote_aware_on_raw_html():
+    html = ('<p><a href="https://x/" title="see > [1] here">t</a> and [2]</p>'
+            "<p><a title='q > [1]' href='https://x/'>s</a></p>")
+    out = brief.linkify_citations(html, 5)
+    assert 'title="see > [1] here"' in out
+    assert "title='q > [1]'" in out
+    assert out.count('class="cite"') == 1 and 'data-cite="2"' in out

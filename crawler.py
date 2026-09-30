@@ -76,14 +76,27 @@ def _arun_timeout_s() -> float:
     return settings.crawl_timeout / 1000 * 2 + 15
 
 
+def _page_names(sr: SearchResult, result) -> list[str]:
+    """Every URL one crawl answered to: the one requested, the one crawl4ai
+    reports as `url` (0.9.x: the requested URL), and `redirected_url` (where
+    the browser actually landed)."""
+    names = [sr.url, getattr(result, "url", None), getattr(result, "redirected_url", None)]
+    return [n for i, n in enumerate(names) if n and n not in names[:i]]
+
+
 async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,
-                                   job_id: str, attempted: set[str] | None = None) -> list[Document]:
+                                   job_id: str, attempted: set[str] | None = None,
+                                   aliases: dict[str, str] | None = None) -> list[Document]:
     """Crawl `search_results` with progress reported into the job store.
 
-    When `attempted` is given, every URL this call tries is added to it —
-    the requested URL and, when the crawl got that far, the final URL after
-    redirects — so a caller can avoid fetching the same page again under
-    another name."""
+    One page can go by several URLs (the search result, the URL crawl4ai
+    reports, the post-redirect URL). When `attempted` is given, every one of
+    them that this call touched is added to it — failed and junk pages
+    included — so a caller can avoid fetching the same page again under
+    another name. When `aliases` is given, each name other than the stored
+    document's `url` is mapped to it, so a caller can find the document from
+    any of them. The extra names are also kept in the document's metadata
+    (`requested_url`, `redirected_url`) for callers in a later run."""
     from jobs import update_url, add_log, inc_counter
 
     browser_cfg = BrowserConfig(headless=True, browser_type="chromium")
@@ -116,8 +129,9 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                 try:
                     result = await asyncio.wait_for(
                         crawler.arun(url=sr.url, config=run_cfg), timeout=limit)
-                    if attempted is not None and getattr(result, "url", None):
-                        attempted.add(result.url)
+                    names = _page_names(sr, result)
+                    if attempted is not None:
+                        attempted.update(names)
                     if not result.success:
                         msg = (result.error_message or "unknown error")[:140]
                         update_url(job_id, sr.url, status="error", error=msg)
@@ -130,7 +144,7 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                     fit_content = result.markdown.fit_markdown if result.markdown else ""
                     internal_links = len(result.links.get("internal", [])) if result.links else 0
                     external_links = len(result.links.get("external", [])) if result.links else 0
-                    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                    metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
                     title = metadata.get("title") or sr.title or parsed.netloc
                     word_count = len(markdown_content.split()) if markdown_content else 0
 
@@ -145,6 +159,18 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                         add_log(job_id, "warn",
                                 f"discarded <code>{_esc(sr.url)}</code>: {_esc(why)}")
                         return None
+
+                    # The page's other names, resolvable now (aliases) and in
+                    # a later run of the same mission (metadata).
+                    redirected = getattr(result, "redirected_url", None)
+                    if sr.url != result.url:
+                        metadata["requested_url"] = sr.url
+                    if redirected and redirected != result.url:
+                        metadata["redirected_url"] = redirected
+                    if aliases is not None:
+                        for name in names:
+                            if name != result.url:
+                                aliases[name] = result.url
 
                     doc = Document(
                         id=str(uuid.uuid4()),

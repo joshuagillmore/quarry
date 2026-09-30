@@ -136,3 +136,35 @@ def test_cron_triggers_are_utc(monkeypatch):
 
     assert seen and all(tz == "UTC" for tz in seen), seen
     assert str(fake.triggers[0].timezone) == "UTC"
+
+
+def test_mission_construction_failure_finishes_the_job(monkeypatch, started):
+    _init()
+
+    def broken_mission(**kwargs):
+        raise ValueError("bad budget")
+
+    monkeypatch.setattr(scheduler, "Mission", broken_mission)
+    with pytest.raises(ValueError):
+        scheduler.launch_scheduled_mission("a1")
+    assert _active_jobs() == 0
+    assert [j.stage for j in jobs._store.values()] == ["error"]
+    assert started == []
+
+
+def test_start_planning_failure_finishes_job_and_mission(monkeypatch):
+    _init()
+
+    def cannot_start(mission_id):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(agent_runner, "start_planning", cannot_start)
+    with pytest.raises(RuntimeError):
+        scheduler.launch_scheduled_mission("a1")
+    assert _active_jobs() == 0
+    (mission,) = asyncio.run(storage.list_missions())
+    # No worker will ever move it on; left in `planning` it would also block
+    # every later scheduled run of this agent (agent_has_active_mission).
+    assert mission.status == "error" and mission.finished_at
+    assert jobs.get_job(mission.job_id).stage == "error"
+    assert not asyncio.run(storage.agent_has_active_mission("a1"))

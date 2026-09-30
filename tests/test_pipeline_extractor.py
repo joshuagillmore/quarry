@@ -30,6 +30,16 @@ def test_plain_object(monkeypatch):
     assert _extract(monkeypatch, '{"a": 1}') == {"a": 1}
 
 
-def test_non_object_output_is_wrapped(monkeypatch):
+def test_non_json_output_is_wrapped(monkeypatch):
     assert _extract(monkeypatch, "no json here") == {"raw_response": "no json here"}
-    assert _extract(monkeypatch, "[1, 2]") == {"raw_response": "[1, 2]"}
+    # A bare JSON scalar is not structured data worth keeping as such.
+    assert _extract(monkeypatch, "42") == {"raw_response": "42"}
+
+
+def test_json_arrays_are_kept_whole(monkeypatch):
+    """Whole-text or fenced arrays are stored as-is: taking the first object
+    out of `[{...}, {...}]` would silently truncate the extraction."""
+    rows = [{"a": 1}, {"b": 2}]
+    assert _extract(monkeypatch, json.dumps(rows)) == rows
+    assert _extract(monkeypatch, "```json\n" + json.dumps(rows) + "\n```") == rows
+    assert _extract(monkeypatch, "[1, 2]") == [1, 2]

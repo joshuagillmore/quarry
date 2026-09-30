@@ -199,10 +199,13 @@ def _finish_locked(j: Job, stage: str, error: Optional[str]) -> None:
 
 
 def finish_job(job_id: str, stage: str = "done", error: Optional[str] = None) -> None:
-    """Move a job to a terminal stage and release its slot. Idempotent:
-    finished_at is stamped once, so repeating the call changes nothing.
-    The one way a job should end; `update_job(done=True)` leaves finished_at
-    unset."""
+    """Move a job to a terminal stage and release its slot. The one way a job
+    should end; `update_job(done=True)` leaves finished_at unset.
+
+    Repeating a call with the same arguments changes nothing. A later call
+    with a different stage (or a new error) does overwrite those fields;
+    only finished_at is stamped once and kept. Use finish_if_running when an
+    earlier terminal stage must stick (crash and cleanup paths)."""
     with _lock:
         j = _store.get(job_id)
         if j:

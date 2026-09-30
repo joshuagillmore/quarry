@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from llm import chat_ex, model_for, _extract_json
+from llm import chat_ex, model_for, json_candidates, _extract_json
 from models import Document, ExtractedData
 
 DEFAULT_PROMPT = (
@@ -15,6 +15,22 @@ DEFAULT_PROMPT = (
     "4. topics: Main topics or themes covered\n"
     "5. sentiment: Overall sentiment (positive, negative, neutral, mixed)\n"
 )
+
+
+def _parse_output(text: str):
+    """The model's JSON answer, or None. A whole-text or fenced JSON object
+    *or array* is kept as-is (an extraction prompt may well ask for a list,
+    and keeping only its first element would silently truncate it); failing
+    that, an object embedded in prose; else None and the caller stores the
+    raw text."""
+    for candidate in json_candidates(text):
+        try:
+            value = json.loads(candidate)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    return _extract_json(text)
 
 
 def extract_from_document(
@@ -49,9 +65,7 @@ def extract_from_document(
         result_text, model = chat_ex(system, user, temperature=0.0, max_tokens=2000, tier="fast")
         print(f"[EXTRACT] Got response ({len(result_text)} chars)", file=sys.stderr, flush=True)
 
-        # Models often fence their JSON or wrap it in prose; keep the object
-        # whenever one can be found, and wrap the raw text only when not.
-        parsed = _extract_json(result_text)
+        parsed = _parse_output(result_text)
         if parsed is None:
             result_json = json.dumps({"raw_response": result_text}, indent=2)
         else:

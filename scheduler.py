@@ -87,7 +87,8 @@ def launch_scheduled_mission(agent_id: str) -> Optional[str]:
 
 
 async def _launch(agent_id: str) -> Optional[str]:
-    from storage import (get_agent, insert_mission, get_latest_finished_mission,
+    from storage import (get_agent, insert_mission, update_mission,
+                         get_latest_finished_mission,
                          agent_has_active_mission)
     from jobs import create_mission_job, finish_job
     from agent_runner import start_planning
@@ -101,41 +102,55 @@ async def _launch(agent_id: str) -> Optional[str]:
         _log(f"agent {agent.name} has a schedule but no question; skipping")
         return None
 
-    with _launch_lock:
-        # Never overlap: APScheduler's max_instances only covers this launch
-        # call (which returns in milliseconds), not the mission it starts.
-        if await agent_has_active_mission(agent_id):
-            _log(f"agent {agent.name} already has a mission in flight; skipping")
-            return None
+    job_id = None        # set once a job slot is taken
+    inserted_id = None   # set once the mission row exists
+    try:
+        with _launch_lock:
+            # Never overlap: APScheduler's max_instances only covers this
+            # launch call (which returns in milliseconds), not the mission it
+            # starts.
+            if await agent_has_active_mission(agent_id):
+                _log(f"agent {agent.name} already has a mission in flight; skipping")
+                return None
 
-        # Link to the previous run on the same question so the brief can diff.
-        prior = await get_latest_finished_mission(agent_id, question, "")
-        job_id = create_mission_job(question, agent.default_max_sources)  # may raise JobLimitReached
-        mission = Mission(
-            id=str(uuid.uuid4()), agent_id=agent_id, question=question,
-            status="planning", job_id=job_id,
-            parent_mission_id=prior.id if prior else None,
-            budget_json=json.dumps({
-                "max_passes": agent.default_max_passes,
-                "max_sources": agent.default_max_sources,
-                "per_req_attempts": agent.default_per_req_attempts,
-                "auto_approve": True,
-                "scheduled": True,
-            }),
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
-        try:
+            # Link to the previous run on the same question so the brief can diff.
+            prior = await get_latest_finished_mission(agent_id, question, "")
+            job_id = create_mission_job(question, agent.default_max_sources)  # may raise JobLimitReached
+            mission = Mission(
+                id=str(uuid.uuid4()), agent_id=agent_id, question=question,
+                status="planning", job_id=job_id,
+                parent_mission_id=prior.id if prior else None,
+                budget_json=json.dumps({
+                    "max_passes": agent.default_max_passes,
+                    "max_sources": agent.default_max_sources,
+                    "per_req_attempts": agent.default_per_req_attempts,
+                    "auto_approve": True,
+                    "scheduled": True,
+                }),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
             await insert_mission(mission)
-        except BaseException as e:
-            # No mission row means no worker will ever finish this job; do it
-            # here so the slot is not leaked.
-            finish_job(job_id, stage="error",
-                       error=f"could not record the scheduled mission: {type(e).__name__}")
-            raise
+            inserted_id = mission.id
 
-    _log(f"launching '{question[:60]}' for agent {agent.name}")
-    start_planning(mission.id)
-    return mission.id
+        _log(f"launching '{question[:60]}' for agent {agent.name}")
+        start_planning(mission.id)
+        return mission.id
+    except BaseException as e:
+        # Anything that fails after the job slot is taken — building the
+        # mission, recording it, or starting its worker — leaves nothing that
+        # would ever finish the job, so release it here. A recorded mission
+        # with no worker is closed too: left in `planning` it would block
+        # every later run of this agent until a restart reconciled it.
+        reason = f"scheduled launch failed: {type(e).__name__}"
+        if job_id:
+            finish_job(job_id, stage="error", error=reason)
+        if inserted_id:
+            try:
+                await update_mission(inserted_id, status="error", error=reason,
+                                     finished_at=datetime.now(timezone.utc).isoformat())
+            except Exception as cleanup_error:  # noqa: BLE001 - keep the original error
+                _log(f"could not mark mission {inserted_id} failed: {cleanup_error!r}")
+        raise
 
 
 def run_scheduled_agent_now(agent_id: str) -> None:

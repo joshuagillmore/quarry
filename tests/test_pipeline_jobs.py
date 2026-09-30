@@ -295,3 +295,16 @@ def test_cancel_after_every_extraction_started_still_finishes_done(monkeypatch):
     asyncio.run(jobs._run_job(jid))
     j = jobs.get_job(jid)
     assert (j.stage, j.extract_done) == ("done", 2)
+
+
+def test_finish_job_documented_overwrite_semantics():
+    """A later finish with a different stage overwrites stage/error but keeps
+    the first finished_at; finish_if_running is the variant that sticks."""
+    jid = jobs.create_job("q", 5, False, "")
+    jobs.finish_job(jid, stage="done")
+    first = jobs.get_job(jid).finished_at
+    jobs.finish_job(jid, stage="cancelled", error="late")
+    j = jobs.get_job(jid)
+    assert (j.stage, j.error, j.finished_at) == ("cancelled", "late", first)
+    assert jobs.finish_if_running(jid, stage="error") is False
+    assert jobs.get_job(jid).stage == "cancelled"

@@ -128,18 +128,29 @@ def test_thread_leaves_a_properly_finished_job_alone():
 
 # ---------- collection ----------
 
-def _wire(monkeypatch, urls, satisfied=False, crawled=None, seen_attempted=None):
+def _wire(monkeypatch, urls, satisfied=False, crawled=None, seen_attempted=None,
+          redirects=None):
+    """Stub search/crawl/assess/brief. `redirects` maps a requested URL to the
+    URL its document is stored under; the fake honours the crawler contract
+    for `attempted` and `aliases` exactly as crawler.py does."""
+    redirects = redirects or {}
     monkeypatch.setattr(agent_runner, "web_search", lambda q, n=5: [
         SearchResult(url=u, title=u, snippet="") for u in urls])
 
-    async def fake_crawl(results, question, job_id, attempted=None):
+    async def fake_crawl(results, question, job_id, attempted=None, aliases=None):
         if seen_attempted is not None:
             seen_attempted.append(set(attempted) if attempted is not None else None)
         if crawled is not None:
             crawled.extend(sr.url for sr in results)
-        if attempted is not None:
-            attempted.update(sr.url for sr in results)
-        return [_doc(sr.url) for sr in results]
+        docs = []
+        for sr in results:
+            final = redirects.get(sr.url, sr.url)
+            if attempted is not None:
+                attempted.update({sr.url, final})
+            if aliases is not None and final != sr.url:
+                aliases[sr.url] = final
+            docs.append(_doc(final))
+        return docs
 
     monkeypatch.setattr(agent_runner, "crawl_urls_with_progress", fake_crawl)
     monkeypatch.setattr(agent_runner, "assess_requirement", lambda req, docs: Assessment(
@@ -274,3 +285,68 @@ def test_delta_falls_back_to_latest_run_without_a_parent(monkeypatch):
 
 def test_runner_no_longer_imports_prior_mission_urls():
     assert not hasattr(agent_runner, "get_prior_mission_urls")
+
+
+# ---------- redirects: one page, several names ----------
+
+def test_redirected_url_resurfacing_is_linked_not_recrawled(monkeypatch):
+    """Requirement 1 crawls A, stored under B. When requirement 2's search
+    returns A again, A must neither be re-crawled nor left unlinked."""
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    budget = {"max_passes": 1, "max_sources": 5, "per_req_attempts": 1}
+
+    async def setup():
+        await storage.insert_mission(_mission("m1", jid, budget=budget))
+        for rid in ("r1", "r2"):
+            await storage.insert_requirement(Requirement(
+                id=rid, mission_id="m1", title=rid, next_queries_json='["q"]'))
+    asyncio.run(setup())
+
+    crawled = []
+    _wire(monkeypatch, ["http://a.example/start"], satisfied=True, crawled=crawled,
+          redirects={"http://a.example/start": "http://b.example/final"})
+    asyncio.run(agent_runner._run_collection("m1"))
+
+    assert crawled == ["http://a.example/start"], "crawled once"
+    for rid in ("r1", "r2"):
+        docs = asyncio.run(storage.get_requirement_documents("m1", rid))
+        assert [d.url for d in docs] == ["http://b.example/final"], rid
+    assert jobs.get_job(jid).sources_used == 1
+
+
+def test_retask_resolves_held_redirects_from_metadata(monkeypatch):
+    """A retask knows a held page by every name it was crawled under: the
+    requested URL (stored under its final URL) and the redirect target
+    (stored under the requested URL, which is what crawl4ai reports)."""
+    _init()
+    jid = jobs.create_mission_job("Q", 1)
+    budget = {"max_passes": 1, "max_sources": 1, "per_req_attempts": 1}
+
+    async def setup():
+        await storage.insert_mission(_mission("m1", jid, budget=budget))
+        await storage.insert_requirement(Requirement(
+            id="r_old", mission_id="m1", title="old", status="satisfied"))
+        await storage.insert_requirement(Requirement(
+            id="r1", mission_id="m1", title="retasked", next_queries_json='["q"]'))
+        held = [
+            _doc("http://b.example/final").model_copy(update={
+                "metadata_json": json.dumps({"requested_url": "http://a.example/start"})}),
+            _doc("http://c.example/asked").model_copy(update={
+                "metadata_json": json.dumps({"redirected_url": "http://d.example/landed"})}),
+        ]
+        for doc in held:
+            await storage.link_mission_document(
+                "m1", "r_old", await storage.upsert_document(doc))
+    asyncio.run(setup())
+
+    crawled = []
+    _wire(monkeypatch, ["http://a.example/start", "http://d.example/landed",
+                        "http://new.example/1"], satisfied=True, crawled=crawled)
+    asyncio.run(agent_runner._run_collection("m1"))
+
+    assert crawled == ["http://new.example/1"]
+    assert jobs.get_job(jid).sources_used == 1
+    r1_urls = {d.url for d in asyncio.run(storage.get_requirement_documents("m1", "r1"))}
+    assert r1_urls == {"http://b.example/final", "http://c.example/asked",
+                       "http://new.example/1"}

@@ -68,7 +68,10 @@ def ordered_sources_for_mission(mission: Mission, docs: list[Document]) -> list[
 
 
 _CITE_RE = re.compile(r"\[(\d{1,3})\]")
-_TAG_SPLIT_RE = re.compile(r"(<[^>]+>)")
+# A whole tag, quote-aware: a `>` inside a quoted attribute value does not end
+# it. The alternatives are disjoint on their first character, so no
+# backtracking blow-up.
+_TAG_SPLIT_RE = re.compile(r"""(<(?:[^>"']|"[^"]*"|'[^']*')*>)""")
 _TAG_NAME_RE = re.compile(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9]*)")
 _LITERAL_TAGS = ("code", "pre")
 
@@ -82,9 +85,10 @@ def linkify_citations(html: str, max_n: int) -> str:
 
     Only text is touched: never the inside of a tag (an href or title that
     contains "[1]" would otherwise get a <button> spliced into the attribute
-    value), and never text inside <code>/<pre>, where [1] is literal. The
-    input is sanitizer output, so `>` inside attribute values is already
-    escaped and splitting on tags is exact."""
+    value), and never text inside <code>/<pre>, where [1] is literal. bleach
+    escapes `<` in text but leaves `>` raw inside attribute values
+    (title="a > [1]"), so tags are matched quote-aware rather than ending at
+    the first `>`."""
     def repl(m: "re.Match[str]") -> str:
         n = int(m.group(1))
         if not 1 <= n <= max_n:

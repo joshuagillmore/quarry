@@ -172,9 +172,16 @@ async def _run_collection(mission_id: str) -> None:
     # never crawled again, but they are not charged to this run's budget
     # either: `collected` starts empty, so a retask gets the fresh budget the
     # route promises. `known` lets a held page that resurfaces in search be
-    # linked to the requirement asking for it without re-fetching it.
-    known: dict[str, str] = {d.url: d.id for d in await get_mission_documents(mission_id)}
-    attempted: set[str] = set(known)
+    # linked to the requirement asking for it without re-fetching it, under
+    # any of its names (`aliases`: other name -> stored url, seeded from the
+    # names the crawler kept in each document's metadata).
+    held = await get_mission_documents(mission_id)
+    known: dict[str, str] = {d.url: d.id for d in held}
+    aliases: dict[str, str] = {}
+    for d in held:
+        for name in _other_names(d):
+            aliases.setdefault(name, d.url)
+    attempted: set[str] = set(known) | set(aliases)
 
     # Fair share of the source budget per requirement, so one greedy
     # requirement can't starve the rest within a pass. The global max_sources
@@ -207,7 +214,7 @@ async def _run_collection(mission_id: str) -> None:
                 await _collect_one(
                     mission, req, collected, job_urls, job_id,
                     max_sources, per_req_cap, per_req_attempts,
-                    attempted=attempted, known=known,
+                    attempted=attempted, known=known, aliases=aliases,
                 )
             except Exception as e:  # noqa: BLE001
                 # Isolate a requirement's failure: burn one of its attempts and
@@ -247,20 +254,38 @@ async def _run_collection(mission_id: str) -> None:
     await _synthesize(mission_id, agent, job_id)
 
 
+def _other_names(doc) -> list[str]:
+    """The URLs besides doc.url that a stored page was crawled under, as the
+    crawler recorded them in its metadata (requested_url, redirected_url)."""
+    try:
+        meta = json.loads(doc.metadata_json or "{}")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(meta, dict):
+        return []
+    names = (meta.get("requested_url"), meta.get("redirected_url"))
+    return [n for n in names if isinstance(n, str) and n and n != doc.url]
+
+
 async def _collect_one(mission, req, collected, job_urls, job_id,
                        max_sources, per_req_cap, per_req_attempts,
                        attempted: set[str] | None = None,
-                       known: dict[str, str] | None = None) -> None:
+                       known: dict[str, str] | None = None,
+                       aliases: dict[str, str] | None = None) -> None:
     """Search, crawl and assess a single requirement. Raising here costs this
     requirement an attempt, not the mission.
 
-    `attempted` is mission-scoped: every URL already tried (requested or
-    redirected-to, failed or junk included) and every URL the mission held
-    before this run. None of them is fetched again. `known` maps the held
-    URLs to their document ids."""
+    All three maps are mission-scoped and shared across requirements:
+    `attempted` holds every URL already tried under any name (requested,
+    reported, redirected-to; failed and junk pages included) and every URL
+    the mission held before this run — none is fetched again. `known` maps
+    held URLs to document ids; `aliases` maps a page's other names to the URL
+    its document is stored under, so a search result is resolved to its
+    document whichever name it comes back as."""
     mission_id = mission.id
     attempted = attempted if attempted is not None else set()
     known = known or {}
+    aliases = aliases if aliases is not None else {}
     if req.attempts >= per_req_attempts:
         await update_requirement(req.id, status="unmet")
         if job_id:
@@ -285,7 +310,9 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
     remaining = max_sources - len(collected)
     cap = max(0, min(per_req_cap, remaining))
     to_crawl = [sr for sr in results
-                if sr.url not in collected and sr.url not in attempted][:cap]
+                if aliases.get(sr.url, sr.url) not in collected
+                and sr.url not in attempted
+                and aliases.get(sr.url, sr.url) not in attempted][:cap]
 
     if to_crawl:
         fresh_for_trace = [JobUrl(url=sr.url, title=sr.title or sr.url)
@@ -294,7 +321,7 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
             jobs.add_urls(job_id, fresh_for_trace)
             job_urls.update(u.url for u in fresh_for_trace)
         docs = await crawl_urls_with_progress(to_crawl, mission.question, job_id or "",
-                                              attempted=attempted)
+                                              attempted=attempted, aliases=aliases)
         for doc in docs:
             doc_id = await upsert_document(doc)
             collected[doc.url] = doc_id
@@ -303,10 +330,11 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
             jobs.update_job(job_id, sources_used=len(collected))
 
     # Link any already-held URLs that resurfaced for this requirement (crawled
-    # earlier in this run, or before a retask), so assessment sees the full
-    # picture without fetching them again.
+    # earlier in this run, or before a retask; under any of their names), so
+    # assessment sees the full picture without fetching them again.
     for sr in results:
-        doc_id = collected.get(sr.url) or known.get(sr.url)
+        stored_url = aliases.get(sr.url, sr.url)
+        doc_id = collected.get(stored_url) or known.get(stored_url)
         if doc_id:
             await link_mission_document(mission_id, req.id, doc_id)
 

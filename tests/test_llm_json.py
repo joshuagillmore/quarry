@@ -43,3 +43,15 @@ def test_list_before_the_object():
 
 def test_nested_object_is_returned_whole():
     assert _extract_json('x {"a": {"b": [1, {"c": 2}]}} y') == {"a": {"b": [1, {"c": 2}]}}
+
+
+def test_array_of_objects_is_not_scanned_into():
+    """A valid JSON array is an answer in its own right; picking its first
+    element would silently drop the rest."""
+    assert _extract_json('[{"a": 1}]') is None
+    assert _extract_json('[{"a": 1}, {"b": 2}]') is None
+    assert _extract_json('```json\n[{"a": 1}, {"b": 2}]\n```') is None
+
+
+def test_invalid_fence_then_object_in_prose_still_found():
+    assert _extract_json('```\nnot json\n```\nanswer: {"a": 1}') == {"a": 1}
