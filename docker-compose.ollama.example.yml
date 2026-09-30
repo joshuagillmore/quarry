@@ -1,0 +1,35 @@
+# Override: reach a local Ollama that runs in its own container instead of
+# going through the host. Use this when Ollama publishes on 127.0.0.1 only
+# (Ollama's own default) — from inside another container,
+# `http://host.docker.internal:11434` cannot reach a port the host bound to
+# loopback only, even though the hostname itself resolves fine. See the
+# README section "Using a local Ollama from Docker" for the two fixes; this
+# file is the "join its network" fix, as opposed to rebinding Ollama to
+# 0.0.0.0.
+#
+# Usage:
+#   1. Copy this file (e.g. to docker-compose.ollama.yml) and fill in your
+#      own container name and network below — the values here are
+#      placeholders, not real defaults.
+#   2. Find the network your Ollama container is actually on:
+#        docker inspect <ollama-container-name> --format '{{json .NetworkSettings.Networks}}'
+#   3. Launch with both files:
+#        docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d --build
+#
+# The external network must already exist (created by whatever stack runs
+# your Ollama container) — Compose will not create it for you, and `up` will
+# fail with "network ... declared as external, but could not be found" if it
+# doesn't.
+
+services:
+  web-researcher:
+    networks:
+      - default
+      - ollama-network
+    environment:
+      OLLAMA_API_BASE: http://<ollama-container-name>:11434
+
+networks:
+  ollama-network:
+    name: <external-network-name>
+    external: true

@@ -45,6 +45,7 @@ The crawl page is driven by the SSE endpoint alone (`GET /api/job/<id>/stream`, 
 ### Two crawler functions — use the progress one
 
 `crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. The one-shot crawl (`_run_job`) passes `skip_on_cancel=True`: a cancel marks every page not fetched yet `skipped`, keeps the pages already fetched, and ends the job `cancelled`. Missions leave it off, because their stop is honoured at the next pass boundary. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
+- **A failed or blocked crawl gets one plain-HTTP retry.** When a page's Chromium fetch fails, or `content_quality.looks_like_block_page` rejects it, and `settings.crawl_fallback` is true (default), `crawl_urls_with_progress` fetches the URL once more with `httpx.get` — off the event loop via `asyncio.to_thread`, a desktop `User-Agent`, `follow_redirects=True` — and, only if that comes back `200`, HTML, and doesn't itself look like a block page, feeds the raw HTML straight into crawl4ai via `crawler.arun(url="raw:" + html, config=run_cfg)` so it goes through the same markdown extraction and junk gate as a normal crawl. Rows fetched this way are stored with `metadata_json["fetched_via"] = "fallback"` and the URL's status becomes `done`, not a degraded state. The fallback never runs for `file:`/non-HTTP URLs, and its log lines are still `html.escape`d like the rest of the crawl log.
 
 ### Storage (`storage.py`)
 
@@ -72,12 +73,26 @@ runs a **Mission** against a question using an intelligence-collection loop:
   at `status=awaiting_approval`; `POST /missions/<id>/approve` then launches
   `start_collection`, which loops searching → `crawl_urls_with_progress` →
   `assess_requirement` (gap analysis) → re-tasking the unmet gaps. Both run in
-  daemon threads (`asyncio.run`), mirroring `jobs._run_thread`.
+  daemon threads (`asyncio.run`), mirroring `jobs._run_thread`. Both take an
+  optional `job_id`; when one is given, the background thread finishes that
+  exact job on every exit path — success, error, or the mission row having
+  been deleted out from under it mid-run — instead of trying to look the job
+  up from the mission. `mission_approve`, `requirement_retask`, `agent_run`,
+  and `scheduler._launch` all pass the job id they themselves created.
 - **Completion is concrete, not vibes:** a mission is done when every requirement
   is `satisfied` or `unmet`. The circuit-breaker is `per_req_attempts` — a
   requirement still unmet after that many tries is marked `unmet` and the agent
   moves on. `max_passes`/`max_sources` are the global budget backstops (stored in
   `missions.budget_json`).
+- **A token budget is a stop condition, not a suggestion.** `_run_collection`
+  checks `storage.get_mission_llm_usage(mission_id)`'s prompt+completion total
+  against `budget.get("max_llm_tokens", settings.max_llm_tokens)` (`0` =
+  unlimited) at each pass boundary and again before each requirement inside
+  the pass — the same checkpoint the mid-pass `Stop` cancellation already
+  used — and crossing it stops the loop, logs `token budget reached`, and
+  marks every requirement not yet reached `assessment_missing="not attempted:
+  token budget reached"`, the same shape as an unmet requirement rather than
+  a crash.
 - **Source of truth is SQLite, not the job store.** Mission status, requirements,
   and the brief live in the new tables (`agents`, `missions`, `requirements`,
   `mission_documents`). The in-memory job store (`jobs.create_mission_job`) only
@@ -110,7 +125,20 @@ runs a **Mission** against a question using an intelligence-collection loop:
   transient (rate limits, dropped connections, Cohere's
   `NO_VALID_RESPONSE_GENERATED`); a non-transient error — a bad model id, an
   auth failure — fails on the first attempt rather than burning the retry
-  budget on something a retry can't fix.
+  budget on something a retry can't fix. `chat_ex` (and the `chat`/`chat_json`
+  wrappers, which forward the same kwargs) take `purpose` and `mission_id`,
+  time every provider call, and record one `LlmCall` row via
+  `storage.insert_llm_call` for each call that actually returns — the
+  fallback call included, under its own model id — while an attempt that
+  raised and got retried is never recorded; a recording failure is logged to
+  stderr and never raised, so a DB hiccup can't fail a mission over
+  telemetry. Callers pass a purpose per call site: `"plan"` (planner),
+  `"assess"` (assessor), `"brief"` (synthesis), `"extract"` (extractor,
+  threaded through `_extract_sources` with the mission id when extraction
+  runs inside a mission, `None` for the one-shot pipeline).
+  `storage.get_mission_llm_usage(mission_id)` rolls those rows up per
+  mission — totals plus a `by_purpose` breakdown — for the mission page's
+  telemetry strip.
 - **The mission view** (`templates/mission.html`) renders three states from
   `mission.status` — editable **approval gate**, **requirements matrix**, and
   **brief + citation-linked source rail**. It polls `GET /api/mission/<id>`
@@ -128,17 +156,40 @@ runs a **Mission** against a question using an intelligence-collection loop:
 - **Citation numbering must match the brief, even after a restart.**
   The LLM prompt numbers sources with `brief.ordered_sources(docs)`, and
   `_synthesize` persists that exact order to `missions.brief_sources_json`.
-  The source rail uses the stored order (via
-  `brief.ordered_sources_for_mission`: stored ids still present, then any
-  documents the brief did not number), capped at `brief.MAX_BRIEF_SOURCES`,
-  so re-rendering the mission page (or restarting the process) can't silently
-  renumber the rail against a different ordering than the one the brief text
-  actually cites. Linkify is bounded by the count of stored ids still
-  present, so an out-of-range `[n]` stays plain text rather than binding to
-  an uncited document a later retask appended.
+  The source rail uses the stored order via `brief.ordered_sources_for_mission`:
+  stored ids keep their slot even when the document behind one is gone — a
+  missing id yields `None` in that position rather than being skipped, so a
+  deleted or stranded source doesn't shift every later citation number down —
+  followed by any documents the brief did not number (e.g. added by a later
+  retask), capped at `brief.MAX_BRIEF_SOURCES`. Re-rendering the mission page
+  (or restarting the process) therefore can't silently renumber the rail
+  against a different ordering than the one the brief text actually cites.
+  The mission page renders a `None` slot as a muted "source no longer
+  available" row and excludes it from `doc_number`. `linkify_citations` is
+  bounded by the count of non-`None` stored slots, so an out-of-range `[n]`
+  stays plain text rather than binding to the wrong document.
   `brief.linkify_citations()` turns `[n]` into `.cite` controls **after**
   `render_markdown` sanitization (it only ever injects markup built from an
   integer it re-serializes, so the sanitizer is never weakened or bypassed).
+- **The brief is checked for its own mistakes.** After `_synthesize` writes
+  the brief, `brief.brief_warnings(mission, requirements, docs, brief_md)`
+  flags three things: an uncited paragraph or bullet of real length, a `[n]`
+  citation pointing at a source `content_quality.is_usable` would reject, and
+  a requirement whose key terms never surface in the brief text at all. The
+  warnings are stored as `missions.brief_warnings_json` in the same
+  `update_mission` call that saves the brief, and `_synthesize` logs
+  `brief checks: N warning(s)`. The mission page renders any of them as a
+  "Brief checks" callout above the brief — a prompt to read closer, not a
+  correctness guarantee.
+- **A mission can be compared against its own history.** `GET
+  /missions/<id>/compare` renders `templates/mission_compare.html`: both
+  briefs side by side (each through `render_markdown`, un-linkified), the two
+  questions and dates, and three source lists built from
+  `storage.get_mission_pair_documents(mission_id, parent_id)` — new this run,
+  dropped since the parent, and shared. It 404s-to-flash when the mission has
+  no `parent_mission_id` or that parent mission is gone. The mission page
+  links to it ("Compare with previous run") whenever a live parent exists —
+  every scheduled run already has one via `parent_mission_id`.
 - **Approve and re-task are atomic status transitions, not unconditional
   `UPDATE`s.** `storage.claim_mission_status(mission_id, from_status,
   to_status)` is a compare-and-set: it only flips the row if it's still in
@@ -175,6 +226,15 @@ runs a **Mission** against a question using an intelligence-collection loop:
   answers. Measured on this box: the `duckduckgo` backend returned **0** results
   for a query where brave/bing returned 4 in under a second. A single-engine
   search silently starves missions.
+- **What search actually returned is recorded, not just acted on.** Every
+  `_collect_one` search call goes through `search.web_search_ex`, which
+  returns `(results, engine)` instead of just `results`; each call appends a
+  `{"pass", "query", "engine", "results"}` entry to that requirement's
+  `requirements.search_stats_json` (capped at the last 40 entries). The
+  requirement detail view renders these as one line per pass (`pass 1 · 3
+  queries · 11 results · brave`), and `assess_requirement` gets a
+  `search_note` summarizing the pass so a gap verdict caused by thin search
+  results reads differently from one caused by good search and bad sources.
 - **A "successful" crawl is often a captcha wall.** `content_quality.py` is the
   one place that judges real content vs. block/interstitial/near-empty pages,
   shared by the crawler (before storing — junk must not consume the source
