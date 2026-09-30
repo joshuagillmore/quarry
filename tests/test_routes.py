@@ -633,7 +633,7 @@ def plannings(monkeypatch):
     import agent_runner
     calls = []
     monkeypatch.setattr(agent_runner, "start_planning",
-                        lambda mid, job_id=None: calls.append(mid))
+                        lambda mid, job_id=None: calls.append((mid, job_id)))
     return calls
 
 
@@ -644,7 +644,8 @@ def test_run_scheduled_redirects_to_the_new_mission(client, plannings):
     assert _path(r) == f"/missions/{mission.id}"
     assert mission.question == "What changed overnight?"
     assert json.loads(mission.budget_json)["auto_approve"] is True
-    assert plannings == [mission.id]
+    # The planner is handed the job the launch created, the one on the row.
+    assert mission.job_id and plannings == [(mission.id, mission.job_id)]
 
 
 def test_run_scheduled_when_busy(client, plannings):
