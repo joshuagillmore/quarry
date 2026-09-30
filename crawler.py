@@ -67,8 +67,45 @@ async def crawl_urls(search_results: list[SearchResult], search_query: str) -> l
     return documents
 
 
-async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str, job_id: str) -> list[Document]:
-    from jobs import update_url, add_log, inc_counter
+def _arun_timeout_s() -> float:
+    """Hard ceiling on one page, in seconds. crawl4ai's page_timeout bounds
+    navigation, but not every stage after it (a wedged browser, a script that
+    never settles), and one hung page would otherwise hold its semaphore slot
+    — and the mission's worker and job slot — forever. Twice the navigation
+    budget plus headroom for rendering and markdown extraction."""
+    return settings.crawl_timeout / 1000 * 2 + 15
+
+
+def _page_names(sr: SearchResult, result) -> list[str]:
+    """Every URL one crawl answered to: the one requested, the one crawl4ai
+    reports as `url` (0.9.x: the requested URL), and `redirected_url` (where
+    the browser actually landed)."""
+    names = [sr.url, getattr(result, "url", None), getattr(result, "redirected_url", None)]
+    return [n for i, n in enumerate(names) if n and n not in names[:i]]
+
+
+async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,
+                                   job_id: str, attempted: set[str] | None = None,
+                                   aliases: dict[str, str] | None = None,
+                                   skip_on_cancel: bool = False) -> list[Document]:
+    """Crawl `search_results` with progress reported into the job store.
+
+    One page can go by several URLs (the search result, the URL crawl4ai
+    reports, the post-redirect URL). When `attempted` is given, every one of
+    them that this call touched is added to it — failed and junk pages
+    included — so a caller can avoid fetching the same page again under
+    another name. When `aliases` is given, each name other than the stored
+    document's `url` is mapped to it, so a caller can find the document from
+    any of them. The extra names are also kept in the document's metadata
+    (`requested_url`, `redirected_url`) for callers in a later run.
+
+    With `skip_on_cancel` (the one-shot crawl), a cancel requested on the job
+    stops every page not fetched yet: it is marked "skipped" and not added to
+    `attempted`; fetches already in flight finish and are returned. Missions
+    leave it off: their stop is honoured at the next pass boundary, and a
+    skipped crawl would have the rest of the pass assess requirements
+    against sources that were never fetched."""
+    from jobs import update_url, add_log, inc_counter, is_cancelled
 
     browser_cfg = BrowserConfig(headless=True, browser_type="chromium")
     # Stealth options: a plain headless Chromium is trivially fingerprinted, and
@@ -92,10 +129,23 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         async def crawl_one(sr: SearchResult) -> Document | None:
             async with semaphore:
+                if skip_on_cancel and is_cancelled(job_id):
+                    update_url(job_id, sr.url, status="skipped")
+                    inc_counter(job_id, "crawl_done")
+                    add_log(job_id, "warn",
+                            f"skipped <code>{_esc(sr.url)}</code>: cancelled")
+                    return None
+                if attempted is not None:
+                    attempted.add(sr.url)
                 update_url(job_id, sr.url, status="fetching")
                 add_log(job_id, "info", f"fetching <code>{_esc(sr.url)}</code>")
+                limit = _arun_timeout_s()
                 try:
-                    result = await crawler.arun(url=sr.url, config=run_cfg)
+                    result = await asyncio.wait_for(
+                        crawler.arun(url=sr.url, config=run_cfg), timeout=limit)
+                    names = _page_names(sr, result)
+                    if attempted is not None:
+                        attempted.update(names)
                     if not result.success:
                         msg = (result.error_message or "unknown error")[:140]
                         update_url(job_id, sr.url, status="error", error=msg)
@@ -108,7 +158,7 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                     fit_content = result.markdown.fit_markdown if result.markdown else ""
                     internal_links = len(result.links.get("internal", [])) if result.links else 0
                     external_links = len(result.links.get("external", [])) if result.links else 0
-                    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+                    metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
                     title = metadata.get("title") or sr.title or parsed.netloc
                     word_count = len(markdown_content.split()) if markdown_content else 0
 
@@ -123,6 +173,18 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                         add_log(job_id, "warn",
                                 f"discarded <code>{_esc(sr.url)}</code>: {_esc(why)}")
                         return None
+
+                    # The page's other names, resolvable now (aliases) and in
+                    # a later run of the same mission (metadata).
+                    redirected = getattr(result, "redirected_url", None)
+                    if sr.url != result.url:
+                        metadata["requested_url"] = sr.url
+                    if redirected and redirected != result.url:
+                        metadata["redirected_url"] = redirected
+                    if aliases is not None:
+                        for name in names:
+                            if name != result.url:
+                                aliases[name] = result.url
 
                     doc = Document(
                         id=str(uuid.uuid4()),
@@ -147,6 +209,13 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                     inc_counter(job_id, "crawl_done")
                     add_log(job_id, "ok", f"<em>{_esc(title[:80])}</em> · {word_count:,}w")
                     return doc
+                except asyncio.TimeoutError:
+                    # str(TimeoutError()) is "", so say what happened.
+                    msg = f"timed out after {limit:.0f}s"
+                    update_url(job_id, sr.url, status="error", error=msg)
+                    inc_counter(job_id, "crawl_done")
+                    add_log(job_id, "err", f"gave up on <code>{_esc(sr.url)}</code>: {_esc(msg)}")
+                    return None
                 except Exception as e:
                     update_url(job_id, sr.url, status="error", error=str(e)[:140])
                     inc_counter(job_id, "crawl_done")

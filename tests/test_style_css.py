@@ -64,5 +64,7 @@ def test_every_declaration_block_is_reachable(css):
 def test_key_rules_present(css):
     """Spot-check rules the mission surfaces depend on."""
     for sel in (".req-open[hidden]", ".telemetry", ".tele-cell", ".srail",
-                ".cite", ".mrow", ".agent-budget", ".coverage"):
+                ".cite", ".mrow", ".agent-budget", ".coverage",
+                ".qadd[hidden]", ".btn:disabled", ".lib-pager",
+                '.stage[data-state="error"]'):
         assert sel in css, f"missing rule {sel}"

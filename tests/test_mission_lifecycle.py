@@ -96,3 +96,45 @@ def test_accepted_by_user_is_recorded_distinctly(tmp_path):
         assert (r.status, r.attempts, r.accepted_by_user) == ("pending", 0, 0)
 
     asyncio.run(go())
+
+
+def test_synthesize_stores_the_citation_order(tmp_path, monkeypatch):
+    """The brief's [n] numbering is persisted with the brief, so the source
+    rail can never drift from the text (e.g. after a later retask adds docs)."""
+    import json
+
+    import agent_runner
+    from brief import ordered_sources
+
+    _setup(tmp_path)
+    captured = {}
+
+    async def go():
+        await storage.insert_mission(_mission("m1", "collecting"))
+        await storage.insert_requirement(Requirement(id="r1", mission_id="m1", title="T"))
+        # The junk page is the newest, so it comes first from storage but must
+        # be numbered last.
+        for doc_id, title, words, when in [
+                ("good1", "Solid source", 900, "2026-01-01"),
+                ("junk", "Just a moment...", 12, "2026-01-03"),
+                ("good2", "Another source", 700, "2026-01-02")]:
+            real_id = await storage.upsert_document(Document(
+                id=doc_id, url="http://x/" + doc_id, domain="x", title=title,
+                search_query="Q", crawled_at=when, content_markdown="w " * words,
+                word_count=words))
+            await storage.link_mission_document("m1", "r1", real_id)
+
+    asyncio.run(go())
+
+    def fake_brief(mission, reqs, docs, new_urls):
+        captured["docs"] = docs
+        return "brief citing [1]"
+
+    monkeypatch.setattr(agent_runner, "synthesize_brief", fake_brief)
+    asyncio.run(agent_runner._synthesize("m1", None, None))
+
+    m = asyncio.run(storage.get_mission("m1"))
+    assert m.status == "done" and m.brief_markdown == "brief citing [1]"
+    ids = json.loads(m.brief_sources_json)
+    assert ids == [d.id for d in ordered_sources(captured["docs"])]
+    assert set(ids) == {"good1", "good2", "junk"} and ids[-1] == "junk"

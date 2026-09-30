@@ -35,11 +35,33 @@ The `data/` directory is bind-mounted, so `data/research.db` survives container 
 
 ```bash
 python -m venv .venv && . .venv/Scripts/activate   # or .venv/bin/activate on macOS/Linux
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt
 crawl4ai-setup            # one-time: installs Chromium for crawl4ai
 cp .env.example .env      # then edit
 python app.py
 ```
+
+`python app.py` binds `127.0.0.1:5000` by default (`FLASK_HOST`/`FLASK_PORT`), reachable only
+from this machine; widening it is covered by the exposure guard below. `.env` tolerates unknown
+keys (a vendor's own `OPENAI_API_KEY`-style variables) and a leading UTF-8 BOM, so re-saving it
+from an editor that adds one won't break config parsing. Never write it with PowerShell's
+`-Encoding utf8`, though — that adds a BOM *and* corrupts the first key. An explicitly empty
+exported environment variable (e.g. `export LLM_PROVIDER_FAST=`) no longer overrides a non-empty
+value already set in `.env` — empty now means "not set", not "clear this".
+
+## Running tests
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run --no-project --python 3.12 --with pytest --with Flask==3.1.3 \
+  --with Werkzeug==3.1.8 --with pydantic==2.13.4 --with pydantic-settings==2.14.2 \
+  --with aiosqlite==0.22.1 --with python-dotenv==1.2.2 --with Markdown==3.10.2 \
+  --with bleach==6.4.0 --with APScheduler==3.11.3 \
+  python -m pytest -q tests
+```
+
+No `PYTHONPATH` needed — `pytest.ini` sets `pythonpath` for you. The `--with` flags pin the
+versions this was last verified against; `.github/workflows/tests.yml` runs the same command on
+every push and pull request.
 
 ## Configuration
 
@@ -55,11 +77,13 @@ All settings come from `.env` (see `.env.example`):
 | `SEARCH_MAX_RESULTS` | Default result count for the search form | `5` |
 | `DB_PATH` | SQLite file path | `data/research.db` |
 | `CRAWL_TIMEOUT` | Per-page crawl timeout (ms) | `30000` |
-| `FLASK_HOST` / `FLASK_PORT` | Bind address | `0.0.0.0:5000` |
+| `LLM_TIMEOUT_S` | Per-call LLM request timeout (seconds) — a hung provider can't hold a mission worker (and its job slot) forever | `120` |
+| `FLASK_HOST` / `FLASK_PORT` | Bind address. Loopback by default; widening it is covered by the exposure guard below | `127.0.0.1:5000` |
 | `FLASK_DEBUG` | Flask debug + auto-reload | `false` |
 | `FLASK_SECRET_KEY` | Override Flask session signing key. Empty → generated once into `data/secret_key` | *(empty)* |
 | `QUARRY_PASSWORD` | Optional login password. Empty → no login | *(empty)* |
 | `QUARRY_BEHIND_PROXY` | Behind a TLS-terminating reverse proxy (ProxyFix + Secure cookie) | `false` |
+| `QUARRY_TRUSTED_HOSTS` | Extra hostnames accepted in the `Host` header, comma-separated, beyond localhost/`127.0.0.1`/`[::1]` (a DNS-rebinding guard) | *(empty)* |
 
 ### Choosing an LLM provider
 
@@ -161,10 +185,18 @@ searches        one row per agent run, with job_id back-reference for trace look
 Designed for **single-user local use** behind a firewall. Some specifics:
 
 - **Optional password login.** By default there is no login and Docker publishes on `127.0.0.1` (`QUARRY_BIND`), so the app is reachable only from the host machine. Before widening `QUARRY_BIND`, set `QUARRY_PASSWORD` in `.env` — every page and API then requires sign-in (rate-limited, 30-day session, logout in the sidebar). The value can be a Werkzeug hash instead of plaintext. Even with a password set, prefer Tailscale/VPN over direct internet exposure.
+- **Host check (DNS-rebinding guard).** With no password set, any request whose `Host` is not `localhost`, `127.0.0.1` or `[::1]` gets a `400` unless that host is listed in `QUARRY_TRUSTED_HOSTS`. Browsing by a LAN name or IP (`http://my-box:5000`, `http://192.168.1.20:5000`) therefore needs that setting. With a password set, the allowlist applies only when `QUARRY_TRUSTED_HOSTS` is non-empty.
 - **Sessions survive restarts.** The signing key is generated once into `data/secret_key` (0600); set `FLASK_SECRET_KEY` to override.
 - **Response hardening:** `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` on every response.
-- **Behind TLS?** Set `QUARRY_BEHIND_PROXY=true` when a TLS-terminating reverse proxy fronts the app: it enables ProxyFix (correct client IPs for login rate limiting) and the `Secure` cookie flag. LAN exposure over plain HTTP sends the password and session cookie in cleartext — use a TLS proxy or Tailscale.
-- **Footgun guard:** binding beyond loopback without a password logs a loud startup warning and shows a red banner in the UI.
+- **Behind TLS?** Set `QUARRY_BEHIND_PROXY=true` when a TLS-terminating reverse proxy fronts the app: it enables ProxyFix (correct client IPs for login rate limiting) and the `Secure` cookie flag. Your proxy needs to forward the original host and scheme — for nginx:
+  ```
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Host $host;
+  ```
+  Without these, ProxyFix can't recover the real client IP or scheme, and `QUARRY_TRUSTED_HOSTS` (above) sees the proxy's own hostname instead of the one the browser actually used. LAN exposure over plain HTTP still sends the password and session cookie in cleartext — use a TLS proxy or Tailscale.
+- **Footgun guard:** widening exposure beyond loopback — via `QUARRY_BIND` (Docker) or `FLASK_HOST` (`python app.py`) — without a password logs a loud startup warning and shows a red banner in the UI. `QUARRY_BEHIND_PROXY=true` doesn't silence it: the guard is about whether unauthenticated traffic can reach the app, not where TLS terminates.
 - **Bounded job store:** at most 6 crawl/mission jobs run concurrently (each is a thread + headless Chromium); finished live traces are evicted after a keep-window so memory can't grow unbounded.
 - **Pinned dependencies:** `constraints.txt` (a `pip freeze` of a verified image) pins the full tree for reproducible builds.
 - **`FLASK_DEBUG` defaults to `false`** in `.env.example`. Never set it to `true` on a host reachable from untrusted networks; Werkzeug's debugger console is an RCE primitive.
@@ -172,8 +204,13 @@ Designed for **single-user local use** behind a firewall. Some specifics:
 - **Inputs are bounded:** query ≤ 500 chars, extraction prompt ≤ 5000 chars, `max_results` clamped to 1–20.
 - **Container runs as a non-root `app` user** (UID 1000). The bind-mounted `data/` directory must be writable by that UID on the host.
 - **Prompt injection is possible**: the LLM extractor sees raw page content. Treat extraction output as suggestion, not ground truth. Don't pipe it into anything that auto-executes.
-- **No CSRF tokens.** Acceptable for a localhost-only app where the SameSite=Lax default on session cookies blocks the relevant cross-site POST scenarios. If you front this with a real domain and add auth, add CSRF tokens too.
+- **CSRF is enforced without tokens.** Every POST is checked against `Sec-Fetch-Site` (rejecting anything other than `same-origin`/`same-site`/`none`) and, as a fallback, the `Origin` header must match the request's own host — a mismatch, or the `null` origin sandboxed iframes send, is rejected with a 403. Combined with the SameSite=Lax session cookie, that blocks the relevant cross-site POST scenarios without a token in every form.
 - **DDG returns external URLs only.** No allowlist on what the crawler will fetch; a crafted query could in theory point the crawler at a private network address. Out of scope today; consider an SSRF guard if you ever expose this.
+
+## Upgrading
+
+- **Everyone is signed out once on this release.** Login sessions are now bound to the password: the cookie carries a token derived from the signing key and `QUARRY_PASSWORD`, so cookies issued by earlier versions are invalid and each browser has to sign in again. Changing the password later signs every session out the same way.
+- **LAN access without a password now needs `QUARRY_TRUSTED_HOSTS`.** See the host check under Security posture.
 
 ## Notes & caveats
 

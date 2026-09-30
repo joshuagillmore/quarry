@@ -112,13 +112,16 @@
     </div>
     {% elif mission.status == 'done' %}
     <div class="tele-cell tele-acts">
-      <form method="post" action="/agents/{{ mission.agent_id }}/run" style="margin:0">
+      {# Re-run goes through the agent; once it is deleted there is nothing to run. #}
+      {% if agent %}
+      <form method="post" action="/agents/{{ agent.id }}/run" style="margin:0">
         <input type="hidden" name="query" value="{{ mission.question }}">
         <button type="submit" class="btn btn-sm" title="Run this question again">
           <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4h-4M2 13V9h4M13.5 9a6 6 0 0 1-10.5 3M2.5 7a6 6 0 0 1 10.5-3"/></svg>
           Re-run
         </button>
       </form>
+      {% endif %}
       {% if mission.brief_markdown %}
       <a class="btn btn-sm" href="/missions/{{ mission.id }}/brief.md">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M5 7l3 3 3-3M3 13h10"/></svg>
@@ -178,7 +181,7 @@
     </div>
 
     <div class="gate-foot">
-      <button type="submit" class="btn btn-accent">
+      <button type="submit" class="btn btn-accent" id="approveBtn">
         Approve <span id="keptCount">{{ requirements | length }}</span> requirements
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8h10M9 4l4 4-4 4"/></svg>
       </button>
@@ -187,8 +190,15 @@
         Add requirement
       </button>
       <span class="count">budget {{ max_sources }} sources · {{ max_passes }} passes · {{ per_req_attempts }} tries per requirement</span>
+      {# Forms cannot nest: this button submits #discardForm below the gate. #}
+      <button type="submit" form="discardForm" class="btn btn-sm btn-ghost"
+              style="margin-left:auto;color:var(--danger)" title="Delete this mission without collecting">
+        Discard plan
+      </button>
     </div>
   </form>
+  <form id="discardForm" method="post" action="/missions/{{ mission.id }}/delete" hidden
+        onsubmit="return confirm('Discard this plan? The mission is deleted and nothing is collected.');"></form>
   {% endif %}
 
   <!-- ── Requirements matrix ────────────────────────────────── -->
@@ -406,10 +416,27 @@
   if (gateForm) {
     const planBody = document.getElementById('planBody');
     const keptCount = document.getElementById('keptCount');
+    const approveBtn = document.getElementById('approveBtn');
 
+    // Mirrors the server's count: a kept row is an original requirement
+    // that is not dropped, or an added one that has a title.
+    const kept = () => Array.from(planBody.querySelectorAll('.plan-row:not(.plan-dropped)'))
+      .filter(row => row.dataset.reqId || (row.querySelector('[data-title]').value || '').trim())
+      .length;
     const refreshCount = () => {
-      keptCount.textContent = planBody.querySelectorAll('.plan-row:not(.plan-dropped)').length;
+      const n = kept();
+      keptCount.textContent = n;
+      approveBtn.disabled = n === 0;
+      approveBtn.title = n === 0 ? 'Keep or add at least one requirement' : '';
     };
+    refreshCount();
+    planBody.addEventListener('input', (e) => {
+      if (e.target.closest('[data-title]')) refreshCount();
+    });
+    // Enter in a title field would submit (approve) the whole plan.
+    planBody.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.closest('[data-title]')) e.preventDefault();
+    });
     const chip = (q) => {
       const el = document.createElement('span');
       el.className = 'qchip';
@@ -443,7 +470,12 @@
         const input = document.createElement('input');
         input.className = 'qadd-in';
         input.placeholder = 'new search query…';
+        // Removing the focused input fires blur, which would commit a
+        // second time (a duplicate chip) without this guard.
+        let done = false;
         const commit = () => {
+          if (done) return;
+          done = true;
           const v = input.value.trim();
           if (v) add.parentNode.insertBefore(chip(v), add);
           input.remove();
@@ -451,7 +483,7 @@
         };
         input.addEventListener('keydown', (ev) => {
           if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
-          if (ev.key === 'Escape') { input.remove(); add.hidden = false; }
+          if (ev.key === 'Escape') { done = true; input.remove(); add.hidden = false; }
         });
         input.addEventListener('blur', commit);
         add.hidden = true;
@@ -476,7 +508,12 @@
       refreshCount();
     });
 
-    gateForm.addEventListener('submit', () => {
+    gateForm.addEventListener('submit', (ev) => {
+      if (kept() === 0) { ev.preventDefault(); refreshCount(); return; }
+      // One approval per click; base.html re-enables data-busy buttons if
+      // the back button restores this page from the bfcache.
+      approveBtn.disabled = true;
+      approveBtn.dataset.busy = '1';
       const plan = Array.from(planBody.querySelectorAll('.plan-row')).map(row => ({
         id: row.dataset.reqId || null,
         title: (row.querySelector('[data-title]').value || '').trim(),
@@ -544,13 +581,22 @@
 
   const copyBtn = document.getElementById('copyBrief');
   if (copyBtn) {
+    const label = document.getElementById('copyBriefLabel');
+    const flashLabel = (text, ms) => {
+      label.textContent = text;
+      setTimeout(() => { label.textContent = 'Copy'; }, ms);
+    };
     copyBtn.addEventListener('click', () => {
       const src = document.getElementById('briefSource');
-      navigator.clipboard.writeText(src ? src.textContent : '').then(() => {
-        const l = document.getElementById('copyBriefLabel');
-        const o = l.textContent; l.textContent = 'Copied';
-        setTimeout(() => { l.textContent = o; }, 1200);
-      });
+      // navigator.clipboard exists only in secure contexts (HTTPS or
+      // localhost); over plain HTTP on a LAN it is undefined.
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        flashLabel('Copy failed — use Export', 2500);
+        return;
+      }
+      navigator.clipboard.writeText(src ? src.textContent : '')
+        .then(() => flashLabel('Copied', 1200))
+        .catch(() => flashLabel('Copy failed — use Export', 2500));
     });
   }
 
@@ -616,9 +662,13 @@
       if (sb && maxSources) sb.style.width = (100 * s.trace.sources_used / maxSources) + '%';
 
       if (logStream) {
+        // `log` is a sliding window; `log_total` counts every line ever
+        // added, so the cursor survives the window moving.
         const log = s.trace.log || [];
-        for (let i = renderedLogs; i < log.length; i++) renderLog(log[i]);
-        renderedLogs = log.length;
+        const total = typeof s.trace.log_total === 'number' ? s.trace.log_total : log.length;
+        const base = total - log.length;
+        for (let i = Math.max(0, renderedLogs - base); i < log.length; i++) renderLog(log[i]);
+        renderedLogs = total;
         const inflight = (s.trace.urls || []).filter(u => u.status === 'fetching').length;
         if (traceMeta) {
           traceMeta.textContent = s.trace.cancel_requested
@@ -632,8 +682,18 @@
 
   function poll() {
     fetch('/api/mission/' + missionId)
-      .then(r => r.json())
-      .then(s => { if (!s.error && applyState(s)) setTimeout(poll, 1200); })
+      .then(r => {
+        if (r.status === 401) {
+          location.href = '/login?next=' + encodeURIComponent(location.pathname);
+          return null;
+        }
+        if (r.status >= 500) throw new Error('server ' + r.status);  // retry below
+        if (!r.ok) return null;       // 404: the mission is gone; stop polling
+        return r.json();
+      })
+      // A mission's `error` field is data (a failed mission still renders),
+      // not a failed request, so applyState always runs on a mission object.
+      .then(s => { if (s && applyState(s)) setTimeout(poll, 1200); })
       .catch(() => setTimeout(poll, 2500));
   }
   if (initialStatus !== 'done' && initialStatus !== 'error') poll();

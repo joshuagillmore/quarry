@@ -13,9 +13,15 @@
       <span class="crawl-query-label">Query</span>
       <span class="crawl-query">"{{ job.query }}"</span>
       <span class="crawl-timer" id="timer">⏱ 0.0s elapsed</span>
-      <a href="/" class="btn btn-sm">Cancel</a>
+      <form method="post" action="/crawl/{{ job.id }}/cancel" id="cancelForm" style="margin:0">
+        <button type="submit" class="btn btn-sm" id="cancelBtn"
+                title="Stop at the next checkpoint; pages already stored are kept">Cancel</button>
+      </form>
       <button type="button" id="jumpBtn" class="btn btn-sm btn-primary" disabled>Jump to results</button>
     </div>
+
+    <div class="flash error hidden" id="crawlError" role="alert"></div>
+    <div class="flash info hidden" id="crawlNotice" role="status"></div>
 
     <div class="pipeline" id="pipeline">
       <div class="stage" data-stage="search" data-state="pending">
@@ -85,18 +91,40 @@
     check: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 8 3.5 3.5L13 5"/></svg>',
     x: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5 12.5 12.5M12.5 3.5l-9 9"/></svg>',
     dot: '<span style="width:6px;height:6px;border-radius:999px;background:currentColor;display:block"></span>',
+    dash: '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8h8"/></svg>',
     spinner: '<div class="spinner-sm"></div>',
   };
+
+  // The extractor runs on the fast tier, which falls back to the reasoning
+  // model when unset. tojson: a model id is data, not script.
+  const EXTRACT_MODEL = {{ (llm_fast_model if llm_fast_model and llm_fast_model != '—' else llm_model)|tojson }};
 
   const urlList = document.getElementById('urlList');
   const logStream = document.getElementById('logStream');
   const timer = document.getElementById('timer');
   const jumpBtn = document.getElementById('jumpBtn');
   const urlMeta = document.getElementById('urlMeta');
+  const cancelForm = document.getElementById('cancelForm');
+  const crawlError = document.getElementById('crawlError');
+  const crawlNotice = document.getElementById('crawlNotice');
 
   let renderedUrls = 0;
   let renderedLogs = 0;
   let stopped = false;
+
+  // The stream only sends a message when something changes, not every tick
+  // of the clock, so the elapsed timer runs locally between messages.
+  let clockBase = 0, clockAt = performance.now();
+  const clock = setInterval(() => {
+    if (stopped) return;
+    const t = clockBase + (performance.now() - clockAt) / 1000;
+    timer.textContent = `⏱ ${t.toFixed(1)}s elapsed`;
+  }, 200);
+
+  function showNotice(el, text) {
+    el.textContent = text;        // textContent: job errors carry page/LLM text
+    el.classList.remove('hidden');
+  }
 
   function setStageState(stage, state) {
     const el = document.querySelector(`.stage[data-stage="${stage}"]`);
@@ -130,6 +158,7 @@
     if (u.status === 'done') statusEl.innerHTML = SVG.check;
     else if (u.status === 'error') statusEl.innerHTML = SVG.x;
     else if (u.status === 'fetching') statusEl.innerHTML = SVG.spinner;
+    else if (u.status === 'skipped') statusEl.innerHTML = SVG.dash;
     else statusEl.innerHTML = SVG.dot;
 
     row.querySelector('.url-title').textContent = u.title || u.url;
@@ -141,6 +170,9 @@
       meta.textContent = 'fetching…';
     } else if (u.status === 'error') {
       meta.innerHTML = `<span style="color:var(--danger)">error</span>`;
+    } else if (u.status === 'skipped') {
+      // Never fetched: the crawl was cancelled before this page's turn.
+      meta.textContent = 'skipped';
     } else {
       meta.textContent = 'queued';
     }
@@ -159,12 +191,13 @@
   }
 
   function renderState(s) {
+    clockBase = s.elapsed; clockAt = performance.now();
     timer.textContent = `⏱ ${s.elapsed.toFixed(1)}s elapsed`;
     document.getElementById('search-count').textContent = s.search_total;
     document.getElementById('search-time').textContent = s.search_total > 0 ? `${s.elapsed.toFixed(2)}s initial` : '—';
     document.getElementById('crawl-count').textContent = `${s.crawl_done}/${s.crawl_total}`;
     document.getElementById('extract-count').textContent = s.extract ? `${s.extract_done}/${s.extract_total}` : '— off';
-    document.getElementById('extract-model').textContent = s.extract ? '{{ llm_model }}' : 'disabled';
+    document.getElementById('extract-model').textContent = s.extract ? EXTRACT_MODEL : 'disabled';
 
     const searchProg = s.search_total > 0 ? 100 : 0;
     const crawlProg = s.crawl_total > 0 ? Math.round(s.crawl_done / s.crawl_total * 100) : 0;
@@ -200,21 +233,48 @@
     const inFlight = s.urls.filter(u => u.status === 'fetching').length;
     urlMeta.textContent = `${s.crawl_done}/${s.crawl_total} crawled · ${inFlight} in flight`;
 
-    for (let i = renderedLogs; i < s.log.length; i++) {
-      renderLog(s.log[i]);
-    }
-    renderedLogs = s.log.length;
+    // `log` is a sliding window over the job's log; `log_total` counts every
+    // line ever added, so the cursor survives the window moving.
+    const total = typeof s.log_total === 'number' ? s.log_total : s.log.length;
+    const base = total - s.log.length;
+    for (let i = Math.max(0, renderedLogs - base); i < s.log.length; i++) renderLog(s.log[i]);
+    renderedLogs = total;
+
+    if (s.error) showNotice(crawlError, s.error);
 
     if (s.done) {
       stopped = true;
+      clearInterval(clock);
+      cancelForm.hidden = true;
       jumpBtn.disabled = false;
       jumpBtn.onclick = () => window.location.href = '/results/' + jobId;
-      if (!s.error) {
+      if (s.stage === 'error') {
+        timer.textContent = `✕ failed after ${s.elapsed.toFixed(1)}s`;
+        ['search', 'crawl', 'extract'].forEach(st => {
+          const el = document.querySelector(`.stage[data-stage="${st}"]`);
+          if (el && el.getAttribute('data-state') === 'active') setStageState(st, 'error');
+        });
+      } else if (s.stage === 'cancelled') {
+        timer.textContent = `■ cancelled after ${s.elapsed.toFixed(1)}s`;
+        showNotice(crawlNotice, 'Crawl cancelled — pages stored before the stop are in the Library.');
+      } else if (!s.error) {
         timer.textContent = `✓ done in ${s.elapsed.toFixed(1)}s`;
         jumpBtn.classList.add('btn-accent');
       }
       es.close();
+    } else if (s.cancel_requested) {
+      cancelForm.hidden = true;
+      showNotice(crawlNotice, 'Cancelling — stopping at the next checkpoint…');
     }
+  }
+
+  function gone() {
+    stopped = true;
+    clearInterval(clock);
+    es.close();
+    cancelForm.hidden = true;
+    showNotice(crawlNotice, 'This crawl is no longer available — its live trace was cleared. ' +
+                            'Anything it stored is in the Library.');
   }
 
   const es = new EventSource('/api/job/' + jobId + '/stream');
@@ -226,10 +286,15 @@
       console.error('render error', e);
     }
   };
+  // The job vanished mid-stream (evicted / process restarted).
+  es.addEventListener('gone', gone);
   es.addEventListener('error', (e) => {
-    // EventSource auto-reconnects on transient failures.
-    // If the server explicitly closed, readyState will be CLOSED.
-    if (es.readyState === EventSource.CLOSED) return;
+    // EventSource auto-reconnects on transient failures. CLOSED means the
+    // server refused the reconnect (204: the job is unknown now).
+    if (es.readyState === EventSource.CLOSED) {
+      if (!stopped) gone();
+      return;
+    }
     console.warn('SSE transient error', e);
   });
 })();

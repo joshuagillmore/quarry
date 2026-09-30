@@ -53,6 +53,9 @@ class Mission(BaseModel):
     plan_json: Optional[str] = None
     budget_json: Optional[str] = None
     brief_markdown: Optional[str] = None
+    # JSON list[str] of document ids in the exact order the brief's [n]
+    # citations were numbered, so the source rail always matches the text.
+    brief_sources_json: Optional[str] = None
     job_id: Optional[str] = None
     parent_mission_id: Optional[str] = None  # Phase 2 delta lineage
     error: Optional[str] = None

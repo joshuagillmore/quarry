@@ -29,7 +29,7 @@
       {% endwith %}
 
       <form method="post" action="/login" class="card" style="padding:22px;display:grid;gap:14px;">
-        <input type="hidden" name="next" value="{{ request.args.get('next', '') }}">
+        <input type="hidden" name="next" value="{{ request.values.get('next', '') }}">
         <div>
           <label class="tweak-label" for="password">Password</label>
           <input id="password" name="password" type="password" required autofocus

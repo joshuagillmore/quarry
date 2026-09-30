@@ -1,9 +1,15 @@
 .git
 .gitignore
 .dockerignore
-.env
+.env*
+!.env.example
 data/
-__pycache__/
+**/*.db
+**/*.db-journal
+**/secret_key
+**/settings.json
+**/settings.json.corrupt
+**/__pycache__/
 *.pyc
 *.pyo
 .venv/
@@ -14,4 +20,5 @@ dist/
 build/
 .vscode/
 .idea/
+.superpowers/
 *.md

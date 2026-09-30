@@ -2,10 +2,12 @@
 Validates: fast-tier extraction + brief actually run on qwen (not the Cohere
 fallback), and a fully-local mission (reasoning=qwen) plans + completes.
 """
-import json, sqlite3, time, urllib.parse, urllib.request
+import json, re, sqlite3, time, urllib.parse, urllib.request
 BASE = "http://127.0.0.1:5000"; DB = "/app/data/research.db"
 FAST = "ollama_chat/qwen2.5:14b"; OLLAMA = "http://host.docker.internal:11434"
 
+def get(path):
+    with urllib.request.urlopen(BASE + path, timeout=30) as r: return r.read().decode("utf-8", "replace")
 def post(path, data):
     req = urllib.request.Request(BASE + path, data=urllib.parse.urlencode(data).encode(), method="POST")
     with urllib.request.urlopen(req, timeout=120) as r: return r.geturl()
@@ -14,6 +16,27 @@ def get_json(path):
 def settings(reasoning, fast):
     post("/settings", {"llm_provider": reasoning, "llm_provider_fast": fast,
                        "ollama_api_base": OLLAMA, "search_max_results": "5"})
+
+def _field(html, name, default):
+    # The settings form's <input> tags wrap onto a second line, so the match
+    # has to span lines (re.S) to find id="..." and value="..." together.
+    m = re.search(rf'<input\b[^>]*\bid="{name}"[^>]*>', html, re.S)
+    if not m:
+        return default
+    v = re.search(r'value="([^"]*)"', m.group(0))
+    return v.group(1) if v else default
+
+def read_live_settings():
+    """Snapshot the settings actually in effect before this driver touches
+    them, so they can be put back at the end instead of overwritten with the
+    hard-coded Cohere/qwen QA config."""
+    html = get("/settings")
+    return {
+        "llm_provider": _field(html, "llm_provider", "cohere/command-a-03-2025"),
+        "llm_provider_fast": _field(html, "llm_provider_fast", ""),
+        "ollama_api_base": _field(html, "ollama_api_base", OLLAMA),
+        "search_max_results": _field(html, "search_max_results", "5"),
+    }
 def poll(mid, terminal, timeout):
     end = time.time() + timeout
     while time.time() < end:
@@ -44,11 +67,14 @@ def run(name, exp, q, extract, reasoning="cohere/command-a-03-2025", fast=FAST):
     post(f"/agents/{aid}/delete", {})
 
 try:
+    print("== capturing the user's real settings (restored on exit) ==", flush=True)
+    _user_settings = read_live_settings()
+
     print("== live-Ollama qwen path ==", flush=True)
     run("QAO-Vax", "immunology", "How do vaccines work?", True)
     run("QAO-Econ", "macroeconomics", "What causes inflation?", True)
     run("QAO-Local", "general science", "What is photosynthesis?", False,
         reasoning=FAST, fast=FAST)   # fully local: planning+assessment on qwen
 finally:
-    settings("cohere/command-a-03-2025", "ollama_chat/qwen2.5:14b")  # restore user's real config
+    post("/settings", _user_settings)  # restore the user's real config
 print("QA_OLLAMA_DONE", flush=True)

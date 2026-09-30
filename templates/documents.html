@@ -7,7 +7,7 @@
 <div class="page page-wide">
   <div class="lib-head">
     <div>
-      <h1 class="page-title">Library <em>&middot;</em> <span style="font-family: var(--font-mono); font-size: 16px; color: var(--fg-subtle); letter-spacing: 0;" id="libCount">{{ documents|length }} documents</span></h1>
+      <h1 class="page-title">Library <em>&middot;</em> <span style="font-family: var(--font-mono); font-size: 16px; color: var(--fg-subtle); letter-spacing: 0;" id="libCount">{{ total }} documents</span></h1>
       {% if full_text_query %}
       <p class="page-sub">
         <strong>{{ documents|length }}</strong> match{{ '' if documents|length == 1 else 'es' }} for <em>"{{ full_text_query }}"</em>{% if search_filter %} within search <em>"{{ search_filter }}"</em>{% endif %} &middot;
@@ -65,7 +65,10 @@
     {% if mission_filter %}<input type="hidden" name="mission" value="{{ mission_filter }}">{% endif %}
     <div class="lib-search">
       <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 12.5a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11ZM11 11l3.5 3.5"/></svg>
-      <input id="libSearch" name="q" placeholder="Filter titles… (Enter for full-text content search)" value="{{ full_text_query or '' }}">
+      {# Deliberately not pre-filled with the full-text query: the client-side
+         filter only sees titles/snippets, so re-applying the query here would
+         hide the full-text matches whose hit is in the body. #}
+      <input id="libSearch" name="q" placeholder="Filter titles… (Enter for full-text content search)">
       <button type="button" id="libClear" class="btn btn-sm btn-ghost hidden">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 3.5 12.5 12.5M12.5 3.5l-9 9"/></svg>
       </button>
@@ -132,6 +135,14 @@
     <div class="title">Nothing matches.</div>
     <div>Try loosening a filter or clearing the search.</div>
   </div>
+
+  {% if pager %}
+  <nav class="lib-pager" aria-label="Library pages">
+    {% if pager.prev_url %}<a class="btn btn-sm" href="{{ pager.prev_url }}" rel="prev">&larr; Newer</a>{% endif %}
+    <span class="lib-pager-info">showing {{ pager.first }}–{{ pager.last }} of {{ pager.total }}</span>
+    {% if pager.next_url %}<a class="btn btn-sm" href="{{ pager.next_url }}" rel="next">Older &rarr;</a>{% endif %}
+  </nav>
+  {% endif %}
   {% else %}
   <div class="empty-state">
     <div class="title">No documents yet.</div>
@@ -144,8 +155,7 @@
 (function() {
   const grid = document.getElementById('libGrid');
   if (!grid) return;
-  const urlParams = new URLSearchParams(window.location.search);
-  const initialQ = urlParams.get('q');
+  const PAGE_NOTE = {{ ((' on this page · ' ~ total ~ ' in all') if pager else '')|tojson }};
   const cards = Array.from(grid.querySelectorAll('.doc-card'));
   const search = document.getElementById('libSearch');
   const clear = document.getElementById('libClear');
@@ -195,11 +205,11 @@
     shown.sort(sorters[sortBy]);
     shown.forEach(c => grid.appendChild(c));
 
-    count.textContent = visible + ' of {{ documents|length }}';
+    // Paged listings filter the cards on this page only; say so.
+    count.textContent = visible + ' of {{ documents|length }}' + PAGE_NOTE;
     empty.classList.toggle('hidden', visible !== 0);
   }
 
-  if (initialQ) search.value = initialQ;
   search.addEventListener('input', apply);
   clear.addEventListener('click', () => { search.value = ''; apply(); });
   ageSel.addEventListener('change', apply);

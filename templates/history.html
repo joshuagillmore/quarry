@@ -58,9 +58,11 @@
           </a>
           {% endif %}
           <a href="/documents?search={{ s.query|urlencode }}" class="btn btn-sm">View</a>
+          {# result_count is how many pages were stored, often fewer than were
+             asked for; re-running with it would shrink the search each time. #}
           <form method="POST" action="/search" style="display:inline">
             <input type="hidden" name="query" value="{{ s.query }}">
-            <input type="hidden" name="max_results" value="{{ s.result_count or 5 }}">
+            <input type="hidden" name="max_results" value="{{ default_results }}">
             <button type="submit" class="btn btn-sm btn-primary">
               <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3v4h-4M2 13V9h4M13.5 9a6 6 0 0 1-10.5 3M2.5 7a6 6 0 0 1 10.5-3"/></svg>
               Re-run

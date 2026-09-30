@@ -15,10 +15,20 @@ _ALLOWED_TAGS = [
     "span", "div",
 ]
 
+_LANGUAGE_CLASS = re.compile(r"language-[A-Za-z0-9_+#.-]+")
+
+
+def _code_class(tag, name, value):
+    """`class` survives only as a fenced-code language marker
+    (`language-python`). Anywhere else a crawled page could borrow the app's
+    own classes (`flash error`, `btn`) and dress itself up as app chrome."""
+    return name == "class" and bool(_LANGUAGE_CLASS.fullmatch(value or ""))
+
+
 _ALLOWED_ATTRS = {
     "a": ["href", "title", "rel", "target"],
     "img": ["src", "alt", "title"],
-    "*": ["class"],
+    "code": _code_class,
 }
 
 _ALLOWED_PROTOCOLS = ["http", "https", "mailto"]

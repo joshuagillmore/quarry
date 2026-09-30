@@ -2,17 +2,29 @@ services:
   web-researcher:
     build: .
     ports:
-      # Localhost-only by default: the app has no authentication, so anyone who
-      # can reach the port can run searches and spend LLM quota. To expose on
-      # your LAN (e.g. behind Tailscale), set QUARRY_BIND=0.0.0.0 in .env.
+      # Localhost-only by default: unless QUARRY_PASSWORD is set in .env,
+      # anyone who can reach the port can run searches and spend LLM quota.
+      # To expose on your LAN (e.g. behind Tailscale), set QUARRY_PASSWORD
+      # and QUARRY_BIND=0.0.0.0 in .env.
       - "${QUARRY_BIND:-127.0.0.1}:5000:5000"
     volumes:
       - ./data:/app/data
     env_file:
       - .env
+    environment:
+      # Passed through explicitly (not just via env_file) so the in-container
+      # exposure guard (insecure_exposure() in app.py) sees the same publish
+      # interface Compose actually used, even if QUARRY_BIND isn't in .env.
+      QUARRY_BIND: ${QUARRY_BIND:-127.0.0.1}
     shm_size: 1g
     restart: unless-stopped
+    # Give gunicorn's graceful_timeout (30s, gunicorn.conf.py) room to finish
+    # in-flight requests before Compose SIGKILLs the container on stop/restart.
+    stop_grace_period: 35s
     healthcheck:
+      # Liveness only. Startup (init_db, reconciliation, the scheduler) is
+      # gunicorn's post_worker_init now, not something this probe triggers —
+      # it just waits for the worker to already be serving.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5)"]
       interval: 30s
       timeout: 10s

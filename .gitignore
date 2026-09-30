@@ -1,6 +1,12 @@
-.env
+.env*
+!.env.example
 data/
-__pycache__/
+**/*.db
+**/*.db-journal
+**/secret_key
+**/settings.json
+**/settings.json.corrupt
+**/__pycache__/
 *.pyc
 .venv/
 venv/
@@ -8,3 +14,4 @@ venv/
 dist/
 build/
 .pytest_cache/
+.superpowers/
