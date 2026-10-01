@@ -228,13 +228,14 @@ run.
   "not attempted: stopped by user"; one already tried in an earlier pass
   keeps its last gap note.
 - **Resume after a limit.** When a mission stops on its token, source or
-  pass budget, or because you clicked Stop, before reaching every
-  requirement, the finished mission page says why ("Stopped: token budget
-  reached · 3 requirements still open") and offers **Resume**. Resume
-  raises that budget by the amount you enter (prefilled with the current
-  limit), reopens the requirements that were never tried, keeps every
+  pass budget, or because you clicked Stop, with requirements still open,
+  the finished mission page says why ("Stopped: token budget reached · 3
+  requirements still open") and offers **Resume**. Resume raises that
+  budget by the amount you enter (prefilled with the current limit),
+  reopens every requirement that still has attempts left, keeps every
   source already collected, and rewrites the brief. Satisfied requirements
-  are never re-run, and after a Stop nothing is raised.
+  and ones that used up their attempts are never re-run, and after a Stop
+  nothing is raised.
 
 ## Architecture
 

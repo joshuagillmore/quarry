@@ -116,11 +116,14 @@ runs a **Mission** against a question using an intelligence-collection loop:
   column existed and while a mission is running or has failed. A `done`
   mission with one of the four limit reasons gets a **Resume** control in
   the done-state telemetry actions (`POST /missions/<id>/resume`, one
-  `extra` field). It reopens only the requirements the run never reached
-  (`unmet` with `assessment_missing` starting `"not attempted:"`) plus any
-  still `pending`, clearing their assessment and keeping `attempts`;
-  satisfied and capped-out requirements are never re-run, and every
-  collected source is kept. It raises the limit that stopped the run:
+  `extra` field). It reopens every requirement still `pending` plus every
+  `unmet` one with attempts left (`attempts < per_req_attempts`, from
+  `budget_json`, else the agent's default) — never reached ("not
+  attempted: ...") or tried but still open when the run stopped, which is
+  how a `pass_budget` stop leaves them — clearing their assessment and
+  keeping `attempts`, so each gets only its remaining tries. Satisfied and
+  capped-out requirements are never re-run, and every collected source is
+  kept. It raises the limit that stopped the run:
   `max_llm_tokens += extra` (cumulative across runs, 1–5,000,000; an
   unlimited 0 stays 0), `max_sources += extra` (1–100) or `max_passes +=
   extra` (1–10), the last two being per-run budgets; after `user_stop`
@@ -129,8 +132,8 @@ runs a **Mission** against a question using an intelligence-collection loop:
   `JobLimitReached`), then `claim_mission_status(id, "done", "collecting")`,
   an undo list on any later failure, then `start_collection(id, job_id)`,
   so extraction re-runs if the mission has it and the brief is rewritten.
-  `_resumable` is the one rule behind the page control, `api_mission`'s
-  `resumable` flag and the route.
+  `_reopenable`/`_resumable` are the one rule behind the page control,
+  `api_mission`'s `resumable` flag and the route.
 - **Source of truth is SQLite, not the job store.** Mission status, requirements,
   and the brief live in the new tables (`agents`, `missions`, `requirements`,
   `mission_documents`). The in-memory job store (`jobs.create_mission_job`) only

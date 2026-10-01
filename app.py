@@ -1133,7 +1133,7 @@ def mission_view(mission_id):
         ext_ids=ext_ids, budget=budget,
         llm_usage=llm_usage, token_rows=_token_rows(llm_usage),
         max_llm_tokens=_budget_max_llm_tokens(budget),
-        resume=_resume_offer(mission, requirements, budget),
+        resume=_resume_offer(mission, requirements, budget, agent),
         has_parent=has_parent,
         live_state=live_state,
         live=mission.job_id in get_in_memory_job_ids(),
@@ -1237,21 +1237,37 @@ _STOP_LABELS = {
 _RESUME_TOKEN_PREFILL = 15000
 
 
-def _reopenable(requirements) -> list:
-    """The requirements a Resume puts back to work: those the stopped run
-    never reached (the runner marks them "not attempted: <reason>"), plus
-    any still pending. Satisfied and capped-out requirements never re-run."""
+def _attempt_cap(mission, agent=None) -> int:
+    """The per-requirement attempt cap collection ran under, read as
+    _run_collection reads it: the mission's budget_json per_req_attempts,
+    else the agent's default (3 once the agent is gone). The agent is only
+    looked up when the budget lacks the key and none was passed."""
+    budget = _mission_budget(mission)
+    if "per_req_attempts" not in budget and agent is None:
+        agent = run_async(get_agent(mission.agent_id))
+    default = agent.default_per_req_attempts if agent else 3
+    try:
+        return max(1, int(budget.get("per_req_attempts", default)))
+    except (TypeError, ValueError, OverflowError):
+        return max(1, int(default))
+
+
+def _reopenable(mission, requirements, agent=None) -> list:
+    """The requirements a Resume puts back to work: every one still
+    pending, plus every unmet one with attempts left (attempts below the
+    cap): never reached ("not attempted: ..."), or tried but still open
+    when the run stopped. Satisfied and capped-out requirements never
+    re-run. The one rule behind the route, the page and api_mission."""
+    cap = _attempt_cap(mission, agent)
     return [r for r in requirements
-            if r.status == "pending"
-            or (r.status == "unmet"
-                and (r.assessment_missing or "").startswith("not attempted:"))]
+            if r.status == "pending" or (r.status == "unmet" and r.attempts < cap)]
 
 
-def _resumable(mission, requirements) -> bool:
+def _resumable(mission, requirements, agent=None) -> bool:
     """True when a finished mission stopped on a limit (or a Stop) and has
-    something to reopen. One rule for the page, the API and the route."""
+    something to reopen."""
     return (mission.status == "done" and mission.stop_reason in _RESUMABLE_STOPS
-            and bool(_reopenable(requirements)))
+            and bool(_reopenable(mission, requirements, agent)))
 
 
 def _limit_value(budget: dict, stop_reason: str) -> int:
@@ -1276,13 +1292,13 @@ def _form_resume_extra(cap: int, default: int) -> int:
     return max(1, min(cap, extra))
 
 
-def _resume_offer(mission, requirements, budget: dict) -> dict | None:
+def _resume_offer(mission, requirements, budget: dict, agent=None) -> dict | None:
     """What the done-state Resume control shows, or None when the mission
     has nothing to resume. `field` is None after a user Stop (nothing to
     raise); otherwise it is prefilled with the limit's current value."""
-    if not _resumable(mission, requirements):
+    if not _resumable(mission, requirements, agent):
         return None
-    n = len(_reopenable(requirements))
+    n = len(_reopenable(mission, requirements, agent))
     offer = {"label": f"{_STOP_LABELS[mission.stop_reason]} · "
                       f"{n} requirement{'' if n == 1 else 's'} still open",
              "field": None}
@@ -1585,10 +1601,11 @@ def requirement_accept(mission_id, req_id):
 @app.route("/missions/<mission_id>/resume", methods=["POST"])
 def mission_resume(mission_id):
     """Pick a mission back up after its collection stopped on a limit (or a
-    Stop) with requirements still open: raise that limit, reopen the
-    requirements the run never reached, and collect again on a fresh job.
-    Sources already collected are kept, satisfied requirements are never
-    re-run, and the brief is rewritten as after a retask."""
+    Stop) with requirements still open: raise that limit, reopen every
+    requirement with attempts left, and collect again on a fresh job.
+    Sources already collected are kept, satisfied and capped-out
+    requirements are never re-run, and the brief is rewritten as after a
+    retask."""
     mission = run_async(get_mission(mission_id))
     if not mission:
         flash("Mission not found.", "error")
@@ -1596,7 +1613,7 @@ def mission_resume(mission_id):
     if mission.status != "done" or mission.stop_reason not in _RESUMABLE_STOPS:
         flash("This mission has nothing to resume.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
-    reopen = _reopenable(run_async(get_requirements_for_mission(mission_id)))
+    reopen = _reopenable(mission, run_async(get_requirements_for_mission(mission_id)))
     if not reopen:
         flash("Every requirement is satisfied or capped out — nothing to resume.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
@@ -1643,7 +1660,8 @@ def mission_resume(mission_id):
             mission_id, budget_json=mission.budget_json,
             resume_count=mission.resume_count, error=mission.error,
             stop_reason=mission.stop_reason, job_id=mission.job_id))))
-        # Reopened with their attempts kept: one never reached has 0.
+        # Reopened with their attempts kept, so each gets only the tries it
+        # has left (one never reached has 0).
         for r in reopen:
             run_async(update_requirement(
                 r.id, status="pending", assessment_missing="", assessment_confidence=""))

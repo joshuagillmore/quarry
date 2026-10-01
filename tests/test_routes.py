@@ -634,7 +634,8 @@ _STOPPED_BUDGET = {"max_sources": 7, "max_passes": 2, "per_req_attempts": 3,
 
 def _seed_stopped(stop_reason="token_budget", budget=None, status="done"):
     """A finished mission whose collection stopped on a limit: r0 satisfied,
-    r1 never reached, r2 capped out after every attempt, r3 still pending."""
+    r1 never reached, r2 capped out after every attempt (3 of 3), r3 still
+    pending."""
     _seed_mission(status=status, n_reqs=4)
     _run(storage.update_mission(
         "m1", stop_reason=stop_reason, brief_markdown="old brief",
@@ -779,21 +780,82 @@ def test_resume_refused_for_a_mission_that_did_not_stop_on_a_limit(
     assert _flashes(client) == ["This mission has nothing to resume."]
 
 
-def test_resume_does_not_reopen_a_requirement_the_run_already_tried(client, starts):
-    """The brief's rule: only never-reached ("not attempted: ...") and
-    pending requirements reopen. One the run tried, that still has
-    attempts left but was marked unmet with its gap when the run ended,
-    stays as it is."""
+def test_resume_after_a_pass_budget_reopens_requirements_with_attempts_left(
+        client, starts):
+    """A pass-budget stop tries every requirement in its first pass, so none
+    is "not attempted": the ones still open were marked unmet with their
+    last gap while they had attempts left. Resume reopens exactly those,
+    attempts kept, so each only gets its remaining tries."""
+    _seed_stopped("pass_budget")
+    _run(storage.update_requirement("r1", status="unmet", attempts=1,
+                                    assessment_missing="gap after one pass",
+                                    assessment_confidence="low"))
+    _run(storage.update_requirement("r3", status="unmet", attempts=2,
+                                    assessment_missing="gap after two passes",
+                                    assessment_confidence="medium"))
+    before = _reqs()
+    assert client.get("/api/mission/m1").get_json()["resumable"] is True
+    assert _resume_form(client.get("/missions/m1").get_data(as_text=True)) is not None
+
+    client.post("/missions/m1/resume", data={"extra": "2"})
+
+    reqs = _reqs()
+    for rid, attempts in (("r1", 1), ("r3", 2)):
+        assert (reqs[rid].status, reqs[rid].attempts) == ("pending", attempts)
+        assert not reqs[rid].assessment_missing and not reqs[rid].assessment_confidence
+    assert reqs["r0"] == before["r0"] and reqs["r2"] == before["r2"]
+    assert _budget()["max_passes"] == 4
+    assert _mission().status == "collecting" and len(starts) == 1
+    assert _flashes(client) == [
+        "Resuming — 2 requirements reopened, pass budget raised to 4."]
+
+
+def test_resume_leaves_a_capped_requirement_alone(client, starts):
     _seed_stopped()
-    _run(storage.update_requirement("r3", status="unmet", attempts=1,
-                                    assessment_missing="gap after one pass"))
+    _run(storage.update_requirement("r3", status="unmet", attempts=3,   # 3 of 3
+                                    assessment_missing="still nothing",
+                                    assessment_confidence="low"))
+    before = _reqs()
+    client.post("/missions/m1/resume", data={"extra": "500"})
+    reqs = _reqs()
+    assert reqs["r1"].status == "pending"
+    assert reqs["r2"] == before["r2"] and reqs["r3"] == before["r3"]
+    assert _flashes(client) == [
+        "Resuming — 1 requirement reopened, token budget raised to 1,500."]
+
+
+def test_resume_attempt_cap_falls_back_to_the_agent_default(client, starts):
+    """A budget without per_req_attempts is capped at the agent's default,
+    as the runner reads it."""
+    _seed_stopped(budget={k: v for k, v in _STOPPED_BUDGET.items()
+                          if k != "per_req_attempts"})
+    _run(storage.update_agent("a1", default_per_req_attempts=2))
+    _run(storage.update_requirement("r1", status="unmet", attempts=1,
+                                    assessment_missing="gap"))     # 1 of 2: open
+    _run(storage.update_requirement("r3", status="unmet", attempts=2,
+                                    assessment_missing="gap"))     # 2 of 2: capped
+    before = _reqs()
+    assert client.get("/api/mission/m1").get_json()["resumable"] is True
+    client.post("/missions/m1/resume", data={"extra": "500"})
+    reqs = _reqs()
+    assert (reqs["r1"].status, reqs["r1"].attempts) == ("pending", 1)
+    assert reqs["r2"] == before["r2"] and reqs["r3"] == before["r3"]
+
+
+def test_resume_attempt_cap_without_the_agent_is_three(client, starts):
+    _seed_stopped(budget={k: v for k, v in _STOPPED_BUDGET.items()
+                          if k != "per_req_attempts"})
+    _run(storage.update_agent("a1", default_per_req_attempts=6))
+    _run(storage.delete_agent("a1"))
+    _run(storage.update_requirement("r1", status="unmet", attempts=2,
+                                    assessment_missing="gap"))     # 2 of 3: open
+    _run(storage.update_requirement("r3", status="unmet", attempts=3,
+                                    assessment_missing="gap"))     # 3 of 3: capped
     before = _reqs()
     client.post("/missions/m1/resume", data={"extra": "500"})
     reqs = _reqs()
     assert reqs["r1"].status == "pending"
     assert reqs["r3"] == before["r3"]
-    assert _flashes(client) == [
-        "Resuming — 1 requirement reopened, token budget raised to 1,500."]
 
 
 def test_resume_refused_when_nothing_is_reopenable(client, starts):
