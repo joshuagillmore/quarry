@@ -1299,29 +1299,54 @@ def _tokens_spent(budget: dict, used: int) -> bool:
     return cap > 0 and used >= cap
 
 
+def _token_prefill(budget: dict, used: int) -> int:
+    """The token field's prefill: the stored budget plus however far usage
+    has overshot it, so the resumed run gets a full budget of headroom (a
+    run only stops at the first checkpoint after crossing its budget, so a
+    token stop has always overshot). Clamped to 1..MAX_LLM_TOKENS_INPUT."""
+    cap = _budget_max_llm_tokens(budget)
+    if cap <= 0:
+        return _RESUME_TOKEN_PREFILL
+    return max(1, min(MAX_LLM_TOKENS_INPUT, cap + max(0, used - cap)))
+
+
+def _resume_prefill(budget: dict, stop_reason: str, used: int) -> int:
+    """What the `extra` field is prefilled with, and what a blank or
+    unreadable `extra` means: the token prefill after a token stop, else
+    the limit's current value, clamped like the field."""
+    if stop_reason == "token_budget":
+        return _token_prefill(budget, used)
+    _key, _name, cap, _unit = _RESUME_LIMITS[stop_reason]
+    return max(1, min(cap, _limit_value(budget, stop_reason)))
+
+
 def _resume_offer(mission, requirements, budget: dict, agent=None,
                   used_tokens: int = 0) -> dict | None:
     """What the done-state Resume control shows, or None when the mission
     has nothing to resume. `fields` holds the number inputs: `extra` for
-    the limit that stopped the run (none after a user Stop), prefilled with
-    its current value, and `extra_tokens` when the token budget is spent
-    and the stop was not the token budget itself (that one's `extra` is
-    already the token field)."""
+    the limit that stopped the run (none after a user Stop), and
+    `extra_tokens` when the token budget is spent and the stop was not the
+    token budget itself (that one's `extra` is already the token field).
+    Wherever a token field shows, the label says how much was used."""
     if not _resumable(mission, requirements, agent):
         return None
+    stop = mission.stop_reason
     n = len(_reopenable(mission, requirements, agent))
-    fields = []
-    limit = _RESUME_LIMITS.get(mission.stop_reason)
+    token_cap = _budget_max_llm_tokens(budget)
+    fields, usage_note = [], ""
+    limit = _RESUME_LIMITS.get(stop)
     if limit:
         _key, name, cap, unit = limit
-        current = _limit_value(budget, mission.stop_reason) or _RESUME_TOKEN_PREFILL
         fields.append({"input": "extra", "name": name, "unit": unit, "max": cap,
-                       "value": max(1, min(cap, current))})
-    if mission.stop_reason != "token_budget" and _tokens_spent(budget, used_tokens):
+                       "value": _resume_prefill(budget, stop, used_tokens)})
+    if stop == "token_budget" and token_cap > 0:
+        usage_note = f" · {used_tokens:,} of {token_cap:,} used"
+    elif _tokens_spent(budget, used_tokens):
         fields.append({"input": "extra_tokens", "name": "token budget", "unit": "tokens",
                        "max": MAX_LLM_TOKENS_INPUT,
-                       "value": min(MAX_LLM_TOKENS_INPUT, _budget_max_llm_tokens(budget))})
-    return {"label": f"{_STOP_LABELS[mission.stop_reason]} · "
+                       "value": _token_prefill(budget, used_tokens)})
+        usage_note = f" · {used_tokens:,} of {token_cap:,} tokens used"
+    return {"label": f"{_STOP_LABELS[stop]}{usage_note} · "
                      f"{n} requirement{'' if n == 1 else 's'} still open",
             "fields": fields}
 
@@ -1637,6 +1662,11 @@ def mission_resume(mission_id):
     # The raised budget, worked out before anything changes. max_llm_tokens
     # is cumulative across runs; max_sources/max_passes are per run.
     budget = _mission_budget(mission)
+    token_cap = _budget_max_llm_tokens(budget)
+    used = 0
+    if token_cap > 0:
+        usage = run_async(get_mission_llm_usage(mission_id))
+        used = usage["prompt_tokens"] + usage["completion_tokens"]
     raised = dict(budget)
     notes = []
     limit = _RESUME_LIMITS.get(mission.stop_reason)
@@ -1645,13 +1675,12 @@ def mission_resume(mission_id):
         current = _limit_value(raised, mission.stop_reason)
         if current > 0:            # an unlimited (0) token budget stays unlimited
             extra = _form_count("extra", cap)
-            # Blank or unreadable: the current value, as the field is prefilled.
-            raised[key] = current + (extra if extra is not None
-                                     else max(1, min(cap, current)))
+            if extra is None:      # blank or unreadable: what the field is prefilled with
+                extra = _resume_prefill(budget, mission.stop_reason, used)
+            raised[key] = current + extra
             notes.append(f"{name} raised to {raised[key]:,}")
     # Any other stop may raise the token budget as well (extra_tokens); a
     # token-budget stop's `extra` already is that raise.
-    token_cap = _budget_max_llm_tokens(budget)
     if mission.stop_reason != "token_budget" and token_cap > 0:
         extra_tokens = _form_count("extra_tokens", MAX_LLM_TOKENS_INPUT)
         if extra_tokens is not None:
@@ -1660,13 +1689,10 @@ def mission_resume(mission_id):
     # A spent token budget stops the resumed run before its first
     # requirement, yet the brief would still be re-written: unless the raise
     # takes the budget past what was used, refuse before anything changes.
-    if token_cap > 0:
-        usage = run_async(get_mission_llm_usage(mission_id))
-        used = usage["prompt_tokens"] + usage["completion_tokens"]
-        if _tokens_spent(raised, used):
-            flash(f"This mission has used {used:,} of its {token_cap:,}-token budget; "
-                  f"raise the token budget above {used:,} to resume.", "error")
-            return redirect(url_for("mission_view", mission_id=mission_id))
+    if token_cap > 0 and _tokens_spent(raised, used):
+        flash(f"This mission has used {used:,} of its {token_cap:,}-token budget; "
+              f"raise the token budget above {used:,} to resume.", "error")
+        return redirect(url_for("mission_view", mission_id=mission_id))
 
     # The job first, as for a retask: if the queue is full, nothing about
     # the mission or its requirements has changed yet.

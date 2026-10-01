@@ -951,17 +951,23 @@ def _resume_form(html):
     return m.group(0) if m else None
 
 
-@pytest.mark.parametrize("stop_reason, label, value, cap", [
-    ("token_budget", "Stopped: token budget reached · 2 requirements still open",
-     "1000", "5000000"),
-    ("source_budget", "Stopped: source budget reached · 2 requirements still open",
+@pytest.mark.parametrize("stop_reason, spent, label, value, cap", [
+    # A token stop has overshot its budget (the run stops at the next
+    # checkpoint after crossing it): the prefill is the original budget plus
+    # that overshoot, so the resumed run gets a full budget of headroom.
+    ("token_budget", 1300,
+     "Stopped: token budget reached · 1,300 of 1,000 used · 2 requirements still open",
+     "1300", "5000000"),
+    ("source_budget", 0, "Stopped: source budget reached · 2 requirements still open",
      "7", "100"),
-    ("pass_budget", "Stopped: pass budget reached · 2 requirements still open",
+    ("pass_budget", 0, "Stopped: pass budget reached · 2 requirements still open",
      "2", "10"),
 ])
-def test_mission_page_offers_resume_with_the_limit_prefilled(client, stop_reason, label,
-                                                            value, cap):
+def test_mission_page_offers_resume_with_the_limit_prefilled(client, stop_reason, spent,
+                                                            label, value, cap):
     _seed_stopped(stop_reason)
+    if spent:
+        _spend_tokens("m1", spent)
     html = client.get("/missions/m1").get_data(as_text=True)
     form = _resume_form(html)
     assert form is not None
@@ -1111,20 +1117,47 @@ def _inputs(form):
 
 def test_mission_page_adds_a_token_field_when_the_tokens_are_spent(client):
     _seed_stopped("source_budget")
-    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
-    assert _inputs(form) == [("extra", "7")]
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert _inputs(_resume_form(html)) == [("extra", "7")]
+    assert "tokens used" not in html
     _spend_tokens("m1", 1000)
-    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    form = _resume_form(html)
     assert _inputs(form) == [("extra", "7"), ("extra_tokens", "1000")]
     assert re.search(r'<input[^>]*name="extra_tokens"[^>]*required', form)
     assert 'max="5000000"' in form
+    assert ("Stopped: source budget reached · 1,000 of 1,000 tokens used · "
+            "2 requirements still open") in html
+
+
+def test_mission_page_extra_tokens_prefill_covers_the_overshoot(client):
+    _seed_stopped("pass_budget")
+    _spend_tokens("m1", 1250)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert _inputs(_resume_form(html)) == [("extra", "2"), ("extra_tokens", "1250")]
+    assert "1,250 of 1,000 tokens used" in html
 
 
 def test_mission_page_token_stop_shows_one_token_field(client):
     _seed_stopped("token_budget")
     _spend_tokens("m1", 1200)
     form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
-    assert _inputs(form) == [("extra", "1000")]
+    assert _inputs(form) == [("extra", "1200")]
+
+
+def test_mission_page_token_prefill_is_clamped(client):
+    _seed_stopped("token_budget", budget={**_STOPPED_BUDGET, "max_llm_tokens": 4_000_000})
+    _spend_tokens("m1", 7_000_000)
+    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    assert _inputs(form) == [("extra", "5000000")]
+
+
+def test_resume_blank_extra_after_a_token_stop_uses_the_overshoot_prefill(client, starts):
+    _seed_stopped("token_budget")
+    _spend_tokens("m1", 1300)
+    client.post("/missions/m1/resume", data={"extra": ""})
+    assert _budget()["max_llm_tokens"] == 1000 + 1300   # 1,000 of headroom past 1,300
+    assert len(starts) == 1
 
 
 def test_mission_page_user_stop_over_budget_shows_only_the_token_field(client):

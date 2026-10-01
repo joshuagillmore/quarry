@@ -132,10 +132,14 @@ runs a **Mission** against a question using an intelligence-collection loop:
   is bounded only by its own clamp); that is accepted. Whatever the stop, a
   token budget (> 0) that is already used up must be raised too, or the
   resumed run would stop before its first requirement and still re-write
-  the brief: the form adds an `extra_tokens` field (1–5,000,000, prefilled
-  with `max_llm_tokens`) when usage ≥ budget — after a `token_budget` stop
-  `extra` already is that field — and the route refuses, with nothing
-  changed, unless the raise takes the budget past the tokens used. It
+  the brief: the form adds an `extra_tokens` field (1–5,000,000) when
+  usage ≥ budget — after a `token_budget` stop `extra` already is that
+  field — and the route refuses, with nothing changed, unless the raise
+  takes the budget past the tokens used. A token field is prefilled with
+  `max_llm_tokens + max(0, used - max_llm_tokens)` (a run stops only at
+  the first checkpoint after crossing its budget, so it has overshot), so
+  the resumed run gets a full budget of headroom, and the label shows the
+  usage ("13,921 of 8,000 used"). It
   increments `resume_count`, clears `error` and
   `stop_reason`, and follows the retask shape: job first (Busy on
   `JobLimitReached`), then `claim_mission_status(id, "done", "collecting")`,
