@@ -235,7 +235,9 @@ run.
   reopens every requirement that still has attempts left, keeps every
   source already collected, and rewrites the brief. Satisfied requirements
   and ones that used up their attempts are never re-run, and after a Stop
-  nothing is raised.
+  nothing is raised. If the mission has also used up its token budget,
+  Resume asks for more tokens too, since the run would otherwise stop
+  straight away.
 
 ## Architecture
 

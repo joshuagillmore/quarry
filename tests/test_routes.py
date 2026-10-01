@@ -1005,6 +1005,135 @@ def test_mission_page_has_no_resume_with_nothing_reopenable(client):
     assert "/missions/m1/resume" not in html
 
 
+# --- resume: a spent token budget must be raised too ----------------------
+
+_SPENT_FLASH = ("This mission has used 1,000 of its 1,000-token budget; "
+                "raise the token budget above 1,000 to resume.")
+
+
+def test_resume_source_stop_over_its_token_budget_refused_without_extra_tokens(
+        client, starts):
+    """The resumed run would stop on the token budget before its first
+    requirement (and still re-write the brief), so it is refused with
+    nothing changed, not even a job created."""
+    _seed_stopped("source_budget")
+    _spend_tokens("m1", 1000)                  # exactly the budget: none left
+    before = _snapshot()
+    r = client.post("/missions/m1/resume", data={"extra": "5"})
+    assert _path(r) == "/missions/m1"
+    assert _snapshot() == before
+    assert starts == [] and not jobs._store
+    assert _flashes(client) == [_SPENT_FLASH]
+
+
+@pytest.mark.parametrize("raw", ["", "lots"], ids=["blank", "junk"])
+def test_resume_unreadable_extra_tokens_counts_as_not_given(client, starts, raw):
+    _seed_stopped("source_budget")
+    _spend_tokens("m1", 1000)
+    before = _snapshot()
+    client.post("/missions/m1/resume", data={"extra": "5", "extra_tokens": raw})
+    assert _snapshot() == before and starts == []
+    assert _flashes(client) == [_SPENT_FLASH]
+
+
+def test_resume_source_stop_over_its_token_budget_resumes_with_extra_tokens(
+        client, starts):
+    _seed_stopped("source_budget")
+    _spend_tokens("m1", 1000)
+    client.post("/missions/m1/resume", data={"extra": "5", "extra_tokens": "1000"})
+    assert _budget() == {**_STOPPED_BUDGET, "max_sources": 12, "max_llm_tokens": 2000}
+    m = _mission()
+    assert m.status == "collecting" and starts == [("m1", m.job_id, m.job_id)]
+    assert _flashes(client) == [
+        "Resuming — 2 requirements reopened, source budget raised to 12, "
+        "token budget raised to 2,000."]
+
+
+def test_resume_user_stop_over_its_token_budget_raises_only_the_tokens(client, starts):
+    _seed_stopped("user_stop")
+    _spend_tokens("m1", 1200)
+    client.post("/missions/m1/resume", data={"extra": "9", "extra_tokens": "800"})
+    assert _budget() == {**_STOPPED_BUDGET, "max_llm_tokens": 1800}
+    assert _flashes(client) == [
+        "Resuming — 2 requirements reopened, token budget raised to 1,800."]
+
+
+def test_resume_refused_when_the_raise_still_leaves_the_tokens_spent(client, starts):
+    _seed_stopped("pass_budget")
+    _spend_tokens("m1", 1500)
+    before = _snapshot()
+    client.post("/missions/m1/resume", data={"extra": "1", "extra_tokens": "500"})
+    assert _snapshot() == before and starts == []
+    assert _flashes(client) == [
+        "This mission has used 1,500 of its 1,000-token budget; "
+        "raise the token budget above 1,500 to resume."]
+
+
+def test_resume_token_stop_uses_extra_as_its_one_token_field(client, starts):
+    """For a token-budget stop `extra` is the token raise; a stray
+    extra_tokens is ignored, and a raise that is still not enough is
+    refused."""
+    _seed_stopped("token_budget")
+    _spend_tokens("m1", 3000)
+    before = _snapshot()
+    client.post("/missions/m1/resume", data={"extra": "500", "extra_tokens": "9000"})
+    assert _snapshot() == before and starts == []
+    assert _flashes(client) == [
+        "This mission has used 3,000 of its 1,000-token budget; "
+        "raise the token budget above 3,000 to resume."]
+    client.post("/missions/m1/resume", data={"extra": "2500", "extra_tokens": "9000"})
+    assert _budget()["max_llm_tokens"] == 3500
+    assert len(starts) == 1
+
+
+@pytest.mark.parametrize("raw, want", [("99999999", 1000 + 5_000_000), ("0", 1001),
+                                       ("-7", 1001)],
+                         ids=["high", "zero", "negative"])
+def test_resume_extra_tokens_is_clamped(client, starts, raw, want):
+    _seed_stopped("source_budget")
+    _spend_tokens("m1", 1000)
+    client.post("/missions/m1/resume", data={"extra": "1", "extra_tokens": raw})
+    assert _budget()["max_llm_tokens"] == want
+    assert len(starts) == 1
+
+
+def test_resume_extra_tokens_never_limits_an_unlimited_budget(client, starts):
+    _seed_stopped("source_budget", budget={**_STOPPED_BUDGET, "max_llm_tokens": 0})
+    _spend_tokens("m1", 10 ** 6)
+    client.post("/missions/m1/resume", data={"extra": "1", "extra_tokens": "500"})
+    assert _budget()["max_llm_tokens"] == 0
+    assert len(starts) == 1
+
+
+def _inputs(form):
+    return re.findall(r'<input[^>]*name="(extra(?:_tokens)?)"[^>]*value="(\d+)"', form)
+
+
+def test_mission_page_adds_a_token_field_when_the_tokens_are_spent(client):
+    _seed_stopped("source_budget")
+    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    assert _inputs(form) == [("extra", "7")]
+    _spend_tokens("m1", 1000)
+    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    assert _inputs(form) == [("extra", "7"), ("extra_tokens", "1000")]
+    assert re.search(r'<input[^>]*name="extra_tokens"[^>]*required', form)
+    assert 'max="5000000"' in form
+
+
+def test_mission_page_token_stop_shows_one_token_field(client):
+    _seed_stopped("token_budget")
+    _spend_tokens("m1", 1200)
+    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    assert _inputs(form) == [("extra", "1000")]
+
+
+def test_mission_page_user_stop_over_budget_shows_only_the_token_field(client):
+    _seed_stopped("user_stop")
+    _spend_tokens("m1", 1000)
+    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    assert _inputs(form) == [("extra_tokens", "1000")]
+
+
 # --- delete -------------------------------------------------------------
 
 def test_delete_at_the_gate_releases_a_live_job(client):

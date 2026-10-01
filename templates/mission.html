@@ -156,12 +156,15 @@
       {% if resume %}
       <form method="post" action="/missions/{{ mission.id }}/resume" style="margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px">
         <span class="mono" style="font-size:11px;color:var(--fg-subtle)">{{ resume.label }}</span>
-        {% if resume.field %}
-        <input type="number" class="select" style="width:96px" name="extra"
-               min="1" max="{{ resume.field.max }}" step="1" value="{{ resume.field.value }}" required
-               aria-label="Add to the {{ resume.field.name }}"
-               title="How much to add to the {{ resume.field.name }} before collecting again">
-        {% endif %}
+        {% for f in resume.fields %}
+        <label style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--fg-subtle)">+
+          <input type="number" class="select" style="width:96px" name="{{ f.input }}"
+                 min="1" max="{{ f.max }}" step="1" value="{{ f.value }}" required
+                 aria-label="Add to the {{ f.name }}"
+                 title="How much to add to the {{ f.name }} before collecting again">
+          {{ f.unit }}
+        </label>
+        {% endfor %}
         <button type="submit" class="btn btn-sm" title="Reopen the requirements left open and collect again; sources already collected are kept">
           <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.5v9l7-4.5z"/></svg>
           Resume

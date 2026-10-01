@@ -1133,7 +1133,8 @@ def mission_view(mission_id):
         ext_ids=ext_ids, budget=budget,
         llm_usage=llm_usage, token_rows=_token_rows(llm_usage),
         max_llm_tokens=_budget_max_llm_tokens(budget),
-        resume=_resume_offer(mission, requirements, budget, agent),
+        resume=_resume_offer(mission, requirements, budget, agent,
+                             llm_usage["prompt_tokens"] + llm_usage["completion_tokens"]),
         has_parent=has_parent,
         live_state=live_state,
         live=mission.job_id in get_in_memory_job_ids(),
@@ -1218,11 +1219,12 @@ def _budget_max_passes(budget: dict) -> int:
 _RESUMABLE_STOPS = ("pass_budget", "source_budget", "token_budget", "user_stop")
 
 # Per limit: the budget_json key a Resume raises, its name in plain words,
-# and the most one Resume may add. A user Stop raises nothing.
+# the most one Resume may add, and the unit shown beside its field. A user
+# Stop raises nothing.
 _RESUME_LIMITS = {
-    "token_budget": ("max_llm_tokens", "token budget", MAX_LLM_TOKENS_INPUT),
-    "source_budget": ("max_sources", "source budget", 100),
-    "pass_budget": ("max_passes", "pass budget", 10),
+    "token_budget": ("max_llm_tokens", "token budget", MAX_LLM_TOKENS_INPUT, "tokens"),
+    "source_budget": ("max_sources", "source budget", 100, "sources"),
+    "pass_budget": ("max_passes", "pass budget", 10, "passes"),
 }
 
 _STOP_LABELS = {
@@ -1280,34 +1282,48 @@ def _limit_value(budget: dict, stop_reason: str) -> int:
     return _budget_max_passes(budget)
 
 
-def _form_resume_extra(cap: int, default: int) -> int:
-    """The Resume form's `extra`, clamped to 1..cap. Blank or unreadable
-    input means `default`, the limit's current value (what the field is
-    prefilled with)."""
-    raw = (request.form.get("extra") or "").strip()[:20]
+def _form_count(field: str, cap: int) -> int | None:
+    """A Resume form number clamped to 1..cap, or None when the field is
+    missing, blank or unreadable."""
+    raw = (request.form.get(field) or "").strip()[:20]
     try:
-        extra = int(raw)
+        return max(1, min(cap, int(raw)))
     except ValueError:
-        extra = default
-    return max(1, min(cap, extra))
+        return None
 
 
-def _resume_offer(mission, requirements, budget: dict, agent=None) -> dict | None:
+def _tokens_spent(budget: dict, used: int) -> bool:
+    """True when the mission has a token budget and has used all of it: a
+    run resumed like that stops before its first requirement."""
+    cap = _budget_max_llm_tokens(budget)
+    return cap > 0 and used >= cap
+
+
+def _resume_offer(mission, requirements, budget: dict, agent=None,
+                  used_tokens: int = 0) -> dict | None:
     """What the done-state Resume control shows, or None when the mission
-    has nothing to resume. `field` is None after a user Stop (nothing to
-    raise); otherwise it is prefilled with the limit's current value."""
+    has nothing to resume. `fields` holds the number inputs: `extra` for
+    the limit that stopped the run (none after a user Stop), prefilled with
+    its current value, and `extra_tokens` when the token budget is spent
+    and the stop was not the token budget itself (that one's `extra` is
+    already the token field)."""
     if not _resumable(mission, requirements, agent):
         return None
     n = len(_reopenable(mission, requirements, agent))
-    offer = {"label": f"{_STOP_LABELS[mission.stop_reason]} · "
-                      f"{n} requirement{'' if n == 1 else 's'} still open",
-             "field": None}
+    fields = []
     limit = _RESUME_LIMITS.get(mission.stop_reason)
     if limit:
-        _key, name, cap = limit
+        _key, name, cap, unit = limit
         current = _limit_value(budget, mission.stop_reason) or _RESUME_TOKEN_PREFILL
-        offer["field"] = {"name": name, "max": cap, "value": max(1, min(cap, current))}
-    return offer
+        fields.append({"input": "extra", "name": name, "unit": unit, "max": cap,
+                       "value": max(1, min(cap, current))})
+    if mission.stop_reason != "token_budget" and _tokens_spent(budget, used_tokens):
+        fields.append({"input": "extra_tokens", "name": "token budget", "unit": "tokens",
+                       "max": MAX_LLM_TOKENS_INPUT,
+                       "value": min(MAX_LLM_TOKENS_INPUT, _budget_max_llm_tokens(budget))})
+    return {"label": f"{_STOP_LABELS[mission.stop_reason]} · "
+                     f"{n} requirement{'' if n == 1 else 's'} still open",
+            "fields": fields}
 
 
 _MAX_PLAN_ROWS = 50   # a drafted plan is a handful of requirements
@@ -1620,15 +1636,37 @@ def mission_resume(mission_id):
 
     # The raised budget, worked out before anything changes. max_llm_tokens
     # is cumulative across runs; max_sources/max_passes are per run.
-    raised = dict(_mission_budget(mission))
-    raise_note = ""
+    budget = _mission_budget(mission)
+    raised = dict(budget)
+    notes = []
     limit = _RESUME_LIMITS.get(mission.stop_reason)
     if limit:
-        key, name, cap = limit
+        key, name, cap, _unit = limit
         current = _limit_value(raised, mission.stop_reason)
         if current > 0:            # an unlimited (0) token budget stays unlimited
-            raised[key] = current + _form_resume_extra(cap, current)
-            raise_note = f", {name} raised to {raised[key]:,}"
+            extra = _form_count("extra", cap)
+            # Blank or unreadable: the current value, as the field is prefilled.
+            raised[key] = current + (extra if extra is not None
+                                     else max(1, min(cap, current)))
+            notes.append(f"{name} raised to {raised[key]:,}")
+    # Any other stop may raise the token budget as well (extra_tokens); a
+    # token-budget stop's `extra` already is that raise.
+    token_cap = _budget_max_llm_tokens(budget)
+    if mission.stop_reason != "token_budget" and token_cap > 0:
+        extra_tokens = _form_count("extra_tokens", MAX_LLM_TOKENS_INPUT)
+        if extra_tokens is not None:
+            raised["max_llm_tokens"] = token_cap + extra_tokens
+            notes.append(f"token budget raised to {raised['max_llm_tokens']:,}")
+    # A spent token budget stops the resumed run before its first
+    # requirement, yet the brief would still be re-written: unless the raise
+    # takes the budget past what was used, refuse before anything changes.
+    if token_cap > 0:
+        usage = run_async(get_mission_llm_usage(mission_id))
+        used = usage["prompt_tokens"] + usage["completion_tokens"]
+        if _tokens_spent(raised, used):
+            flash(f"This mission has used {used:,} of its {token_cap:,}-token budget; "
+                  f"raise the token budget above {used:,} to resume.", "error")
+            return redirect(url_for("mission_view", mission_id=mission_id))
 
     # The job first, as for a retask: if the queue is full, nothing about
     # the mission or its requirements has changed yet.
@@ -1675,8 +1713,8 @@ def mission_resume(mission_id):
         _rollback(mission_id, undo)
         raise
     n = len(reopen)
-    flash(f"Resuming — {n} requirement{'' if n == 1 else 's'} reopened{raise_note}.",
-          "success")
+    flash(f"Resuming — {n} requirement{'' if n == 1 else 's'} reopened"
+          f"{''.join(', ' + note for note in notes)}.", "success")
     return redirect(url_for("mission_view", mission_id=mission_id))
 
 

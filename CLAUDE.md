@@ -127,7 +127,16 @@ runs a **Mission** against a question using an intelligence-collection loop:
   `max_llm_tokens += extra` (cumulative across runs, 1–5,000,000; an
   unlimited 0 stays 0), `max_sources += extra` (1–100) or `max_passes +=
   extra` (1–10), the last two being per-run budgets; after `user_stop`
-  nothing is raised. It increments `resume_count`, clears `error` and
+  nothing is raised. Each later run gets a raised `max_sources`/`max_passes`
+  in full, so repeated resumes grow them with no overall cap (each resume
+  is bounded only by its own clamp); that is accepted. Whatever the stop, a
+  token budget (> 0) that is already used up must be raised too, or the
+  resumed run would stop before its first requirement and still re-write
+  the brief: the form adds an `extra_tokens` field (1–5,000,000, prefilled
+  with `max_llm_tokens`) when usage ≥ budget — after a `token_budget` stop
+  `extra` already is that field — and the route refuses, with nothing
+  changed, unless the raise takes the budget past the tokens used. It
+  increments `resume_count`, clears `error` and
   `stop_reason`, and follows the retask shape: job first (Busy on
   `JobLimitReached`), then `claim_mission_status(id, "done", "collecting")`,
   an undo list on any later failure, then `start_collection(id, job_id)`,
