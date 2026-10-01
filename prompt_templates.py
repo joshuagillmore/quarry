@@ -65,7 +65,7 @@ WHAT IT NEEDS: {description}
 
 COLLECTED SOURCES (title + excerpt):
 {sources}
-
+{search_note}
 Decide if these sources, taken together, give a well-grounded answer to the \
 requirement. To count as satisfied they must cover the requirement's specific \
 substance — the facts, mechanisms, or evidence it asks for — not merely mention \
@@ -83,10 +83,15 @@ Respond with ONLY valid JSON in exactly this shape:
 }}"""
 
 
-def build_assess_prompt(title: str, description: str, sources_block: str) -> str:
+def build_assess_prompt(title: str, description: str, sources_block: str,
+                        search_note: str = "") -> str:
+    """`search_note` is an optional one-line summary of what this pass's
+    searches returned (e.g. "Search coverage this pass: 3 queries, 11
+    results (brave)"), so the grader can tell thin coverage from a thin web."""
     return ASSESS_INSTRUCTION.format(
         title=title, description=description or "(no detail given)",
         sources=sources_block or "(no sources collected yet)",
+        search_note=f"\n{search_note}\n" if search_note else "",
     )
 
 
@@ -105,7 +110,7 @@ SOURCES (numbered; cite them as [n]):
 {delta}
 Write the brief in Markdown with these sections:
 ## Summary
-A 3-5 sentence answer to the question.
+A 3-5 sentence answer to the question, citing its sources inline as [n].
 ## Key Findings
 Bullet points of the most important findings. Cite supporting sources inline as \
 [n]. Only state what the sources support.

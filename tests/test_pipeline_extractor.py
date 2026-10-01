@@ -43,3 +43,13 @@ def test_json_arrays_are_kept_whole(monkeypatch):
     assert _extract(monkeypatch, json.dumps(rows)) == rows
     assert _extract(monkeypatch, "```json\n" + json.dumps(rows) + "\n```") == rows
     assert _extract(monkeypatch, "[1, 2]") == [1, 2]
+
+
+def test_extractor_tags_its_call_with_purpose_and_mission(monkeypatch):
+    seen = []
+    monkeypatch.setattr(extractor, "chat_ex",
+                        lambda *a, **k: seen.append(k) or ('{"a": 1}', "model-x"))
+    extractor.extract_from_document(_doc(), mission_id="m1")
+    extractor.extract_from_document(_doc())
+    assert [(k["purpose"], k["mission_id"]) for k in seen] == [
+        ("extract", "m1"), ("extract", None)]

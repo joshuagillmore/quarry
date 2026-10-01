@@ -51,6 +51,14 @@ def _is_web_url(url: str) -> bool:
 def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
     """First engine that returns anything wins. Returns [] only when every
     engine fails or genuinely has nothing."""
+    return web_search_ex(query, max_results)[0]
+
+
+def web_search_ex(query: str, max_results: int = 5) -> tuple[list[SearchResult], str | None]:
+    """web_search, plus the engine (ddgs backend) that answered: (results,
+    engine). The engine is None when no engine produced any results, so a
+    caller can record search coverage and tell "nothing out there" from
+    "found it on the third engine"."""
     last_error = None
     for backend in _backends():
         for attempt in range(_ATTEMPTS_PER_ENGINE):
@@ -81,10 +89,10 @@ def web_search(query: str, max_results: int = 5) -> list[SearchResult]:
                     print(f"[SEARCH] '{query[:60]}' served by fallback engine "
                           f"'{backend}' ({len(results)} results)",
                           file=sys.stderr, flush=True)
-                return results
+                return results, backend
             break  # engine answered with nothing; try the next one
 
     print(f"[SEARCH] no results for '{query[:60]}' from any engine "
           f"({type(last_error).__name__ if last_error else 'all empty'})",
           file=sys.stderr, flush=True)
-    return []
+    return [], None

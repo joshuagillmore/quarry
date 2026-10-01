@@ -126,8 +126,8 @@ def test_cancel_skips_every_unfetched_page_when_asked(monkeypatch):
 
 
 def test_cancel_does_not_skip_pages_by_default(monkeypatch):
-    """Missions leave skip_on_cancel off: their stop is honoured at the next
-    pass boundary, so the crawl in flight still fetches every page."""
+    """Missions leave skip_on_cancel off: their stop is honoured before the
+    next requirement, so the crawl in flight still fetches every page."""
     urls = ["http://c.example/1", "http://c.example/2"]
     monkeypatch.setattr(crawler, "AsyncWebCrawler", _fake_crawler(_pages(urls)))
     jid = _job(urls)
@@ -209,3 +209,453 @@ def test_aliases_map_every_name_to_the_stored_url(monkeypatch):
     assert meta_c["redirected_url"] == "http://d.example/landed"
     assert "requested_url" not in meta_e and "redirected_url" not in meta_e
     assert meta_b["title"] == "A real page", "page metadata is kept"
+
+
+# ---------- plain-HTTP fallback ----------
+
+import json  # noqa: E402
+import threading  # noqa: E402
+
+import httpx  # noqa: E402  (tests/stubs/httpx.py)
+
+_GOOD_HTML = ("<html><head><title>Plain page</title></head><body>"
+              + "<p>" + "fact " * 200 + "</p></body></html>")
+_BLOCK_HTML = ("<html><head><title>Just a moment...</title></head>"
+               "<body>Checking your browser</body></html>")
+
+
+class _Stream:
+    """Stands in for the response of `with httpx.stream(...) as r`: status,
+    headers and url are there at once; the raw (still-encoded) body only
+    arrives when iterated, and `pulled` counts the bytes the caller read."""
+
+    def __init__(self, status=200, ctype="text/html; charset=utf-8", text=_GOOD_HTML,
+                 url="http://f.example/1", chunks=None, length=None, encoding="utf-8",
+                 content_encoding=None, header_delay=0.0):
+        self.status_code = status
+        self.headers = {"content-type": ctype}
+        if length is not None:
+            self.headers["content-length"] = str(length)
+        if content_encoding is not None:
+            self.headers["content-encoding"] = content_encoding
+        self._header_delay = header_delay
+        self.url = url
+        self.encoding = encoding
+        self._chunks = chunks if chunks is not None else [text.encode()]
+        self.pulled = 0
+        self.body_read = False
+        self.closed = False
+
+    def __enter__(self):
+        if self._header_delay:   # a server slow to send its headers
+            import time as _time
+            _time.sleep(self._header_delay)
+        return self
+
+    def __exit__(self, *a):
+        self.closed = True
+        return False
+
+    def iter_raw(self):
+        self.body_read = True
+        for chunk in self._chunks:
+            self.pulled += len(chunk)
+            yield chunk
+
+
+def _raw_aware_crawler(browser, raw_calls):
+    """arun(url) answers from `browser` for real URLs; a "raw:" URL is
+    converted like crawl4ai would: markdown from the HTML's text."""
+    import re
+
+    class FakeCrawler(_fake_crawler(browser)):
+        async def arun(self, url, config=None):
+            if url.startswith("raw:"):
+                html = url[len("raw:"):]
+                raw_calls.append(html)
+                text = re.sub(r"<[^>]+>", " ", html)
+                title = re.search(r"<title>(.*?)</title>", html).group(1)
+                res = _Result(url)
+                res.markdown = _MD(" ".join(text.split()))
+                res.metadata = {"title": title}
+                return res
+            return await super().arun(url, config)
+
+    return FakeCrawler
+
+
+def _fallback_case(monkeypatch, browser_result, http=None, url="http://f.example/1"):
+    """Crawl one URL whose browser fetch gives `browser_result`; `http` is
+    what httpx.stream returns (or raises). Returns (docs, job, calls, raw_calls)."""
+    async def page():
+        return browser_result
+
+    calls, raw_calls = [], []
+
+    def fake_stream(method, u, **kwargs):
+        calls.append((method, u, kwargs))
+        if isinstance(http, Exception):
+            raise http
+        return http
+
+    monkeypatch.setattr(crawler.httpx, "stream", fake_stream)
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", _raw_aware_crawler({url: page}, raw_calls))
+    jid = _job([url])
+    docs = asyncio.run(crawler.crawl_urls_with_progress(_srs([url]), "q", jid))
+    return docs, jobs.get_job(jid), calls, raw_calls
+
+
+def _msgs(job):
+    return " ".join(entry.msg for entry in job.log)
+
+
+def _failed(url="http://f.example/1"):
+    return _Result(url, success=False, error="net::ERR_BLOCKED")
+
+
+def test_fallback_rescues_a_failed_page(monkeypatch):
+    final = "http://f.example/landed?a=<b>"
+    resp = _Stream(url=final)
+    docs, job, calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    [doc] = docs
+    assert doc.url == final, "stored under the fetch's final URL, not raw:"
+    assert doc.title == "Plain page" and doc.word_count >= 200
+    meta = json.loads(doc.metadata_json)
+    assert meta["fetched_via"] == "fallback"
+    assert meta["requested_url"] == "http://f.example/1"
+    assert [u.status for u in job.urls] == ["done"]
+    assert job.crawl_done == 1
+    assert "fallback fetched <code>http://f.example/landed?a=&lt;b&gt;</code>" in _msgs(job)
+    [(method, url, kwargs)] = calls
+    assert (method, url) == ("GET", "http://f.example/1")
+    assert kwargs["follow_redirects"] is True
+    assert kwargs["timeout"] == crawler.settings.crawl_timeout / 1000
+    assert "Mozilla/5.0" in kwargs["headers"]["User-Agent"]
+    assert kwargs["headers"]["Accept"] == "text/html,*/*"
+    assert kwargs["headers"]["Accept-Encoding"] == "gzip, deflate", "never br"
+    assert raw_calls == [_GOOD_HTML]
+    assert resp.closed, "the stream is always closed"
+
+
+def test_fallback_conversion_uses_its_own_browserless_config(monkeypatch):
+    """crawl4ai 0.9.2 routes a raw: URL through the browser whenever its
+    config asks for browser work (simulate_user, remove_overlay_elements,
+    ...), so reusing the stealth crawl's config would re-render every
+    rescued page in headless Chromium. The conversion gets its own config
+    with none of those set, and the final URL as its base."""
+    class _Cfg:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    start, final = "http://f.example/1", "http://f.example/landed"
+
+    async def page():
+        return _failed(start)
+
+    seen = []   # (url, config) of every arun call, in order
+
+    class Recording(_raw_aware_crawler({start: page}, [])):
+        async def arun(self, url, config=None):
+            seen.append((url, config))
+            return await super().arun(url, config)
+
+    monkeypatch.setattr(crawler, "CrawlerRunConfig", _Cfg)
+    monkeypatch.setattr(crawler.httpx, "stream", lambda m, u, **k: _Stream(url=final))
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", Recording)
+    jid = _job([start])
+    docs = asyncio.run(crawler.crawl_urls_with_progress(_srs([start]), "q", jid))
+
+    assert [d.url for d in docs] == [final]
+    [(browser_url, run_cfg), (raw_url, convert_cfg)] = seen
+    assert browser_url == start and raw_url.startswith("raw:")
+    assert run_cfg.kw["simulate_user"] is True, "the browser crawl keeps its stealth options"
+    assert convert_cfg is not run_cfg
+    assert "simulate_user" not in convert_cfg.kw
+    assert "remove_overlay_elements" not in convert_cfg.kw
+    browser_work = {"override_navigator", "user_agent_mode", "js_code", "wait_for", "magic",
+                    "scan_full_page", "process_iframes", "screenshot", "pdf",
+                    "process_in_browser", "remove_consent_popups", "page_timeout"}
+    assert not browser_work & set(convert_cfg.kw)
+    assert convert_cfg.kw["base_url"] == final
+
+
+def test_fallback_rescues_a_block_page(monkeypatch):
+    blocked = _Result("http://f.example/1", title="Just a moment...", words=20)
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, blocked, _Stream())
+    assert [d.url for d in docs] == ["http://f.example/1"]
+    assert "requested_url" not in json.loads(docs[0].metadata_json)
+    assert [u.status for u in job.urls] == ["done"]
+
+
+def test_fallback_decodes_with_the_declared_charset(monkeypatch):
+    html = _GOOD_HTML.replace("Plain page", "Café page")
+    resp = _Stream(chunks=[html.encode("latin-1")], encoding="latin-1")
+    docs, _job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs[0].title == "Café page" and raw_calls == [html]
+
+
+def test_fallback_http_error_keeps_the_page_failed(monkeypatch):
+    resp = _Stream(status=403)
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert not resp.body_read, "an error status is judged from the headers alone"
+    [u] = job.urls
+    assert u.status == "error" and "net::ERR_BLOCKED" in u.error
+    assert "fallback failed: HTTP 403" in _msgs(job)
+    assert job.crawl_done == 1
+
+
+def test_fallback_rejects_non_html_without_reading_the_body(monkeypatch):
+    resp = _Stream(ctype="application/pdf", text="%PDF-1.7")
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert not resp.body_read and resp.pulled == 0
+    assert "fallback failed: not HTML" in _msgs(job)
+
+
+def _endless(chunk_size):
+    while True:
+        yield b"x" * chunk_size
+
+
+def test_fallback_aborts_an_oversized_body_at_the_cap(monkeypatch):
+    chunk = 256 * 1024
+    resp = _Stream(chunks=_endless(chunk))
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert "fallback failed: page too large" in _msgs(job)
+    assert crawler._FALLBACK_MAX_BYTES < resp.pulled <= crawler._FALLBACK_MAX_BYTES + chunk, \
+        "reading stops at the first chunk past the cap"
+    assert resp.closed
+
+
+def test_fallback_rejects_a_declared_oversize_without_reading(monkeypatch):
+    resp = _Stream(length=crawler._FALLBACK_MAX_BYTES + 1)
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and not resp.body_read
+    assert "fallback failed: page too large" in _msgs(job)
+
+
+def test_fallback_gives_up_on_a_body_that_never_ends_in_time(monkeypatch):
+    import time as _time
+
+    def trickle():
+        while True:
+            _time.sleep(0.01)
+            yield b"<p>slow</p>"
+
+    monkeypatch.setattr(crawler.settings, "crawl_timeout", 100)   # 0.1 s budget
+    resp = _Stream(chunks=trickle())
+    t0 = _time.monotonic()
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, _failed(), resp)
+    assert _time.monotonic() - t0 < 3
+    assert docs == [] and "fallback failed: timed out" in _msgs(job)
+    assert resp.closed
+
+
+def test_fallback_rejects_a_block_page_body(monkeypatch):
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(),
+                                                  _Stream(text=_BLOCK_HTML))
+    assert docs == [] and raw_calls == [], "a block page is never converted"
+    assert "fallback failed:" in _msgs(job) and "just a moment" in _msgs(job)
+    assert job.urls[0].status == "error"
+
+
+def test_fallback_body_is_judged_off_the_event_loop(monkeypatch):
+    """Decoding and scanning a page-controlled body must not hold the event
+    loop (the whole app's) — it happens in the fetch's worker thread."""
+    seen = []
+    real = crawler._fallback_page_problem
+
+    def spy(html):
+        seen.append(threading.current_thread() is threading.main_thread())
+        return real(html)
+
+    monkeypatch.setattr(crawler, "_fallback_page_problem", spy)
+    docs, _job, _calls, _raw = _fallback_case(monkeypatch, _failed(), _Stream())
+    assert docs and seen == [False]
+
+
+# Short ids: pytest puts the test id in an environment variable, and a 200 KB
+# body would overflow it on Windows.
+@pytest.mark.parametrize("body", [
+    pytest.param("<" * 200_000, id="lt-run"),
+    pytest.param("<script>" * 25_000, id="unclosed-scripts"),
+    pytest.param("<style" * 40_000, id="unclosed-style-openers"),
+    pytest.param("<title" * 40_000, id="title-openers"),
+    pytest.param("<title>" + "a" * 200_000, id="unclosed-title"),
+    pytest.param("<a" * 100_000, id="unclosed-tags"),
+    pytest.param("<" + "a" * 200_000, id="one-endless-tag"),
+    pytest.param("<script>x</script>" * 10_000 + "<style>", id="scripts-then-unclosed"),
+])
+def test_fallback_page_check_is_linear_on_hostile_bodies(body):
+    import time as _time
+    t0 = _time.monotonic()
+    crawler._fallback_page_problem(body)
+    assert _time.monotonic() - t0 < 0.5
+
+
+def test_fallback_page_check_still_reads_title_and_text():
+    assert crawler._fallback_page_problem(_GOOD_HTML) == ""
+    assert "just a moment" in crawler._fallback_page_problem(_BLOCK_HTML)
+    # Script and style text is not page text; an unclosed opener stops the
+    # stripping rather than scanning on.
+    scripted = ("<title>Real</title><script>" + "var x; " * 500 + "</script>"
+                + "<p>" + "word " * 10 + "</p>")
+    assert crawler._fallback_page_problem(scripted) == "only 11 words of content"
+
+
+def test_fallback_conversion_still_goes_through_the_junk_gate(monkeypatch):
+    class ThinCrawler(_fake_crawler({})):
+        async def arun(self, url, config=None):
+            if url.startswith("raw:"):
+                return _Result(url, title="Thin", words=10)  # converts to almost nothing
+            return _failed()
+
+    monkeypatch.setattr(crawler.httpx, "stream", lambda m, u, **k: _Stream())
+    monkeypatch.setattr(crawler, "AsyncWebCrawler", ThinCrawler)
+    jid = _job(["http://f.example/1"])
+    docs = asyncio.run(crawler.crawl_urls_with_progress(_srs(["http://f.example/1"]), "q", jid))
+    assert docs == []
+    assert "fallback failed: only 10 words of content" in _msgs(jobs.get_job(jid))
+    assert jobs.get_job(jid).urls[0].status == "error"
+
+
+def test_fallback_disabled_by_setting(monkeypatch):
+    monkeypatch.setattr(crawler.settings, "crawl_fallback", False)
+    docs, job, calls, _raw = _fallback_case(monkeypatch, _failed(), _Stream())
+    assert docs == [] and calls == []
+    assert "fallback" not in _msgs(job)
+    assert job.urls[0].status == "error"
+
+
+def test_fallback_never_fetches_non_http_urls(monkeypatch):
+    docs, job, calls, _raw = _fallback_case(
+        monkeypatch, _failed("file:///etc/passwd"), _Stream(), url="file:///etc/passwd")
+    assert docs == [] and calls == []
+
+
+def test_fallback_network_error_is_reported_not_raised(monkeypatch):
+    docs, job, _calls, _raw = _fallback_case(
+        monkeypatch, _failed(), httpx.ConnectError("connection refused"))
+    assert docs == []
+    assert "fallback failed: ConnectError" in _msgs(job)
+    assert job.urls[0].status == "error" and job.crawl_done == 1
+
+
+def test_fallback_skipped_after_a_one_shot_cancel(monkeypatch):
+    async def fails_then_cancel():
+        jobs.request_cancel(jid)
+        return _failed()
+
+    calls = []
+    monkeypatch.setattr(crawler.httpx, "stream", lambda m, u, **k: calls.append(u) or _Stream())
+    monkeypatch.setattr(crawler, "AsyncWebCrawler",
+                        _fake_crawler({"http://f.example/1": fails_then_cancel}))
+    jid = _job(["http://f.example/1"])
+    docs = asyncio.run(crawler.crawl_urls_with_progress(
+        _srs(["http://f.example/1"]), "q", jid, skip_on_cancel=True))
+    assert docs == [] and calls == []
+
+
+# ---------- fallback: compressed bodies are bounded by their decoded size ----------
+
+import zlib  # noqa: E402
+
+
+def _compressed(size, wbits, piece=1024 * 1024):
+    """`size` bytes of zeros compressed with `wbits` (31 gzip, 15 zlib, -15
+    raw deflate), produced piecewise so the test never holds `size` bytes."""
+    z = zlib.compressobj(9, zlib.DEFLATED, wbits)
+    out = bytearray()
+    zeros = b"\0" * piece
+    for _ in range(size // piece):
+        out += z.compress(zeros)
+    out += z.flush()
+    return bytes(out)
+
+
+def _chunks(data, size):
+    return [data[i:i + size] for i in range(0, len(data), size)]
+
+
+def test_capped_body_stops_a_gzip_bomb_at_the_cap():
+    cap = crawler._FALLBACK_MAX_BYTES
+    bomb = _compressed(64 * 1024 * 1024, 31)          # 64 MB of zeros, ~64 KB on the wire
+    body = crawler._CappedBody("gzip", cap)
+    peak = 0
+    fits = True
+    for chunk in _chunks(bomb, 16 * 1024):
+        fits = body.feed(chunk)
+        peak = max(peak, len(body.body))
+        if not fits:
+            break
+    assert not fits, "the bomb must be refused"
+    assert peak <= cap + 1, "decoded bytes never run more than a byte past the cap"
+
+
+def test_capped_body_identity_stops_within_one_chunk():
+    cap, chunk = 1000, 300
+    body = crawler._CappedBody("", cap)
+    results = [body.feed(b"x" * chunk) for _ in range(4)]
+    assert results == [True, True, True, False]
+    assert len(body.body) <= cap + chunk
+
+
+@pytest.mark.parametrize("wbits,label", [(31, "gzip"), (15, "deflate"), (-15, "deflate"),
+                                         (15, "gzip")])
+def test_capped_body_decodes_gzip_and_both_deflate_flavours(wbits, label):
+    z = zlib.compressobj(6, zlib.DEFLATED, wbits)
+    data = z.compress(_GOOD_HTML.encode()) + z.flush()
+    body = crawler._CappedBody(label, crawler._FALLBACK_MAX_BYTES)
+    # One-byte first chunk: the flavour is sniffed from the first two bytes.
+    assert all(body.feed(c) for c in [data[:1]] + _chunks(data[1:], 100))
+    assert body.finish() and bytes(body.body) == _GOOD_HTML.encode()
+
+
+def test_fallback_aborts_a_gzip_bomb(monkeypatch):
+    bomb = _compressed(64 * 1024 * 1024, 31)
+    resp = _Stream(chunks=_chunks(bomb, 16 * 1024), content_encoding="gzip")
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert "fallback failed: page too large" in _msgs(job)
+    assert resp.pulled < len(bomb), "reading stops once the decoded size passes the cap"
+    assert resp.closed
+
+
+@pytest.mark.parametrize("encoding", ["br", "gzip, gzip", "deflate, gzip", "zstd", "compress"])
+def test_fallback_rejects_unsupported_content_encodings_before_reading(monkeypatch, encoding):
+    resp = _Stream(content_encoding=encoding)
+    docs, job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and raw_calls == []
+    assert not resp.body_read
+    assert "fallback failed: unsupported content-encoding" in _msgs(job)
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "identity", "GZIP"])
+def test_fallback_stores_a_compressed_page_under_the_cap(monkeypatch, encoding):
+    raw = _GOOD_HTML.encode()
+    if encoding.lower() == "gzip":
+        z = zlib.compressobj(6, zlib.DEFLATED, 31)
+        raw = z.compress(raw) + z.flush()
+    elif encoding == "deflate":
+        z = zlib.compressobj(6, zlib.DEFLATED, 15)
+        raw = z.compress(raw) + z.flush()
+    resp = _Stream(chunks=_chunks(raw, 50), content_encoding=encoding)
+    docs, _job, _calls, raw_calls = _fallback_case(monkeypatch, _failed(), resp)
+    assert [d.title for d in docs] == ["Plain page"]
+    assert raw_calls == [_GOOD_HTML]
+
+
+def test_fallback_corrupt_compressed_body_is_reported(monkeypatch):
+    resp = _Stream(chunks=[b"\x1f\x8b" + b"not really gzip" * 10], content_encoding="gzip")
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and "fallback failed: could not decompress" in _msgs(job)
+
+
+def test_fallback_deadline_covers_slow_headers(monkeypatch):
+    monkeypatch.setattr(crawler.settings, "crawl_timeout", 50)    # 0.05 s budget
+    resp = _Stream(header_delay=0.1)
+    docs, job, _calls, _raw = _fallback_case(monkeypatch, _failed(), resp)
+    assert docs == [] and not resp.body_read
+    assert "fallback failed: timed out" in _msgs(job)

@@ -3,7 +3,7 @@
 {% block crumbs %}<span class="sep">/</span><span class="cur">Agents</span>{% endblock %}
 
 {% block content %}
-<div class="page">
+<div class="page page-agents">
   <div style="display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:20px">
     <div>
       <h1 class="page-title">Expert agents</h1>
@@ -87,15 +87,15 @@
         {% endif %}
       </div>
 
+      {# Enter in the question submits this form (its only submit button). #}
       <form class="agent-ask" method="post" action="/agents/{{ a.id }}/run">
         <input type="text" name="question" maxlength="500" required
                placeholder="Ask {{ a.name }} to research…" aria-label="Research question">
-        <button type="submit" class="btn btn-accent">Plan mission</button>
+        <button type="submit" class="btn btn-accent agent-go">Plan mission</button>
       </form>
       {% if a.schedule_question %}
-      <form method="post" action="/agents/{{ a.id }}/run-scheduled"
-            style="padding:0 18px 12px;margin:0">
-        <button type="submit" class="btn btn-sm btn-ghost" style="width:100%"
+      <form class="agent-sched" method="post" action="/agents/{{ a.id }}/run-scheduled">
+        <button type="submit" class="btn agent-go"
                 title="Run the standing question now, unattended (auto-approves its plan)">
           <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v10l8-5-8-5Z"/></svg>
           Run scheduled question now

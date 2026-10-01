@@ -40,9 +40,18 @@ class Settings(BaseSettings):
     search_backends: str = "auto,brave,bing,duckduckgo"
     db_path: str = "data/research.db"
     crawl_timeout: int = 30000
+    # When headless Chromium fails a page or gets a block/captcha wall, retry
+    # it once with a plain HTTP fetch and convert that HTML instead. Some bot
+    # walls only fingerprint the browser; set false to skip the second fetch.
+    crawl_fallback: bool = True
     # Per-call LLM request timeout in seconds. Without one, a hung provider
     # holds a mission worker (and its job slot) forever.
     llm_timeout_s: int = 120
+    # Default per-mission LLM token budget (prompt + completion across every
+    # call the mission makes). 0 = unlimited. Used when a mission's
+    # budget_json does not set its own max_llm_tokens; collection stops at the
+    # next pass/requirement boundary once the budget is exceeded.
+    max_llm_tokens: int = 0
     # Loopback by default: the dev server must not be network-reachable
     # unless asked (the Docker image sets its own bind address).
     flask_host: str = "127.0.0.1"

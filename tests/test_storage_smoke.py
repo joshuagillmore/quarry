@@ -313,11 +313,12 @@ def test_init_db_migrates_an_old_schema():
 
     assert "job_id" in _columns("searches")
     assert "schedule_question" in _columns("agents")
-    assert "brief_sources_json" in _columns("missions")
+    assert {"brief_sources_json", "brief_warnings_json"} <= _columns("missions")
     assert {"assessment_missing", "assessment_confidence",
-            "accepted_by_user"} <= _columns("requirements")
+            "accepted_by_user", "search_stats_json"} <= _columns("requirements")
     old = asyncio.run(storage.get_mission("old"))
     assert old.status == "done" and old.brief_sources_json is None
+    assert old.brief_warnings_json is None
 
 
 def _index_column_sets(table):
@@ -335,3 +336,4 @@ def test_init_db_creates_lookup_indexes():
     assert ("mission_id",) in _index_column_sets("requirements")
     assert ("document_id",) in _index_column_sets("mission_documents")
     assert ("agent_id", "status") in _index_column_sets("missions")
+    assert ("mission_id",) in _index_column_sets("llm_calls")

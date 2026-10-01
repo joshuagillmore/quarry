@@ -66,5 +66,18 @@ def test_key_rules_present(css):
     for sel in (".req-open[hidden]", ".telemetry", ".tele-cell", ".srail",
                 ".cite", ".mrow", ".agent-budget", ".coverage",
                 ".qadd[hidden]", ".btn:disabled", ".lib-pager",
-                '.stage[data-state="error"]'):
+                '.stage[data-state="error"]',
+                ".tele-tokens", ".tele-sub", ".src-gone", ".brief-checks",
+                ".bcheck", ".search-stat.zero", ".cmp-grid", ".cmp-list",
+                ".agent-go", ".agent-sched", ".page-agents"):
         assert sel in css, f"missing rule {sel}"
+
+
+def test_agent_run_buttons_have_a_36px_hit_area(css):
+    """The agents page's Plan mission / Run scheduled buttons fill their row
+    and are never shorter than 36px (they were 32px and 26px)."""
+    body = _strip_comments(css).replace(" ", "")
+    go = re.search(r"\.agent-go\{([^}]*)\}", body)
+    assert go and "min-height:36px" in go.group(1) and "height:auto" in go.group(1)
+    ask = re.search(r"\.agent-ask\{([^}]*)\}", body)
+    assert ask and "align-items:stretch" in ask.group(1)

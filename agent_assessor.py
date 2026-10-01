@@ -1,6 +1,7 @@
 """Gap analysis: judge whether the documents collected for a requirement
 satisfy it, and if not, propose refined queries aimed at the gap.
 """
+import re
 import sys
 from dataclasses import dataclass
 
@@ -41,15 +42,85 @@ def _is_yes(value) -> bool:
     return isinstance(value, str) and value.strip().lower() in {"true", "yes"}
 
 
-def assess_requirement(requirement: Requirement, docs: list[Document]) -> Assessment:
+# Function words long enough to pass the 5-letter cut; they say nothing
+# about what a requirement is about.
+_STOPWORDS = frozenset({
+    "about", "above", "after", "again", "against", "along", "among", "around",
+    "because", "before", "being", "below", "between", "beyond", "could",
+    "during", "either", "every", "might", "neither", "other", "others",
+    "should", "since", "their", "theirs", "there", "these", "those",
+    "though", "through", "under", "until", "where", "whether", "which",
+    "while", "whose", "within", "without", "would",
+})
+# Words of 5+ letters (letters only: digits and underscores split words).
+_TERM_RE = re.compile(r"[^\W\d_]{5,}")
+
+NO_TERM_OVERLAP = "no collected source mentions the requirement's key terms"
+# Where a description's first clause ends: ? ! ; or a line break, or a full
+# stop after a lowercase word ("... batteries. Then"), never the dots of an
+# abbreviation such as "U.S." or "e.g.".
+_CLAUSE_END_RE = re.compile(r"[?!;\n]|(?<=[a-z]{2})\.(?:\s|$)")
+REQUERY_MAX_CHARS = 200
+
+
+def key_terms(requirement: Requirement) -> set[str]:
+    """The words that say what a requirement is about: lowercased words of 5+
+    letters from its title and description, minus a few function words. May
+    be empty (a title of short words only), in which case nothing can be
+    judged from it."""
+    text = f"{requirement.title or ''} {requirement.description or ''}".lower()
+    return set(_TERM_RE.findall(text)) - _STOPWORDS
+
+
+def _requery(requirement: Requirement) -> list[str]:
+    """A fresh query for a requirement nothing on-topic was found for: its
+    title plus the first clause of its description (when that adds
+    anything), so the next pass does not repeat the queries that missed."""
+    title = (requirement.title or "").strip()
+    clause = _CLAUSE_END_RE.split(requirement.description or "", maxsplit=1)[0].strip()
+    query = f"{title} {clause}" if clause and clause.lower() not in title.lower() else title
+    if len(query) > REQUERY_MAX_CHARS:   # cut at a word boundary
+        cut = query[:REQUERY_MAX_CHARS + 1]
+        space = cut.rfind(" ")
+        query = cut[:space] if space > 0 else cut[:REQUERY_MAX_CHARS]
+    query = query.strip()
+    return [query] if query else []
+
+
+def _mentions_any(docs: list[Document], terms: set[str]) -> bool:
+    for d in docs:
+        body = (d.content_fit or d.content_markdown or "").lower()
+        if any(term in body for term in terms):
+            return True
+    return False
+
+
+def assess_requirement(requirement: Requirement, docs: list[Document],
+                       search_note: str = "") -> Assessment:
     """Returns an Assessment. On LLM/parse failure, returns a not-satisfied
-    assessment with no new queries (caller's attempt cap will still advance)."""
-    prompt = build_assess_prompt(requirement.title, requirement.description, _sources_block(docs))
+    assessment with no new queries (caller's attempt cap will still advance).
+
+    When the requirement has key terms and no collected source mentions any
+    of them (or nothing was collected), the answer is already known: not
+    satisfied, with no LLM call, re-tasked with a query built from the
+    requirement itself (_requery). A requirement without key terms is always
+    sent to the LLM. `search_note` summarises this pass's searches for the
+    prompt."""
+    terms = key_terms(requirement)
+    if terms and not _mentions_any(docs, terms):
+        print(f"[ASSESS] skipped LLM for {requirement.title!r}: none of "
+              f"{len(docs)} source(s) mentions its key terms",
+              file=sys.stderr, flush=True)
+        return Assessment(False, "low", NO_TERM_OVERLAP, _requery(requirement))
+
+    prompt = build_assess_prompt(requirement.title, requirement.description,
+                                 _sources_block(docs), search_note=search_note)
     # The persona isn't needed for grading; a tight system message keeps it cheap.
     try:
         parsed, _raw = chat_json(
             "You are a meticulous research analyst grading source coverage.",
             prompt, max_tokens=600,
+            purpose="assess", mission_id=requirement.mission_id,
         )
     except Exception as e:  # noqa: BLE001
         # A provider hiccup must not destroy a mission that has already paid to

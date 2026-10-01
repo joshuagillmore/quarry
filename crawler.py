@@ -1,10 +1,14 @@
 import asyncio
 import json
+import re
+import time
 import uuid
+import zlib
 from datetime import datetime, timezone
-from html import escape as _esc
+from html import escape as _esc, unescape
 from urllib.parse import urlparse
 
+import httpx
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from models import Document, SearchResult
 from config import settings
@@ -84,6 +88,282 @@ def _page_names(sr: SearchResult, result) -> list[str]:
     return [n for i, n in enumerate(names) if n and n not in names[:i]]
 
 
+def _page_document(result, sr: SearchResult, search_query: str, url: str,
+                   redirected: str | None, names: list[str],
+                   aliases: dict[str, str] | None,
+                   extra_meta: dict | None = None) -> tuple[Document | None, str]:
+    """(Document stored under `url`, "") for a crawl result, or (None, why)
+    when the page is a captcha wall or empty shell. A junk page "succeeds"
+    as far as the browser is concerned; rejecting it here means it is never
+    stored, never cited, and never charged to a mission's source budget.
+
+    The page's other names (`names`, `redirected`) are kept in the
+    document's metadata for a later run and, for an accepted page, mapped to
+    `url` in `aliases` now."""
+    parsed = urlparse(url)
+    markdown_content = result.markdown.raw_markdown if result.markdown else ""
+    fit_content = result.markdown.fit_markdown if result.markdown else ""
+    internal_links = len(result.links.get("internal", [])) if result.links else 0
+    external_links = len(result.links.get("external", [])) if result.links else 0
+    metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+    title = metadata.get("title") or sr.title or parsed.netloc
+    word_count = len(markdown_content.split()) if markdown_content else 0
+
+    junk, why = looks_like_block_page(title, word_count)
+    if junk:
+        return None, why
+
+    metadata.update(extra_meta or {})
+    if sr.url != url:
+        metadata["requested_url"] = sr.url
+    if redirected and redirected != url:
+        metadata["redirected_url"] = redirected
+    if aliases is not None:
+        for name in names:
+            if name != url:
+                aliases[name] = url
+
+    return Document(
+        id=str(uuid.uuid4()),
+        url=url,
+        domain=parsed.netloc,
+        title=title,
+        search_query=search_query,
+        crawled_at=datetime.now(timezone.utc).isoformat(),
+        content_markdown=markdown_content,
+        content_fit=fit_content,
+        word_count=word_count,
+        links_internal=internal_links,
+        links_external=external_links,
+        metadata_json=json.dumps(metadata),
+    ), ""
+
+
+# --- Plain-HTTP fallback ---
+#
+# Some bot walls fingerprint the headless browser but let a plain HTTP GET
+# through. When the browser fails a page or gets a block page, the page is
+# fetched once more with httpx and that HTML is converted by crawl4ai
+# ("raw:" URL), so it gets the same markdown and the same junk gate.
+
+_FALLBACK_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": "text/html,*/*",
+    # Only codings _CappedBody decodes itself under the cap. httpx would
+    # otherwise decode br (and stacked codings) with no output limit: a few
+    # hundred wire bytes can expand to gigabytes in one read.
+    "Accept-Encoding": "gzip, deflate",
+}
+# Bigger than any article; the body is converted in memory. Enforced on the
+# decoded size as the body arrives, so a longer one is never read in full.
+_FALLBACK_MAX_BYTES = 5_000_000
+_SUPPORTED_CODINGS = ("", "identity", "gzip", "x-gzip", "deflate")
+# The fallback's pre-check reads page-controlled HTML, so every scan here is
+# linear: no pattern can run ahead past a "<" it would then backtrack over.
+# (The first versions, `<[^>]*>` and lazy `.*?` spans, were quadratic: about
+# 0.75 s at 40 KB and hours at 5 MB, with the GIL held.)
+_TITLE_SCAN_CHARS = 64 * 1024
+_TITLE_RE = re.compile(r"<title[^<>]*>([^<]*)</title", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^<>]*>")
+_NON_TEXT_OPEN_RE = re.compile(r"<(script|style|noscript)\b", re.IGNORECASE)
+_NON_TEXT_CLOSE_RE = {name: re.compile(f"</{name}", re.IGNORECASE)
+                      for name in ("script", "style", "noscript")}
+
+
+def _is_http_url(url: str) -> bool:
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(parts.netloc)
+
+
+def _html_title(html: str) -> str:
+    """The <title> text, looked for only near the top of the page."""
+    m = _TITLE_RE.search(html, 0, _TITLE_SCAN_CHARS)
+    return " ".join(unescape(m.group(1)).split())[:300] if m else ""
+
+
+def _strip_non_text(html: str) -> str:
+    """`html` without its script/style/noscript blocks. Each search starts
+    where the last one ended, so the whole pass is linear; an opener with no
+    closer stops the stripping there (the rest is kept as-is) instead of
+    being searched past again."""
+    parts: list[str] = []
+    pos = 0
+    while True:
+        opener = _NON_TEXT_OPEN_RE.search(html, pos)
+        if not opener:
+            break
+        closer = _NON_TEXT_CLOSE_RE[opener.group(1).lower()].search(html, opener.end())
+        if not closer:
+            break
+        parts.append(html[pos:opener.start()])
+        end = html.find(">", closer.end())
+        pos = len(html) if end == -1 else end + 1
+    parts.append(html[pos:])
+    return " ".join(parts)
+
+
+def _rough_word_count(html: str) -> int:
+    return len(_TAG_RE.sub(" ", _strip_non_text(html)).split())
+
+
+def _fallback_page_problem(html: str) -> str:
+    """Why a fetched body is not worth converting (a block page, judged on
+    its <title> and a rough word count), or "" when it is."""
+    junk, why = looks_like_block_page(_html_title(html), _rough_word_count(html))
+    return why if junk else ""
+
+
+class _CappedBody:
+    """A response body accumulated from raw (still-encoded) chunks with an
+    exact bound on its decoded size. gzip/deflate are decompressed here with
+    zlib's max_length, so no chunk can expand past the cap in memory: at
+    most cap + 1 decoded bytes are ever held (cap + one chunk for an
+    unencoded body). The zlib flavour is sniffed from the first two bytes:
+    gzip, zlib-wrapped deflate, or the raw deflate some servers send."""
+
+    def __init__(self, coding: str, cap: int):
+        self.coding = "" if coding in ("", "identity") else coding
+        self.cap = cap
+        self.body = bytearray()
+        self._z = None
+        self._head = b""    # raw bytes held until the flavour is known
+
+    @staticmethod
+    def _wbits(head: bytes) -> int:
+        if head[:2] == b"\x1f\x8b":
+            return 31                                   # gzip
+        if len(head) >= 2 and head[0] & 0x0F == 8 and (head[0] << 8 | head[1]) % 31 == 0:
+            return 15                                   # zlib-wrapped deflate
+        return -15                                      # raw deflate
+
+    def _inflate(self, raw: bytes) -> bool:
+        out = self._z.decompress(raw, self.cap - len(self.body) + 1)
+        self.body += out
+        return len(self.body) <= self.cap and not self._z.unconsumed_tail
+
+    def feed(self, raw: bytes) -> bool:
+        """Add a raw chunk. False once the decoded body is past the cap (the
+        caller stops reading). Raises zlib.error on a corrupt body."""
+        if not self.coding:
+            self.body += raw
+            return len(self.body) <= self.cap
+        if self._z is None:
+            self._head += raw
+            if len(self._head) < 2:
+                return True
+            raw, self._head = self._head, b""
+            self._z = zlib.decompressobj(self._wbits(raw))
+        return self._inflate(raw)
+
+    def finish(self) -> bool:
+        """End of body: decode what is still held. False if past the cap."""
+        if not self.coding:
+            return len(self.body) <= self.cap
+        if self._z is None:
+            if not self._head:
+                return True
+            self._z = zlib.decompressobj(self._wbits(self._head))
+            if not self._inflate(self._head):
+                return False
+        self.body += self._z.flush()
+        return len(self.body) <= self.cap
+
+
+def _declared_length(response) -> int:
+    try:
+        return int(response.headers.get("content-length") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _decode(body: bytes, encoding: str | None) -> str:
+    try:
+        return body.decode(encoding or "utf-8", errors="replace")
+    except LookupError:  # a charset Python does not know
+        return body.decode("utf-8", errors="replace")
+
+
+def _fetch_fallback_html(url: str) -> tuple[str, str, str]:
+    """Worker-thread body of the fallback: (html, final url, "") from a
+    plain GET of `url`, or ("", "", reason) when it is not a usable page.
+
+    The response is streamed and judged as early as possible. Status,
+    content type and content coding are read from the headers before any
+    body is (a PDF link is never downloaded; a coding other than none or a
+    single gzip/deflate is refused). A declared size past the cap is
+    refused too. The raw body then goes through _CappedBody, which bounds
+    its decoded size exactly (httpx's own decoding has no output limit).
+
+    A wall-clock deadline starts before the request, since httpx's timeout
+    is per read and a trickling server would never trip it. It is checked
+    once the final headers are in and again after every body chunk, so the
+    body is bounded by it (to within one chunk read), but the headers and
+    redirects are not: time they take is refused after the fact, when the
+    first check sees the deadline already passed, and each of those reads
+    is only bounded by httpx's per-read timeout. Only then is the body
+    decoded to text and checked for a block page. All of it runs here, off
+    the event loop: page-controlled bytes never hold up the app."""
+    budget_s = settings.crawl_timeout / 1000
+    timed_out = f"timed out after {budget_s:g}s"
+    deadline = time.monotonic() + budget_s
+    with httpx.stream("GET", url, follow_redirects=True, timeout=budget_s,
+                      headers=_FALLBACK_HEADERS) as response:
+        if time.monotonic() > deadline:
+            return "", "", timed_out
+        if response.status_code != 200:
+            return "", "", f"HTTP {response.status_code}"
+        ctype = (response.headers.get("content-type") or "").lower()
+        if "html" not in ctype:
+            return "", "", f"not HTML ({ctype.split(';')[0].strip() or 'no content type'})"
+        coding = (response.headers.get("content-encoding") or "").strip().lower()
+        if coding not in _SUPPORTED_CODINGS:
+            return "", "", f"unsupported content-encoding ({coding[:40]})"
+        if _declared_length(response) > _FALLBACK_MAX_BYTES:
+            return "", "", "page too large"
+        body = _CappedBody("gzip" if coding == "x-gzip" else coding, _FALLBACK_MAX_BYTES)
+        try:
+            for chunk in response.iter_raw():
+                if not body.feed(chunk):
+                    return "", "", "page too large"
+                if time.monotonic() > deadline:
+                    return "", "", timed_out
+            if not body.finish():
+                return "", "", "page too large"
+        except zlib.error as e:
+            return "", "", f"could not decompress the body ({str(e)[:60]})"
+        html = _decode(bytes(body.body), response.encoding)
+        final_url = str(response.url)
+    problem = _fallback_page_problem(html)
+    if problem:
+        return "", "", problem
+    return html, final_url, ""
+
+
+async def _fallback_html(url: str) -> tuple[str, str, str]:
+    """_fetch_fallback_html on a worker thread."""
+    return await asyncio.to_thread(_fetch_fallback_html, url)
+
+
+def _conversion_config(base_url: str) -> CrawlerRunConfig:
+    """The run config for turning fallback-fetched HTML into markdown via a
+    "raw:" URL. Never the browser crawl's config: crawl4ai sends a raw: URL
+    through the browser whenever the config asks for browser work
+    (simulate_user, remove_overlay_elements, js_code, wait_for, ...), which
+    would render the rescued page in headless Chromium, inline scripts and
+    all, for up to the whole page timeout. With none of those set it takes
+    the fast path and just parses the HTML. `base_url` (the fetch's final
+    URL) resolves the page's relative links."""
+    return CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        word_count_threshold=50,
+        base_url=base_url,
+    )
+
+
 async def crawl_urls_with_progress(search_results: list[SearchResult], search_query: str,
                                    job_id: str, attempted: set[str] | None = None,
                                    aliases: dict[str, str] | None = None,
@@ -99,12 +379,17 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
     any of them. The extra names are also kept in the document's metadata
     (`requested_url`, `redirected_url`) for callers in a later run.
 
+    A page the browser fails, times out on, or gets a block page for is
+    fetched once more over plain HTTP when `settings.crawl_fallback` is on
+    (http(s) URLs only); a page rescued that way is stored under the fetch's
+    final URL with `"fetched_via": "fallback"` in its metadata.
+
     With `skip_on_cancel` (the one-shot crawl), a cancel requested on the job
     stops every page not fetched yet: it is marked "skipped" and not added to
-    `attempted`; fetches already in flight finish and are returned. Missions
-    leave it off: their stop is honoured at the next pass boundary, and a
-    skipped crawl would have the rest of the pass assess requirements
-    against sources that were never fetched."""
+    `attempted`; fetches already in flight finish and are returned (without
+    a fallback fetch). Missions leave it off: their stop is honoured before
+    the next requirement, and a skipped crawl would have the rest of the
+    requirement's assessment run against sources that were never fetched."""
     from jobs import update_url, add_log, inc_counter, is_cancelled
 
     browser_cfg = BrowserConfig(headless=True, browser_type="chromium")
@@ -127,6 +412,59 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
     semaphore = asyncio.Semaphore(4)
 
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        def done(sr: SearchResult, doc: Document) -> Document:
+            update_url(
+                job_id, sr.url,
+                status="done", title=doc.title, words=doc.word_count,
+                links_internal=doc.links_internal, links_external=doc.links_external,
+            )
+            inc_counter(job_id, "crawl_done")
+            add_log(job_id, "ok", f"<em>{_esc((doc.title or '')[:80])}</em> · {doc.word_count:,}w")
+            return doc
+
+        def failed(sr: SearchResult, error: str) -> None:
+            update_url(job_id, sr.url, status="error", error=error[:140])
+            inc_counter(job_id, "crawl_done")
+            return None
+
+        async def fallback(sr: SearchResult, limit: float) -> tuple[Document | None, str]:
+            html, final_url, reason = await asyncio.wait_for(_fallback_html(sr.url),
+                                                             timeout=limit)
+            if not html:
+                return None, reason
+            result = await asyncio.wait_for(
+                crawler.arun(url="raw:" + html, config=_conversion_config(final_url)),
+                timeout=limit)
+            if not result.success:
+                return None, f"conversion failed: {(result.error_message or 'unknown error')[:100]}"
+            names = [n for n in dict.fromkeys((sr.url, final_url)) if n]
+            doc, why = _page_document(result, sr, search_query, final_url, None, names,
+                                      aliases, extra_meta={"fetched_via": "fallback"})
+            if doc is not None and attempted is not None:
+                attempted.update(names)
+            return doc, why
+
+        async def fail_or_fall_back(sr: SearchResult, error: str, limit: float) -> Document | None:
+            """The browser could not produce a usable page: try the plain
+            HTTP fallback once, then either store its page or record the
+            failure. Never raises (bar cancellation): one page must not
+            take down the whole crawl."""
+            if (not settings.crawl_fallback or not _is_http_url(sr.url)
+                    or (skip_on_cancel and is_cancelled(job_id))):
+                return failed(sr, error)
+            try:
+                doc, reason = await fallback(sr, limit)
+            except asyncio.TimeoutError:
+                doc, reason = None, f"timed out after {limit:.0f}s"
+            except Exception as e:  # noqa: BLE001 - reported below, never raised
+                doc, reason = None, f"{type(e).__name__}: {str(e)[:100]}"
+            if doc is None:
+                add_log(job_id, "warn",
+                        f"fallback failed: {_esc(reason)} (<code>{_esc(sr.url)}</code>)")
+                return failed(sr, f"{error}; fallback: {reason}")
+            add_log(job_id, "info", f"fallback fetched <code>{_esc(doc.url)}</code>")
+            return done(sr, doc)
+
         async def crawl_one(sr: SearchResult) -> Document | None:
             async with semaphore:
                 if skip_on_cancel and is_cancelled(job_id):
@@ -147,80 +485,24 @@ async def crawl_urls_with_progress(search_results: list[SearchResult], search_qu
                     if attempted is not None:
                         attempted.update(names)
                     if not result.success:
-                        msg = (result.error_message or "unknown error")[:140]
-                        update_url(job_id, sr.url, status="error", error=msg)
-                        inc_counter(job_id, "crawl_done")
-                        add_log(job_id, "err", f"failed <code>{_esc(sr.url)}</code>: {_esc(msg)}")
-                        return None
-
-                    parsed = urlparse(result.url)
-                    markdown_content = result.markdown.raw_markdown if result.markdown else ""
-                    fit_content = result.markdown.fit_markdown if result.markdown else ""
-                    internal_links = len(result.links.get("internal", [])) if result.links else 0
-                    external_links = len(result.links.get("external", [])) if result.links else 0
-                    metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
-                    title = metadata.get("title") or sr.title or parsed.netloc
-                    word_count = len(markdown_content.split()) if markdown_content else 0
-
-                    # A captcha wall or empty shell "succeeds" as far as the
-                    # browser is concerned. Reject it here so it is never
-                    # stored, never cited, and never charged to the mission's
-                    # source budget.
-                    junk, why = looks_like_block_page(title, word_count)
-                    if junk:
-                        update_url(job_id, sr.url, status="error", error=why)
-                        inc_counter(job_id, "crawl_done")
+                        error = (result.error_message or "unknown error")[:140]
+                        add_log(job_id, "err", f"failed <code>{_esc(sr.url)}</code>: {_esc(error)}")
+                    else:
+                        doc, error = _page_document(
+                            result, sr, search_query, result.url,
+                            getattr(result, "redirected_url", None), names, aliases)
+                        if doc is not None:
+                            return done(sr, doc)
                         add_log(job_id, "warn",
-                                f"discarded <code>{_esc(sr.url)}</code>: {_esc(why)}")
-                        return None
-
-                    # The page's other names, resolvable now (aliases) and in
-                    # a later run of the same mission (metadata).
-                    redirected = getattr(result, "redirected_url", None)
-                    if sr.url != result.url:
-                        metadata["requested_url"] = sr.url
-                    if redirected and redirected != result.url:
-                        metadata["redirected_url"] = redirected
-                    if aliases is not None:
-                        for name in names:
-                            if name != result.url:
-                                aliases[name] = result.url
-
-                    doc = Document(
-                        id=str(uuid.uuid4()),
-                        url=result.url,
-                        domain=parsed.netloc,
-                        title=title,
-                        search_query=search_query,
-                        crawled_at=datetime.now(timezone.utc).isoformat(),
-                        content_markdown=markdown_content,
-                        content_fit=fit_content,
-                        word_count=word_count,
-                        links_internal=internal_links,
-                        links_external=external_links,
-                        metadata_json=json.dumps(metadata),
-                    )
-
-                    update_url(
-                        job_id, sr.url,
-                        status="done", title=title, words=word_count,
-                        links_internal=internal_links, links_external=external_links,
-                    )
-                    inc_counter(job_id, "crawl_done")
-                    add_log(job_id, "ok", f"<em>{_esc(title[:80])}</em> · {word_count:,}w")
-                    return doc
+                                f"discarded <code>{_esc(sr.url)}</code>: {_esc(error)}")
                 except asyncio.TimeoutError:
                     # str(TimeoutError()) is "", so say what happened.
-                    msg = f"timed out after {limit:.0f}s"
-                    update_url(job_id, sr.url, status="error", error=msg)
-                    inc_counter(job_id, "crawl_done")
-                    add_log(job_id, "err", f"gave up on <code>{_esc(sr.url)}</code>: {_esc(msg)}")
-                    return None
+                    error = f"timed out after {limit:.0f}s"
+                    add_log(job_id, "err", f"gave up on <code>{_esc(sr.url)}</code>: {_esc(error)}")
                 except Exception as e:
-                    update_url(job_id, sr.url, status="error", error=str(e)[:140])
-                    inc_counter(job_id, "crawl_done")
+                    error = str(e)[:140]
                     add_log(job_id, "err", f"exception on <code>{_esc(sr.url)}</code>: {_esc(str(e)[:120])}")
-                    return None
+                return await fail_or_fall_back(sr, error, limit)
 
         results = await asyncio.gather(*[crawl_one(sr) for sr in search_results])
         documents = [d for d in results if d is not None]

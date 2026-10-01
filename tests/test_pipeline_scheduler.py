@@ -28,10 +28,23 @@ def _add_mission(mid, status, finished_at=None, question="What changed?"):
         created_at="t", finished_at=finished_at)))
 
 
+class _Started(list):
+    """The mission ids start_planning was called with; `job_ids` holds the
+    job id passed alongside each."""
+
+    def __init__(self):
+        super().__init__()
+        self.job_ids = []
+
+    def __call__(self, mission_id, job_id=None):
+        self.append(mission_id)
+        self.job_ids.append(job_id)
+
+
 @pytest.fixture
 def started(monkeypatch):
-    calls = []
-    monkeypatch.setattr(agent_runner, "start_planning", lambda mid: calls.append(mid))
+    calls = _Started()
+    monkeypatch.setattr(agent_runner, "start_planning", calls)
     return calls
 
 
@@ -155,7 +168,7 @@ def test_mission_construction_failure_finishes_the_job(monkeypatch, started):
 def test_start_planning_failure_finishes_job_and_mission(monkeypatch):
     _init()
 
-    def cannot_start(mission_id):
+    def cannot_start(mission_id, job_id=None):
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(agent_runner, "start_planning", cannot_start)
@@ -168,3 +181,12 @@ def test_start_planning_failure_finishes_job_and_mission(monkeypatch):
     assert mission.status == "error" and mission.finished_at
     assert jobs.get_job(mission.job_id).stage == "error"
     assert not asyncio.run(storage.agent_has_active_mission("a1"))
+
+
+def test_launch_hands_its_job_to_the_worker(started):
+    """The worker finishes the job it was given even if the mission row is
+    deleted before it reads it, so the launch must pass it along."""
+    _init()
+    mid = scheduler.launch_scheduled_mission("a1")
+    m = asyncio.run(storage.get_mission(mid))
+    assert started.job_ids == [m.job_id] and m.job_id

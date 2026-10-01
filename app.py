@@ -38,13 +38,14 @@ from storage import (
     get_requirement_documents, get_agent_track_records,
     reconcile_interrupted_missions, delete_mission,
     claim_mission_status, agent_has_active_mission,
+    get_mission_llm_usage, get_mission_pair_documents,
 )
 from jobs import (
     create_job, get_job, job_state, run_job_in_background,
     get_sidebar_jobs, get_in_memory_job_ids, create_mission_job,
     request_cancel, JobLimitReached,
 )
-from agent_runner import start_planning, start_collection
+from agent_runner import start_planning, start_collection, _token_budget
 from brief import linkify_citations
 from scheduler import (start_scheduler, sync_agent_jobs, validate_cron,
                        describe_next_run, scheduled_jobs)
@@ -358,7 +359,8 @@ def index():
         }
     except Exception:
         stats = None
-    return render_template("index.html", stats=stats, agents=run_async(list_agents()))
+    return render_template("index.html", stats=stats, agents=run_async(list_agents()),
+                           default_max_llm_tokens=settings.max_llm_tokens)
 
 
 @app.route("/search", methods=["POST"])
@@ -390,7 +392,9 @@ def crawl_view(job_id):
     if not job:
         flash("Job not found.", "error")
         return redirect(url_for("index"))
-    return render_template("crawl.html", job=job)
+    # The page renders from the same serialization the stream sends, so a
+    # finished job reads right before the first message arrives.
+    return render_template("crawl.html", job=job, state=job_state(job_id))
 
 
 @app.route("/crawl/<job_id>/cancel", methods=["POST"])
@@ -491,6 +495,7 @@ def results_view(job_id):
         documents=documents,
         ext_ids=ext_ids,
         agents=run_async(list_agents()),
+        default_max_llm_tokens=settings.max_llm_tokens,
         active_page="results",
         job_meta={
             "elapsed": elapsed_s,
@@ -619,8 +624,8 @@ def documents_list():
     total = None  # set only for the paged listings
     if mission_filter:
         # Mission filter takes precedence; full-text within a mission is handled
-        # client-side by the title filter. Unpaged: a mission is bounded by
-        # its source budget.
+        # client-side by the page's filter (the same input, seeded with `q`).
+        # Unpaged: a mission is bounded by its source budget.
         mission_obj = run_async(get_mission(mission_filter))
         documents = run_async(get_mission_documents(mission_filter))
     elif full_text:
@@ -682,7 +687,11 @@ def documents_list():
         search_filter=search_filter,
         mission_filter=mission_filter,
         mission_obj=mission_obj,
-        full_text_query=full_text,
+        # The one search input always shows `q`; full_text_query is set only
+        # when the cards ARE full-text matches, which the client filter must
+        # then leave alone (their hit may be in the body it cannot see).
+        lib_query=full_text,
+        full_text_query="" if mission_filter else full_text,
         search_queries=search_queries,
         missions=missions,
         pager=pager,
@@ -848,6 +857,21 @@ def agent_delete(agent_id):
     return redirect(url_for("agents_list"))
 
 
+# Upper bound on a per-mission LLM token budget typed into the run form.
+MAX_LLM_TOKENS_INPUT = 5_000_000
+
+
+def _form_token_budget() -> int:
+    """The run form's per-mission LLM token budget (prompt + completion),
+    clamped to 0..MAX_LLM_TOKENS_INPUT. Blank, missing or unreadable input
+    means the operator default, settings.max_llm_tokens (0 = unlimited)."""
+    raw = (request.form.get("max_llm_tokens") or "").strip()[:20]
+    try:
+        return max(0, min(MAX_LLM_TOKENS_INPUT, int(raw)))
+    except ValueError:
+        return settings.max_llm_tokens
+
+
 @app.route("/agents/<agent_id>/run", methods=["POST"])
 def agent_run(agent_id):
     agent = run_async(get_agent(agent_id))
@@ -871,6 +895,7 @@ def agent_run(agent_id):
     max_sources = _clamp("max_sources", agent.default_max_sources, 1, 100)
     max_passes = _clamp("max_passes", agent.default_max_passes, 1, 10)
     per_req = _clamp("per_req_attempts", agent.default_per_req_attempts, 1, 6)
+    max_llm_tokens = _form_token_budget()
     # LLM extraction applies to the collected sources regardless of mode.
     extract = request.form.get("extract") == "on"
     extract_prompt = request.form.get("extract_prompt", "").strip()[:5000]
@@ -887,13 +912,16 @@ def agent_run(agent_id):
             "max_passes": max_passes,
             "max_sources": max_sources,
             "per_req_attempts": per_req,
+            "max_llm_tokens": max_llm_tokens,
             "extract": extract,
             "extract_prompt": extract_prompt,
         }),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
     run_async(insert_mission(mission))
-    start_planning(mission.id)
+    # Handed the job it runs under, so the worker releases that slot on every
+    # exit path -- even if the mission row is deleted underneath it.
+    start_planning(mission.id, job_id)
     return redirect(url_for("mission_view", mission_id=mission.id))
 
 
@@ -915,6 +943,136 @@ def missions_list():
                            total=len(missions), active_page="missions")
 
 
+def _cite_bound(mission, numbered) -> int:
+    """How many of the brief's [n] markers may become citation links.
+
+    Without a stored order the brief numbered ordered_sources(docs), which is
+    the rail itself, so every numbered entry is citable. With a stored order
+    (brief_sources_json) the brief numbered exactly the stored ids. The rail
+    keeps each stored slot where it was -- a document deleted since is a None
+    slot, so later numbers never shift -- and then appends documents the
+    brief never numbered (e.g. from a later retask). The bound is the number
+    of the last stored slot whose document still exists: [n] past it is LLM
+    noise or an uncited document and stays text, while a removed slot before
+    it links to its "source no longer available" row. With no removed slot
+    before a surviving one this equals the count of non-None stored slots;
+    past a gap, that count would unlink sources the brief did cite."""
+    try:
+        stored = json.loads(mission.brief_sources_json or "null")
+    except (ValueError, RecursionError):
+        stored = None
+    if not isinstance(stored, list):
+        return len(numbered)
+    stored_ids = {i for i in stored if isinstance(i, str)}
+    bound = 0
+    for n, d in numbered:
+        if d is None:
+            continue            # a stored slot whose document is gone
+        if d.id not in stored_ids:
+            break               # the appended, never-numbered documents
+        bound = n
+    return bound
+
+
+_BRIEF_CHECK_LABELS = {
+    "uncited_paragraph": "Uncited claim",
+    "junk_citation": "Cites an unusable source",
+    "requirement_unmentioned": "Requirement not addressed",
+}
+_MAX_BRIEF_CHECKS = 50
+
+
+def _brief_checks(raw) -> list[dict]:
+    """brief_warnings_json as display rows {"kind", "label", "detail"}. Never
+    raises: non-list JSON, non-dict rows and non-string fields are dropped,
+    values are bounded, and the template autoescapes them (a detail may quote
+    LLM or page text)."""
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (ValueError, RecursionError):
+        return []
+    rows = []
+    for item in parsed[:_MAX_BRIEF_CHECKS] if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind") if isinstance(item.get("kind"), str) else ""
+        detail = item.get("detail") if isinstance(item.get("detail"), str) else ""
+        if not kind and not detail:
+            continue
+        rows.append({"kind": kind[:60],
+                     "label": _BRIEF_CHECK_LABELS.get(kind, kind[:60] or "Check"),
+                     "detail": detail[:500]})
+    return rows
+
+
+def _search_passes(raw) -> list[dict]:
+    """A requirement's search_stats_json as one line per pass, in the order
+    the searches ran: {"run", "n", "queries", "results", "engines"}.
+
+    Rows are appended chronologically, and every collection run (the first,
+    then each retask) numbers its passes from 1 again. So consecutive rows
+    with the same pass number are one line, and a pass number lower than the
+    line before starts a new run: a retask's pass 1 never merges into the
+    first run's. (A retask right after a run whose last search for this
+    requirement was also pass 1 looks like more queries in that pass;
+    nothing in a row marks the run.) engines are the distinct names that
+    answered, first seen first (empty when none did). Rows that are not
+    dicts or carry no integer pass are skipped; never raises."""
+    try:
+        parsed = json.loads(raw) if raw else []
+    except (ValueError, RecursionError):
+        return []
+    lines: list[dict] = []
+    run = 1
+    for item in parsed if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            n = int(item.get("pass"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        try:
+            results = max(0, int(item.get("results") or 0))
+        except (TypeError, ValueError, OverflowError):
+            results = 0
+        if not lines or lines[-1]["n"] != n:
+            if lines and n < lines[-1]["n"]:
+                run += 1
+            lines.append({"run": run, "n": n, "queries": 0, "results": 0, "engines": []})
+        line = lines[-1]
+        line["queries"] += 1
+        line["results"] += results
+        engine = item.get("engine")
+        if isinstance(engine, str) and engine and engine[:40] not in line["engines"]:
+            line["engines"].append(engine[:40])
+    return lines
+
+
+_PURPOSE_ORDER = ("plan", "assess", "extract", "brief")
+
+
+def _token_rows(usage: dict) -> list[dict]:
+    """get_mission_llm_usage's by_purpose as rows in pipeline order (plan,
+    assess, extract, brief, then anything else alphabetically)."""
+    by = usage.get("by_purpose") or {}
+    rank = {p: i for i, p in enumerate(_PURPOSE_ORDER)}
+    return [
+        {"purpose": p, "calls": by[p]["calls"], "prompt": by[p]["prompt_tokens"],
+         "completion": by[p]["completion_tokens"],
+         "total": by[p]["prompt_tokens"] + by[p]["completion_tokens"]}
+        for p in sorted(by, key=lambda p: (rank.get(p, len(rank)), p))
+    ]
+
+
+def _budget_max_llm_tokens(budget: dict) -> int:
+    """The token cap collection enforces: the mission's own budget_json
+    max_llm_tokens, else settings.max_llm_tokens. 0 = none."""
+    try:
+        return max(0, int(budget.get("max_llm_tokens", settings.max_llm_tokens)))
+    except (TypeError, ValueError, OverflowError):
+        return max(0, settings.max_llm_tokens)
+
+
 @app.route("/missions/<mission_id>")
 def mission_view(mission_id):
     mission = run_async(get_mission(mission_id))
@@ -931,33 +1089,22 @@ def mission_view(mission_id):
     # the brief bind to the right rail entry. Capped like the brief itself:
     # with a stored order, ordered_sources_for_mission appends every uncited
     # document too, and numbering must not run past what a brief can cite.
+    # A None entry is a stored slot whose document is gone: it keeps its
+    # number (the rail shows it as removed) and no document carries it.
     ordered = brief.ordered_sources_for_mission(mission, documents)
     numbered = list(enumerate(ordered[:brief.MAX_BRIEF_SOURCES], 1))
-    doc_number = {d.id: n for n, d in numbered}
-
-    # Which [n] may become links. With a stored order the brief numbered
-    # exactly those documents (the ones still present lead the rail), so an
-    # out-of-range [n] -- LLM noise in an old brief -- must stay text rather
-    # than bind to an uncited document a later retask appended.
-    cite_bound = len(numbered)
-    try:
-        stored = json.loads(mission.brief_sources_json or "null")
-    except (ValueError, RecursionError):
-        stored = None
-    if isinstance(stored, list):
-        present = {d.id for d in documents}
-        cited = {i for i in stored if isinstance(i, str) and i in present}
-        cite_bound = min(cite_bound, len(cited))
+    doc_number = {d.id: n for n, d in numbered if d is not None}
 
     # Sanitize first (never bypassed), then turn [n] into citation controls.
     brief_html = ""
     if mission.brief_markdown:
         brief_html = linkify_citations(
-            render_markdown(mission.brief_markdown), cite_bound)
+            render_markdown(mission.brief_markdown), _cite_bound(mission, numbered))
 
     # Sources per requirement, carrying their citation number where they have
-    # one, plus the queries the agent ran/will run (stored as JSON).
-    req_sources, req_queries = {}, {}
+    # one, plus the queries the agent ran/will run (stored as JSON) and what
+    # each pass of searching returned.
+    req_sources, req_queries, req_search = {}, {}, {}
     for r in requirements:
         req_sources[r.id] = [
             {"doc": d, "n": doc_number.get(d.id)}
@@ -967,23 +1114,79 @@ def mission_view(mission_id):
             req_queries[r.id] = json.loads(r.next_queries_json or "[]")
         except json.JSONDecodeError:
             req_queries[r.id] = []
+        req_search[r.id] = _search_passes(r.search_stats_json)
 
-    budget = {}
-    try:
-        budget = json.loads(mission.budget_json or "{}")
-    except json.JSONDecodeError:
-        budget = {}
+    budget = _mission_budget(mission)
+    llm_usage = run_async(get_mission_llm_usage(mission_id))
+    # The compare link only when there is a previous run to compare with.
+    has_parent = bool(mission.parent_mission_id) and \
+        run_async(get_mission(mission.parent_mission_id)) is not None
 
     live_state = job_state(mission.job_id) if mission.job_id else None
     return render_template(
         "mission.html", mission=mission, agent=agent,
         requirements=requirements, documents=documents,
-        numbered_sources=numbered, req_sources=req_sources,
-        req_queries=req_queries,
-        brief_html=brief_html, ext_ids=ext_ids, budget=budget,
+        numbered_sources=numbered,
+        rail_available=sum(1 for _n, d in numbered if d is not None),
+        req_sources=req_sources, req_queries=req_queries, req_search=req_search,
+        brief_html=brief_html, brief_checks=_brief_checks(mission.brief_warnings_json),
+        ext_ids=ext_ids, budget=budget,
+        llm_usage=llm_usage, token_rows=_token_rows(llm_usage),
+        max_llm_tokens=_budget_max_llm_tokens(budget),
+        resume=_resume_offer(mission, requirements, budget, agent,
+                             llm_usage["prompt_tokens"] + llm_usage["completion_tokens"]),
+        has_parent=has_parent,
         live_state=live_state,
         live=mission.job_id in get_in_memory_job_ids(),
         active_page="missions",
+    )
+
+
+def _unique_by_url(docs: list) -> list:
+    """One document per URL, first occurrence kept: the same page stored
+    under two search queries is one source."""
+    seen, out = set(), []
+    for d in docs:
+        if d.url not in seen:
+            seen.add(d.url)
+            out.append(d)
+    return out
+
+
+@app.route("/missions/<mission_id>/compare")
+def mission_compare(mission_id):
+    """This run beside the run it follows (parent_mission_id, which the
+    scheduler sets): both briefs, and the sources split by URL into new in
+    this run, dropped since the previous one, and shared."""
+    mission = run_async(get_mission(mission_id))
+    if not mission:
+        flash("Mission not found.", "error")
+        return redirect(url_for("missions_list"))
+    if not mission.parent_mission_id:
+        flash("This mission has no previous run to compare with.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    parent = run_async(get_mission(mission.parent_mission_id))
+    if not parent:
+        flash("The previous run was deleted, so there is nothing to compare with.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+
+    child_docs, parent_docs = run_async(get_mission_pair_documents(mission_id, parent.id))
+    child_docs, parent_docs = _unique_by_url(child_docs), _unique_by_url(parent_docs)
+    child_urls = {d.url for d in child_docs}
+    parent_urls = {d.url for d in parent_docs}
+    delta = {
+        "new": [d for d in child_docs if d.url not in parent_urls],
+        "dropped": [d for d in parent_docs if d.url not in child_urls],
+        "shared": [d for d in child_docs if d.url in parent_urls],
+    }
+    # Both briefs sanitized like every brief. Not linkified: [n] controls
+    # bind to a source rail, and this page has none.
+    return render_template(
+        "mission_compare.html", mission=mission, parent=parent,
+        agent=run_async(get_agent(mission.agent_id)),
+        brief_html=render_markdown(mission.brief_markdown) if mission.brief_markdown else "",
+        parent_brief_html=render_markdown(parent.brief_markdown) if parent.brief_markdown else "",
+        delta=delta, active_page="missions",
     )
 
 
@@ -1000,6 +1203,152 @@ def _budget_max_sources(budget: dict) -> int:
         return max(1, int(budget.get("max_sources", 30)))
     except (TypeError, ValueError):
         return 30
+
+
+def _budget_max_passes(budget: dict) -> int:
+    try:
+        return max(1, int(budget.get("max_passes", 4)))
+    except (TypeError, ValueError, OverflowError):
+        return 4
+
+
+# --- resume after a limit ---
+
+# missions.stop_reason values a Resume picks up from: the run ended on a
+# limit, or on the user's Stop, with requirements still open.
+_RESUMABLE_STOPS = ("pass_budget", "source_budget", "token_budget", "user_stop")
+
+# Per limit: the budget_json key a Resume raises, its name in plain words,
+# the most one Resume may add, and the unit shown beside its field. A user
+# Stop raises nothing.
+_RESUME_LIMITS = {
+    "token_budget": ("max_llm_tokens", "token budget", MAX_LLM_TOKENS_INPUT, "tokens"),
+    "source_budget": ("max_sources", "source budget", 100, "sources"),
+    "pass_budget": ("max_passes", "pass budget", 10, "passes"),
+}
+
+_STOP_LABELS = {
+    "token_budget": "Stopped: token budget reached",
+    "source_budget": "Stopped: source budget reached",
+    "pass_budget": "Stopped: pass budget reached",
+    "user_stop": "Stopped by you",
+}
+
+# Prefill for the token field when the stored budget is 0 (unlimited); a
+# mission with no token limit cannot stop on one, so this is a fallback.
+_RESUME_TOKEN_PREFILL = 15000
+
+
+def _attempt_cap(mission, agent=None) -> int:
+    """The per-requirement attempt cap collection ran under, read as
+    _run_collection reads it: the mission's budget_json per_req_attempts,
+    else the agent's default (3 once the agent is gone). The agent is only
+    looked up when the budget lacks the key and none was passed."""
+    budget = _mission_budget(mission)
+    if "per_req_attempts" not in budget and agent is None:
+        agent = run_async(get_agent(mission.agent_id))
+    default = agent.default_per_req_attempts if agent else 3
+    try:
+        return max(1, int(budget.get("per_req_attempts", default)))
+    except (TypeError, ValueError, OverflowError):
+        return max(1, int(default))
+
+
+def _reopenable(mission, requirements, agent=None) -> list:
+    """The requirements a Resume puts back to work: every one still
+    pending, plus every unmet one with attempts left (attempts below the
+    cap): never reached ("not attempted: ..."), or tried but still open
+    when the run stopped. Satisfied and capped-out requirements never
+    re-run. The one rule behind the route, the page and api_mission."""
+    cap = _attempt_cap(mission, agent)
+    return [r for r in requirements
+            if r.status == "pending" or (r.status == "unmet" and r.attempts < cap)]
+
+
+def _resumable(mission, requirements, agent=None) -> bool:
+    """True when a finished mission stopped on a limit (or a Stop) and has
+    something to reopen."""
+    return (mission.status == "done" and mission.stop_reason in _RESUMABLE_STOPS
+            and bool(_reopenable(mission, requirements, agent)))
+
+
+def _limit_value(budget: dict, stop_reason: str) -> int:
+    """The current value of the limit that stopped the mission (0 for an
+    unlimited token budget)."""
+    if stop_reason == "token_budget":
+        return _budget_max_llm_tokens(budget)
+    if stop_reason == "source_budget":
+        return _budget_max_sources(budget)
+    return _budget_max_passes(budget)
+
+
+def _form_count(field: str, cap: int) -> int | None:
+    """A Resume form number clamped to 1..cap, or None when the field is
+    missing, blank or unreadable."""
+    raw = (request.form.get(field) or "").strip()[:20]
+    try:
+        return max(1, min(cap, int(raw)))
+    except ValueError:
+        return None
+
+
+def _tokens_spent(budget: dict, used: int) -> bool:
+    """True when the mission has a token budget and has used all of it: a
+    run resumed like that stops before its first requirement."""
+    cap = _budget_max_llm_tokens(budget)
+    return cap > 0 and used >= cap
+
+
+def _token_prefill(budget: dict, used: int) -> int:
+    """The token field's prefill: the stored budget plus however far usage
+    has overshot it, so the resumed run gets a full budget of headroom (a
+    run only stops at the first checkpoint after crossing its budget, so a
+    token stop has always overshot). Clamped to 1..MAX_LLM_TOKENS_INPUT."""
+    cap = _budget_max_llm_tokens(budget)
+    if cap <= 0:
+        return _RESUME_TOKEN_PREFILL
+    return max(1, min(MAX_LLM_TOKENS_INPUT, cap + max(0, used - cap)))
+
+
+def _resume_prefill(budget: dict, stop_reason: str, used: int) -> int:
+    """What the `extra` field is prefilled with, and what a blank or
+    unreadable `extra` means: the token prefill after a token stop, else
+    the limit's current value, clamped like the field."""
+    if stop_reason == "token_budget":
+        return _token_prefill(budget, used)
+    _key, _name, cap, _unit = _RESUME_LIMITS[stop_reason]
+    return max(1, min(cap, _limit_value(budget, stop_reason)))
+
+
+def _resume_offer(mission, requirements, budget: dict, agent=None,
+                  used_tokens: int = 0) -> dict | None:
+    """What the done-state Resume control shows, or None when the mission
+    has nothing to resume. `fields` holds the number inputs: `extra` for
+    the limit that stopped the run (none after a user Stop), and
+    `extra_tokens` when the token budget is spent and the stop was not the
+    token budget itself (that one's `extra` is already the token field).
+    Wherever a token field shows, the label says how much was used."""
+    if not _resumable(mission, requirements, agent):
+        return None
+    stop = mission.stop_reason
+    n = len(_reopenable(mission, requirements, agent))
+    token_cap = _budget_max_llm_tokens(budget)
+    fields, usage_note = [], ""
+    limit = _RESUME_LIMITS.get(stop)
+    if limit:
+        _key, name, cap, unit = limit
+        fields.append({"input": "extra", "name": name, "unit": unit, "max": cap,
+                       "value": _resume_prefill(budget, stop, used_tokens)})
+    if stop == "token_budget" and token_cap > 0:
+        usage_note = f" · {used_tokens:,} of {token_cap:,} used"
+    elif _tokens_spent(budget, used_tokens):
+        fields.append({"input": "extra_tokens", "name": "token budget", "unit": "tokens",
+                       "max": MAX_LLM_TOKENS_INPUT,
+                       "value": _token_prefill(budget, used_tokens)})
+        usage_note = f" · {used_tokens:,} of {token_cap:,} tokens used"
+    return {"label": f"{_STOP_LABELS[stop]}{usage_note} · "
+                     f"{n} requirement{'' if n == 1 else 's'} still open",
+            "fields": fields}
 
 
 _MAX_PLAN_ROWS = 50   # a drafted plan is a handful of requirements
@@ -1116,7 +1465,8 @@ def mission_approve(mission_id):
         run_async(update_mission(mission_id, job_id=job_id))
         undo.append(("restore the planning trace", lambda: run_async(
             update_mission(mission_id, job_id=mission.job_id))))
-        start_collection(mission_id)
+        # Handed the job so the worker releases it on every exit path.
+        start_collection(mission_id, job_id)
     except JobLimitReached as e:
         _rollback(mission_id, undo)
         flash(f"Busy: {e}.", "error")
@@ -1134,14 +1484,16 @@ def mission_approve(mission_id):
 
 @app.route("/missions/<mission_id>/stop", methods=["POST"])
 def mission_stop(mission_id):
-    """Cooperative stop: the runner finishes the current pass, then synthesizes
-    a brief from whatever was collected."""
+    """Cooperative stop, honoured before the next requirement: the runner
+    finishes the requirement in flight, marks the rest unmet (one never
+    tried says "not attempted: stopped by user"), then synthesizes a brief
+    from whatever was collected."""
     mission = run_async(get_mission(mission_id))
     if not mission:
         flash("Mission not found.", "error")
         return redirect(url_for("missions_list"))
     if mission.job_id and request_cancel(mission.job_id):
-        flash("Stopping after the current pass — the brief will still be written.", "info")
+        flash("Stopping after the current requirement — the brief will still be written.", "info")
     else:
         flash("This mission is not running.", "info")
     return redirect(url_for("mission_view", mission_id=mission_id))
@@ -1187,6 +1539,17 @@ def requirement_retask(mission_id, req_id):
     if mission.status == "awaiting_approval":
         flash("Approve the plan first — re-tasking is for a mission that has finished.", "info")
         return redirect(url_for("mission_view", mission_id=mission_id))
+    # A mission that has spent its token budget cannot collect again (the
+    # runner stops before the first requirement), yet a retask would still
+    # re-extract and re-write the brief: refuse it before anything changes.
+    token_budget = _token_budget(_mission_budget(mission))
+    if token_budget > 0:
+        usage = run_async(get_mission_llm_usage(mission_id))
+        used = usage["prompt_tokens"] + usage["completion_tokens"]
+        if used >= token_budget:
+            flash(f"This mission has used {used:,} of {token_budget:,} tokens; "
+                  "raise the budget before re-tasking.", "error")
+            return redirect(url_for("mission_view", mission_id=mission_id))
 
     req = next((r for r in run_async(get_requirements_for_mission(mission_id))
                 if r.id == req_id), None)
@@ -1248,7 +1611,8 @@ def requirement_retask(mission_id, req_id):
             assessment_missing=req.assessment_missing,
             assessment_confidence=req.assessment_confidence,
         ))))
-        start_collection(mission_id)
+        # Handed the job so the worker releases it on every exit path.
+        start_collection(mission_id, job_id)
     except BaseException:
         _rollback(mission_id, undo)
         raise
@@ -1272,6 +1636,111 @@ def requirement_accept(mission_id, req_id):
     run_async(update_requirement(req_id, status="satisfied", accepted_by_user=1))
     flash(f"“{req.title}” marked satisfied — recorded as your decision, not the assessor's.",
           "success")
+    return redirect(url_for("mission_view", mission_id=mission_id))
+
+
+@app.route("/missions/<mission_id>/resume", methods=["POST"])
+def mission_resume(mission_id):
+    """Pick a mission back up after its collection stopped on a limit (or a
+    Stop) with requirements still open: raise that limit, reopen every
+    requirement with attempts left, and collect again on a fresh job.
+    Sources already collected are kept, satisfied and capped-out
+    requirements are never re-run, and the brief is rewritten as after a
+    retask."""
+    mission = run_async(get_mission(mission_id))
+    if not mission:
+        flash("Mission not found.", "error")
+        return redirect(url_for("missions_list"))
+    if mission.status != "done" or mission.stop_reason not in _RESUMABLE_STOPS:
+        flash("This mission has nothing to resume.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    reopen = _reopenable(mission, run_async(get_requirements_for_mission(mission_id)))
+    if not reopen:
+        flash("Every requirement is satisfied or capped out — nothing to resume.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+
+    # The raised budget, worked out before anything changes. max_llm_tokens
+    # is cumulative across runs; max_sources/max_passes are per run.
+    budget = _mission_budget(mission)
+    token_cap = _budget_max_llm_tokens(budget)
+    used = 0
+    if token_cap > 0:
+        usage = run_async(get_mission_llm_usage(mission_id))
+        used = usage["prompt_tokens"] + usage["completion_tokens"]
+    raised = dict(budget)
+    notes = []
+    limit = _RESUME_LIMITS.get(mission.stop_reason)
+    if limit:
+        key, name, cap, _unit = limit
+        current = _limit_value(raised, mission.stop_reason)
+        if current > 0:            # an unlimited (0) token budget stays unlimited
+            extra = _form_count("extra", cap)
+            if extra is None:      # blank or unreadable: what the field is prefilled with
+                extra = _resume_prefill(budget, mission.stop_reason, used)
+            raised[key] = current + extra
+            notes.append(f"{name} raised to {raised[key]:,}")
+    # Any other stop may raise the token budget as well (extra_tokens); a
+    # token-budget stop's `extra` already is that raise.
+    if mission.stop_reason != "token_budget" and token_cap > 0:
+        extra_tokens = _form_count("extra_tokens", MAX_LLM_TOKENS_INPUT)
+        if extra_tokens is not None:
+            raised["max_llm_tokens"] = token_cap + extra_tokens
+            notes.append(f"token budget raised to {raised['max_llm_tokens']:,}")
+    # A spent token budget stops the resumed run before its first
+    # requirement, yet the brief would still be re-written: unless the raise
+    # takes the budget past what was used, refuse before anything changes.
+    if token_cap > 0 and _tokens_spent(raised, used):
+        flash(f"This mission has used {used:,} of its {token_cap:,}-token budget; "
+              f"raise the token budget above {used:,} to resume.", "error")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+
+    # The job first, as for a retask: if the queue is full, nothing about
+    # the mission or its requirements has changed yet.
+    try:
+        job_id = create_mission_job(mission.question, _budget_max_sources(raised))
+    except JobLimitReached as e:
+        flash(f"Busy: {e}.", "error")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    # From here on, any failure undoes what was done so far, newest first:
+    # the job holds a slot, and a claimed mission with no worker behind it
+    # cannot be stopped or deleted until restart.
+    undo = [("release the new job", lambda: jobs.finish_job(
+        job_id, stage="error", error="resume failed"))]
+    try:
+        # Then claim the transition, so a concurrent resume (or retask)
+        # cannot start a second worker.
+        if not run_async(claim_mission_status(mission_id, "done", "collecting")):
+            jobs.finish_job(job_id, stage="cancelled")
+            flash("This mission changed state in the meantime — nothing was resumed.",
+                  "info")
+            return redirect(url_for("mission_view", mission_id=mission_id))
+        undo.append(("restore status done", lambda: run_async(
+            claim_mission_status(mission_id, "collecting", "done"))))
+        run_async(update_mission(
+            mission_id, budget_json=json.dumps(raised),
+            resume_count=mission.resume_count + 1,
+            error=None, stop_reason=None, job_id=job_id))
+        undo.append(("restore the mission", lambda: run_async(update_mission(
+            mission_id, budget_json=mission.budget_json,
+            resume_count=mission.resume_count, error=mission.error,
+            stop_reason=mission.stop_reason, job_id=mission.job_id))))
+        # Reopened with their attempts kept, so each gets only the tries it
+        # has left (one never reached has 0).
+        for r in reopen:
+            run_async(update_requirement(
+                r.id, status="pending", assessment_missing="", assessment_confidence=""))
+            undo.append((f"restore requirement {r.id}", lambda r=r: run_async(
+                update_requirement(r.id, status=r.status,
+                                   assessment_missing=r.assessment_missing,
+                                   assessment_confidence=r.assessment_confidence))))
+        # Handed the job so the worker releases it on every exit path.
+        start_collection(mission_id, job_id)
+    except BaseException:
+        _rollback(mission_id, undo)
+        raise
+    n = len(reopen)
+    flash(f"Resuming — {n} requirement{'' if n == 1 else 's'} reopened"
+          f"{''.join(', ' + note for note in notes)}.", "success")
     return redirect(url_for("mission_view", mission_id=mission_id))
 
 
@@ -1312,7 +1781,13 @@ def api_mission(mission_id):
         "unmet": sum(1 for r in requirements if r.status == "unmet"),
         "total": len(requirements),
         "done": mission.status in ("done", "error"),
+        "stop_reason": mission.stop_reason,
+        "resumable": _resumable(mission, requirements),
     }
+    # Prompt + completion across every recorded call; the page's LLM tokens
+    # cell ([data-tele-tokens]) follows it live.
+    usage = run_async(get_mission_llm_usage(mission_id))
+    state["llm_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
     if mission.job_id:
         js = job_state(mission.job_id)
         if js:

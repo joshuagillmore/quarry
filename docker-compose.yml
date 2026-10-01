@@ -11,6 +11,10 @@ services:
       - ./data:/app/data
     env_file:
       - .env
+    # Using a local Ollama that only publishes on 127.0.0.1? The default
+    # OLLAMA_API_BASE (host.docker.internal) can't reach it from in here —
+    # see docker-compose.ollama.example.yml and the README section "Using a
+    # local Ollama from Docker".
     environment:
       # Passed through explicitly (not just via env_file) so the in-container
       # exposure guard (insecure_exposure() in app.py) sees the same publish

@@ -44,7 +44,8 @@ The crawl page is driven by the SSE endpoint alone (`GET /api/job/<id>/stream`, 
 
 ### Two crawler functions — use the progress one
 
-`crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. The one-shot crawl (`_run_job`) passes `skip_on_cancel=True`: a cancel marks every page not fetched yet `skipped`, keeps the pages already fetched, and ends the job `cancelled`. Missions leave it off, because their stop is honoured at the next pass boundary. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
+`crawler.py` has both `crawl_urls` (batch, no progress) and `crawl_urls_with_progress`. **The app only uses the latter.** It crawls with an `asyncio.Semaphore(4)` and reports per-URL state back into the job store via `update_url`/`add_log`/`inc_counter`. The one-shot crawl (`_run_job`) passes `skip_on_cancel=True`: a cancel marks every page not fetched yet `skipped`, keeps the pages already fetched, and ends the job `cancelled`. Missions leave it off, because their stop is honoured before the next requirement: the requirement in flight finishes its crawl and assessment. Crawl4ai produces two markdown variants per page: `raw_markdown` (stored as `content_markdown`) and `fit_markdown` (stored as `content_fit`); the extractor prefers `content_fit`.
+- **A failed or blocked crawl gets one plain-HTTP retry.** When a page's Chromium fetch fails or times out, or `content_quality.looks_like_block_page` rejects it, and `settings.crawl_fallback` is true (default), `crawl_urls_with_progress` fetches the URL once more (`_fetch_fallback_html`). It streams the response with `httpx.stream` (a desktop `User-Agent`, `follow_redirects=True`, `Accept-Encoding: gzip, deflate` pinned, never `br`) and judges it from the headers before any body is read: a non-`200` status, a non-HTML content type, an unsupported or stacked `Content-Encoding`, or a `Content-Length` past the 5 MB cap is refused without downloading. The body is read raw (`iter_raw`, so httpx never decodes it) through `_CappedBody`, which inflates gzip/deflate itself with zlib's `max_length` and so bounds the **decoded** size exactly. A wall-clock deadline (the crawl timeout) runs from before the request, checked after the final headers and after every chunk, since httpx's timeout is per read. All of that body work — fetching, inflating, decoding, the block-page check — runs off the event loop via `asyncio.to_thread`, and every scan of the page-controlled HTML (title, script/style stripping, rough word count) is linear. Only a page that passes is converted: `crawler.arun(url="raw:" + html, config=_conversion_config(final_url))`, a plain config with no browser-requiring flags (crawl4ai would otherwise render a `raw:` page in Chromium) and the final URL as `base_url`. The result then goes through the same `_page_document` junk gate as a normal crawl, so a thin or block page is still discarded. Rows fetched this way are stored under the fetch's final URL with `metadata_json["fetched_via"] = "fallback"`, and the URL's status becomes `done`, not a degraded state. The fallback never runs for `file:`/non-HTTP URLs, and its log lines are still `html.escape`d like the rest of the crawl log.
 
 ### Storage (`storage.py`)
 
@@ -72,12 +73,87 @@ runs a **Mission** against a question using an intelligence-collection loop:
   at `status=awaiting_approval`; `POST /missions/<id>/approve` then launches
   `start_collection`, which loops searching → `crawl_urls_with_progress` →
   `assess_requirement` (gap analysis) → re-tasking the unmet gaps. Both run in
-  daemon threads (`asyncio.run`), mirroring `jobs._run_thread`.
+  daemon threads (`asyncio.run`), mirroring `jobs._run_thread`. Both take an
+  optional `job_id`; when one is given, the background thread finishes that
+  exact job on every exit path — success, error, or the mission row having
+  been deleted out from under it mid-run — instead of trying to look the job
+  up from the mission. `mission_approve`, `requirement_retask`, `agent_run`,
+  and `scheduler._launch` all pass the job id they themselves created.
 - **Completion is concrete, not vibes:** a mission is done when every requirement
   is `satisfied` or `unmet`. The circuit-breaker is `per_req_attempts` — a
   requirement still unmet after that many tries is marked `unmet` and the agent
   moves on. `max_passes`/`max_sources` are the global budget backstops (stored in
   `missions.budget_json`).
+- **A token budget is a stop condition, not a suggestion.** `_run_collection`
+  checks `storage.get_mission_llm_usage(mission_id)`'s prompt+completion total
+  against `budget.get("max_llm_tokens", settings.max_llm_tokens)` (`0` =
+  unlimited) at each pass boundary and again before each requirement inside
+  the pass — the same checkpoint the mid-pass `Stop` cancellation already
+  used — and crossing it stops the loop and logs `token budget reached`.
+  Collection stopped that way also skips extraction (`skipping extraction:
+  token budget reached`, one LLM call per source), while the brief, a single
+  call, still runs. Every requirement still pending is marked `unmet`, the
+  same shape as any unmet requirement rather than a crash; one never tried
+  (`attempts == 0`) gets `assessment_missing="not attempted: token budget
+  reached"` (or `"not attempted: stopped by user"` after a Stop), while one
+  already tried in an earlier pass keeps its last assessor gap text.
+  `requirement_retask` refuses a mission whose spend has reached its budget,
+  with a flash and no state change: the runner would stop before the first
+  requirement, yet the retask would still re-extract and re-write the brief.
+  The per-run override is the "LLM tokens" field in the **Agentic
+  Crawl** panel of the Search page's run form (`max_llm_tokens`, 0–5,000,000,
+  blank or non-numeric falling back to `settings.max_llm_tokens`); `agent_run`
+  writes it into that mission's `budget_json`. There is no agent-level
+  default — the `agents` table is untouched — so re-running a mission from
+  its own page (which carries no budget forward) always gets the operator
+  default, not whatever budget its previous run used.
+- **A mission that stopped on a limit can be resumed.** `_run_collection`
+  records why it ended in `missions.stop_reason`, written by `_synthesize`
+  in the same `update_mission` as the brief: `pass_budget`,
+  `source_budget`, `token_budget` or `user_stop` when requirements were
+  still pending, and `complete` when nothing is pending and no unmet
+  requirement has attempts left (even when a budget ran out on that same
+  last pass). A run that leaves nothing pending while unmet requirements
+  still have attempts left — a retask reopens only one requirement — keeps
+  the previous run's reason, so Resume still offers them. The column holds
+  the last finished run's reason until a new run finishes: a retask does
+  not clear it (the carry-forward relies on that), so while a retask runs,
+  and after one that crashed, it is still the previous reason; a Resume
+  clears it when it starts. It is NULL for missions finished before the
+  column existed and for runs that have not finished since a Resume. A `done`
+  mission with one of the four limit reasons gets a **Resume** control in
+  the done-state telemetry actions (`POST /missions/<id>/resume`, one
+  `extra` field). It reopens every requirement still `pending` plus every
+  `unmet` one with attempts left (`attempts < per_req_attempts`, from
+  `budget_json`, else the agent's default) — never reached ("not
+  attempted: ...") or tried but still open when the run stopped, which is
+  how a `pass_budget` stop leaves them — clearing their assessment and
+  keeping `attempts`, so each gets only its remaining tries. Satisfied and
+  capped-out requirements are never re-run, and every collected source is
+  kept. It raises the limit that stopped the run:
+  `max_llm_tokens += extra` (cumulative across runs, 1–5,000,000; an
+  unlimited 0 stays 0), `max_sources += extra` (1–100) or `max_passes +=
+  extra` (1–10), the last two being per-run budgets; after `user_stop`
+  nothing is raised. Each later run gets a raised `max_sources`/`max_passes`
+  in full, so repeated resumes grow them with no overall cap (each resume
+  is bounded only by its own clamp); that is accepted. Whatever the stop, a
+  token budget (> 0) that is already used up must be raised too, or the
+  resumed run would stop before its first requirement and still re-write
+  the brief: the form adds an `extra_tokens` field (1–5,000,000) when
+  usage ≥ budget — after a `token_budget` stop `extra` already is that
+  field — and the route refuses, with nothing changed, unless the raise
+  takes the budget past the tokens used. A token field is prefilled with
+  `max_llm_tokens + max(0, used - max_llm_tokens)` (a run stops only at
+  the first checkpoint after crossing its budget, so it has overshot), so
+  the resumed run gets a full budget of headroom, and the label shows the
+  usage ("13,921 of 8,000 used"). It
+  increments `resume_count`, clears `error` and
+  `stop_reason`, and follows the retask shape: job first (Busy on
+  `JobLimitReached`), then `claim_mission_status(id, "done", "collecting")`,
+  an undo list on any later failure, then `start_collection(id, job_id)`,
+  so extraction re-runs if the mission has it and the brief is rewritten.
+  `_reopenable`/`_resumable` are the one rule behind the page control,
+  `api_mission`'s `resumable` flag and the route.
 - **Source of truth is SQLite, not the job store.** Mission status, requirements,
   and the brief live in the new tables (`agents`, `missions`, `requirements`,
   `mission_documents`). The in-memory job store (`jobs.create_mission_job`) only
@@ -110,7 +186,21 @@ runs a **Mission** against a question using an intelligence-collection loop:
   transient (rate limits, dropped connections, Cohere's
   `NO_VALID_RESPONSE_GENERATED`); a non-transient error — a bad model id, an
   auth failure — fails on the first attempt rather than burning the retry
-  budget on something a retry can't fix.
+  budget on something a retry can't fix. `chat_ex` (and the `chat`/`chat_json`
+  wrappers, which forward the same kwargs) take `purpose` and `mission_id`,
+  time every provider call, and record one `LlmCall` row via
+  `storage.insert_llm_call` for each call that actually returns — the
+  fallback call included, under its own model id — while an attempt that
+  raised and got retried is never recorded; a recording failure is logged to
+  stderr and never raised, so a DB hiccup can't fail a mission over
+  telemetry. Callers pass a purpose per call site: `"plan"` (planner),
+  `"assess"` (assessor), `"brief"` (synthesis), `"extract"` (extractor,
+  threaded through `_extract_sources` with the mission id when extraction
+  runs inside a mission, `None` for the one-shot pipeline).
+  `storage.get_mission_llm_usage(mission_id)` rolls those rows up per
+  mission — totals plus a `by_purpose` breakdown — for the mission page's
+  telemetry strip; `api_mission` also returns `llm_tokens` so the ~1.2s poll
+  updates that cell without a page reload.
 - **The mission view** (`templates/mission.html`) renders three states from
   `mission.status` — editable **approval gate**, **requirements matrix**, and
   **brief + citation-linked source rail**. It polls `GET /api/mission/<id>`
@@ -128,17 +218,55 @@ runs a **Mission** against a question using an intelligence-collection loop:
 - **Citation numbering must match the brief, even after a restart.**
   The LLM prompt numbers sources with `brief.ordered_sources(docs)`, and
   `_synthesize` persists that exact order to `missions.brief_sources_json`.
-  The source rail uses the stored order (via
-  `brief.ordered_sources_for_mission`: stored ids still present, then any
-  documents the brief did not number), capped at `brief.MAX_BRIEF_SOURCES`,
-  so re-rendering the mission page (or restarting the process) can't silently
-  renumber the rail against a different ordering than the one the brief text
-  actually cites. Linkify is bounded by the count of stored ids still
-  present, so an out-of-range `[n]` stays plain text rather than binding to
-  an uncited document a later retask appended.
+  The source rail uses the stored order via `brief.ordered_sources_for_mission`:
+  stored ids keep their slot even when the document behind one is gone — a
+  missing id yields `None` in that position rather than being skipped, so a
+  deleted or stranded source doesn't shift every later citation number down —
+  followed by any documents the brief did not number (e.g. added by a later
+  retask), capped at `brief.MAX_BRIEF_SOURCES`. Re-rendering the mission page
+  (or restarting the process) therefore can't silently renumber the rail
+  against a different ordering than the one the brief text actually cites.
+  The mission page renders a `None` slot as a muted "source no longer
+  available" row and excludes it from `doc_number`. `linkify_citations`'s
+  bound (`app._cite_bound`) is the **position of the last surviving stored
+  slot**, not the count of surviving slots — those differ once a slot is
+  `None`: with a stored order `[d1, gone, d2]`, the count of surviving slots
+  is 2, but bounding by that count would unlink `[3]` even though it's `d2`,
+  a real, still-cited source. Bounding by position instead keeps `[3]`
+  linked, while `[2]` — the removed slot — still resolves to its "source no
+  longer available" rail row rather than falling through as plain text.
+  Past the bound, `[n]` is either LLM noise or an uncited document and stays
+  plain text.
   `brief.linkify_citations()` turns `[n]` into `.cite` controls **after**
   `render_markdown` sanitization (it only ever injects markup built from an
   integer it re-serializes, so the sanitizer is never weakened or bypassed).
+- **The brief is checked for its own mistakes.** After `_synthesize` writes
+  the brief, `brief.brief_warnings(mission, requirements, docs, brief_md)`
+  flags three things: an uncited paragraph or bullet of real length (outside
+  Coverage & Gaps), a `[n]` citation pointing at a source
+  `content_quality.is_usable` would reject, and a requirement whose key terms
+  never surface in the brief outside its Coverage & Gaps section (which
+  restates every requirement by design; a degraded coverage-only brief is not
+  checked for this). `[n]` resolves only within the stored order the brief
+  was numbered with, never against documents a later retask appended after
+  it. The prompt asks for inline `[n]` in the Summary as well as Key
+  Findings, so the uncited check does not fire on every Summary. The
+  warnings are stored as `missions.brief_warnings_json` in the same
+  `update_mission` call that saves the brief, and `_synthesize` logs
+  `brief checks: N warning(s)`. The mission page renders any of them as a
+  "Brief checks" callout above the brief — a prompt to read closer, not a
+  correctness guarantee.
+- **A mission can be compared against its own history.** `GET
+  /missions/<id>/compare` renders `templates/mission_compare.html`: both
+  briefs side by side (each through `render_markdown`, un-linkified), the two
+  questions and dates, and three source lists built from
+  `storage.get_mission_pair_documents(mission_id, parent_id)` — new this run,
+  dropped since the parent, and shared, deduped by URL (a page stored under
+  two different search queries still counts once). It 404s-to-flash when the
+  mission has no `parent_mission_id` or that parent mission is gone. The
+  mission page links to it ("Compare with previous run") whenever a live
+  parent exists —
+  every scheduled run already has one via `parent_mission_id`.
 - **Approve and re-task are atomic status transitions, not unconditional
   `UPDATE`s.** `storage.claim_mission_status(mission_id, from_status,
   to_status)` is a compare-and-set: it only flips the row if it's still in
@@ -146,7 +274,10 @@ runs a **Mission** against a question using an intelligence-collection loop:
   dropped connection) can't launch collection twice for the same mission.
 - **Telemetry + cooperative stop** live in the job store (`pass_num`,
   `sources_used`, `cancel_requested`); `agent_runner` checks `jobs.is_cancelled`
-  at pass boundaries so a stop still produces a brief from what was collected.
+  at each pass boundary and again before each requirement, so a stop costs at
+  most the requirement in flight and still produces a brief from what was
+  collected. The mission page's button says so: "Stop after the current
+  requirement".
 - **Static assets are cache-busted** by mtime (`@app.url_defaults`), because a
   deploy otherwise leaves users on a stale `style.css`.
 - **Scheduling ("morning brief")** lives in `scheduler.py`. An agent with a
@@ -175,6 +306,15 @@ runs a **Mission** against a question using an intelligence-collection loop:
   answers. Measured on this box: the `duckduckgo` backend returned **0** results
   for a query where brave/bing returned 4 in under a second. A single-engine
   search silently starves missions.
+- **What search actually returned is recorded, not just acted on.** Every
+  `_collect_one` search call goes through `search.web_search_ex`, which
+  returns `(results, engine)` instead of just `results`; each call appends a
+  `{"pass", "query", "engine", "results"}` entry to that requirement's
+  `requirements.search_stats_json` (capped at the last 40 entries). The
+  requirement detail view renders these as one line per pass (`pass 1 · 3
+  queries · 11 results · brave`), and `assess_requirement` gets a
+  `search_note` summarizing the pass so a gap verdict caused by thin search
+  results reads differently from one caused by good search and bad sources.
 - **A "successful" crawl is often a captcha wall.** `content_quality.py` is the
   one place that judges real content vs. block/interstitial/near-empty pages,
   shared by the crawler (before storing — junk must not consume the source
@@ -261,6 +401,13 @@ web-researcher:/tmp/x.py && docker compose exec -T web-researcher python
   `_DONE_KEEP`/`_DONE_TTL_S`. `create_job`/`create_mission_job` raise
   `JobLimitReached`; routes flash "Busy". The scheduler's `_launch` creates the
   job before the mission row, so a full queue skips a scheduled fire cleanly.
+- **The crawl fallback never lets httpx decode a body.** It reads only
+  `iter_raw()`, the decoded size is bounded by `_CappedBody` (zlib
+  `max_length`, so a gzip bomb stops at the 5 MB cap), and `Accept-Encoding`
+  stays pinned to `gzip, deflate`: httpx's own decoders (br above all) have
+  no output limit, so a few hundred wire bytes could expand to gigabytes in
+  one read. Any other or stacked `Content-Encoding` is refused before the
+  body is read.
 - **Dependencies are pinned** via `constraints.txt` (a `pip freeze` of a
   verified image) used as `pip install -r requirements.txt -c constraints.txt`.
   To upgrade deliberately: bump/rebuild, verify, re-freeze.

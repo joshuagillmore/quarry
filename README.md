@@ -77,7 +77,9 @@ All settings come from `.env` (see `.env.example`):
 | `SEARCH_MAX_RESULTS` | Default result count for the search form | `5` |
 | `DB_PATH` | SQLite file path | `data/research.db` |
 | `CRAWL_TIMEOUT` | Per-page crawl timeout (ms) | `30000` |
+| `CRAWL_FALLBACK` | Retry a failed or blocked page with a plain HTTP fetch instead of giving up on it (see "Collection reliability and telemetry" below) | `true` |
 | `LLM_TIMEOUT_S` | Per-call LLM request timeout (seconds) — a hung provider can't hold a mission worker (and its job slot) forever | `120` |
+| `MAX_LLM_TOKENS` | Default per-mission LLM token budget (prompt + completion); a mission stops cleanly once it crosses this. `0` = unlimited | `0` |
 | `FLASK_HOST` / `FLASK_PORT` | Bind address. Loopback by default; widening it is covered by the exposure guard below | `127.0.0.1:5000` |
 | `FLASK_DEBUG` | Flask debug + auto-reload | `false` |
 | `FLASK_SECRET_KEY` | Override Flask session signing key. Empty → generated once into `data/secret_key` | *(empty)* |
@@ -117,6 +119,41 @@ Providers and the key can also be changed at runtime on the **Settings** page
 `data/settings.json` (never the repo), apply immediately, and take precedence
 over `.env`.
 
+### Using a local Ollama from Docker
+
+`OLLAMA_API_BASE` defaults to `http://host.docker.internal:11434`, which only
+works if Ollama listens on every interface (`0.0.0.0`). Ollama's own default
+bind is `127.0.0.1` — loopback only — and a connection arriving through
+`host.docker.internal` is not the same connection as one from the host's own
+loopback interface, so the host refuses it even though the hostname resolves
+fine. The symptom: `curl http://localhost:11434` works on the host, but
+Quarry's container can't reach Ollama at all.
+
+Two fixes:
+
+1. **Rebind Ollama to `0.0.0.0`.** Set `OLLAMA_HOST=0.0.0.0:11434` wherever
+   you start Ollama and restart it; leave `OLLAMA_API_BASE` at its default.
+   This also makes Ollama reachable from other machines on your LAN, so only
+   do it on a network you trust.
+2. **Join Quarry to Ollama's own Docker network instead.** If Ollama runs in
+   a container (its own, or part of another Compose stack), copy
+   `docker-compose.ollama.example.yml`, fill in your Ollama container's name
+   and network, and launch with both files:
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.ollama.example.yml up -d --build
+   ```
+
+   Find the network name with:
+
+   ```bash
+   docker inspect <ollama-container-name> --format '{{json .NetworkSettings.Networks}}'
+   ```
+
+   The external network must already exist — Compose won't create one for
+   you — and `OLLAMA_API_BASE` then addresses Ollama by its container name
+   (Docker's built-in DNS resolves it) instead of going through the host.
+
 ## Features
 
 - **End-to-end agent run** with a live progress page showing search results, in-flight crawls, and an agent log stream.
@@ -147,6 +184,60 @@ run.
 ![Expert agents: each with an area of expertise and its own collection budget](docs/img/agents.png)
 
 ![Missions: every agent run, with per-mission requirement coverage and status](docs/img/missions.png)
+
+### Collection reliability and telemetry
+
+- **Crawl fallback.** If a page's headless-Chromium crawl fails, times out, or
+  comes back looking like a block/captcha page, Quarry retries it once with a
+  plain HTTP fetch and feeds that HTML straight into the same markdown
+  pipeline. Sites that only fail because Chromium's fingerprint gets blocked
+  often succeed on the plain retry. Controlled by `CRAWL_FALLBACK` (default
+  on); never attempted for local/non-HTTP URLs.
+- **LLM token telemetry and budget.** Every planning, assessment, brief, and
+  extraction call is logged (model, purpose, token counts, duration) and
+  rolled up per mission on the mission page's telemetry strip, broken down by
+  purpose. Set `MAX_LLM_TOKENS` to give a mission a token budget, counted in
+  prompt + completion tokens (`0` = unlimited, the default). Once a mission's
+  spend passes it, collection stops cleanly at the next pass or requirement
+  boundary instead of mid-requirement, and extraction is skipped too; the
+  brief is still written from what was collected, so the final spend can
+  run a little past the budget. Requirements that were never tried are
+  marked "not attempted: token budget reached"; one already tried in an
+  earlier pass keeps its last gap note. A mission that has used up its
+  budget can't be re-tasked. Override it per run with the "LLM tokens"
+  field in the Agentic Crawl panel on the Search page (blank uses
+  `MAX_LLM_TOKENS`); it's a per-run choice, not an agent setting, so
+  re-running a mission from its own page doesn't carry its budget forward.
+- **Brief quality checks.** After synthesis, the brief is checked for
+  uncited long paragraphs, citations pointing at a source that turned out not
+  to be usable, and requirements that never actually made it into the brief's
+  prose. Any findings show up as a "Brief checks" callout above the brief — a
+  prompt to read closer, not a hard failure.
+- **Compare view.** A mission with a previous run (every scheduled "morning
+  brief" has one) links to "Compare with previous run", showing both briefs
+  side by side plus which sources are new, which dropped out, and which are
+  shared between the two runs, deduped by URL.
+- **Search signals.** Each requirement's detail view shows a line per
+  collection pass — queries run, results returned, and which engine answered
+  (e.g. `pass 1 · 3 queries · 11 results · brave`) — so a pass that quietly
+  returned nothing is visible instead of looking identical to one that found
+  nothing worth citing.
+- **Stop lands mid-pass.** Clicking "Stop after the current requirement" on
+  a running mission is honored before each requirement within the current
+  pass, not just between passes. Requirements that were never tried show
+  "not attempted: stopped by user"; one already tried in an earlier pass
+  keeps its last gap note.
+- **Resume after a limit.** When a mission stops on its token, source or
+  pass budget, or because you clicked Stop, with requirements still open,
+  the finished mission page says why ("Stopped: token budget reached · 3
+  requirements still open") and offers **Resume**. Resume raises that
+  budget by the amount you enter (prefilled with the current limit),
+  reopens every requirement that still has attempts left, keeps every
+  source already collected, and rewrites the brief. Satisfied requirements
+  and ones that used up their attempts are never re-run, and after a Stop
+  nothing is raised. If the mission has also used up its token budget,
+  Resume asks for more tokens too, since the run would otherwise stop
+  straight away.
 
 ## Architecture
 

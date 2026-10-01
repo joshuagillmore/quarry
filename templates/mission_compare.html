@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Compare runs — Quarry{% endblock %}
+{% block crumbs %}
+  <span class="sep">/</span><a href="/missions">Missions</a>
+  <span class="sep">/</span><a href="/missions/{{ mission.id }}">Mission</a>
+  <span class="sep">/</span><span class="cur">Compare</span>
+{% endblock %}
+
+{% macro stamp(m) -%}
+  {{ (m.created_at or '')[:16] | replace('T', ' ') }}
+{%- endmacro %}
+
+{# One run's brief. brief_html is render_markdown output (sanitized); it is
+   the only value on this page marked safe. Not linkified: [n] controls bind
+   to a source rail, and this page has none. #}
+{% macro run_column(m, label, brief_html) %}
+<section class="brief cmp-col">
+  <div class="brief-head">
+    <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.5h6l3 3v10h-9v-13ZM9.5 1.5v3h3"/></svg>
+    <strong>{{ label }}</strong>
+    <span class="brief-meta">{{ stamp(m) }}</span>
+    <a class="btn btn-sm" href="/missions/{{ m.id }}">Open run</a>
+  </div>
+  <div class="cmp-q">{{ m.question }}</div>
+  {% if brief_html %}
+  <div class="brief-body">{{ brief_html | safe }}</div>
+  {% elif m.status in ('planning', 'awaiting_approval', 'collecting', 'synthesizing') %}
+  <div class="cmp-empty">No brief yet: this run is still in progress.</div>
+  {% else %}
+  <div class="cmp-empty">No brief.</div>
+  {% endif %}
+</section>
+{% endmacro %}
+
+{% macro source_list(key, title, docs, empty) %}
+<section class="cmp-list" data-cmp="{{ key }}">
+  <div class="cmp-list-head">{{ title }}<span class="n">{{ docs | length }}</span></div>
+  {% if docs %}
+  <ul>
+    {% for d in docs %}
+    <li><a class="cmp-item" href="/document/{{ d.id }}">
+      <span class="cmp-item-t">{{ d.title or d.domain }}</span>
+      <span class="cmp-item-u">{{ d.url }}</span>
+    </a></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <div class="cmp-empty">{{ empty }}</div>
+  {% endif %}
+</section>
+{% endmacro %}
+
+{% block content %}
+<div class="page page-wide">
+
+  <header class="mission-head">
+    <div class="mission-head-top">
+      <span class="pill">compare runs</span>
+      {% if agent %}
+      <span class="mission-agent">
+        <span class="who">{{ agent.name[:1] | upper }}</span>
+        <span>{{ agent.name }}</span>
+        <span class="exp">· {{ agent.expertise }}</span>
+      </span>
+      {% endif %}
+      <a class="btn btn-sm mission-compare" href="/missions/{{ mission.id }}">Back to this run</a>
+    </div>
+    <h1 class="mission-q">{{ mission.question }}</h1>
+  </header>
+
+  <div class="telemetry">
+    <div class="tele-cell">
+      <div class="tele-k">New sources</div>
+      <div class="tele-v">{{ delta.new | length }}</div>
+    </div>
+    <div class="tele-cell">
+      <div class="tele-k">Dropped</div>
+      <div class="tele-v">{{ delta.dropped | length }}</div>
+    </div>
+    <div class="tele-cell">
+      <div class="tele-k">In both runs</div>
+      <div class="tele-v">{{ delta.shared | length }}</div>
+    </div>
+    <div class="tele-cell">
+      <div class="tele-k">Previous run</div>
+      <div class="tele-v">{{ stamp(parent) }}</div>
+    </div>
+  </div>
+
+  <div class="cmp-grid">
+    {{ run_column(parent, 'Previous run', parent_brief_html) }}
+    {{ run_column(mission, 'This run', brief_html) }}
+  </div>
+
+  <div class="cmp-lists">
+    {# Empty-list copy says only what an empty list proves. #}
+    {{ source_list('new', 'New in this run', delta.new, 'No new sources.') }}
+    {{ source_list('dropped', 'Dropped since the previous run', delta.dropped, 'Nothing dropped.') }}
+    {{ source_list('shared', 'In both runs', delta.shared, 'No sources in common.') }}
+  </div>
+
+</div>
+{% endblock %}

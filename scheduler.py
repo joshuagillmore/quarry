@@ -133,7 +133,9 @@ async def _launch(agent_id: str) -> Optional[str]:
             inserted_id = mission.id
 
         _log(f"launching '{question[:60]}' for agent {agent.name}")
-        start_planning(mission.id)
+        # The worker owns this job and finishes it on every exit path, even
+        # if the mission row is deleted before it gets to read it.
+        start_planning(mission.id, job_id)
         return mission.id
     except BaseException as e:
         # Anything that fails after the job slot is taken — building the
