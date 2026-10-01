@@ -755,6 +755,66 @@ def test_resumed_run_only_works_the_reopened_requirements(monkeypatch):
     assert _stored_stop_reason() == "complete"
 
 
+def _retasked_after_a_limit(jid, other_attempts, stop_reason="pass_budget"):
+    """A mission that stopped on a limit, then had one requirement retasked:
+    r1 reopened (pending, 0 attempts), r2 left unmet at `other_attempts` of
+    3. Retask leaves the previous stop_reason in place."""
+    budget = {"max_passes": 1, "max_sources": 5, "per_req_attempts": 3}
+
+    async def setup():
+        await storage.insert_mission(_mission("m1", jid, budget=budget))
+        await storage.update_mission("m1", stop_reason=stop_reason)
+        await storage.insert_requirement(Requirement(
+            id="r1", mission_id="m1", title="Retasked", next_queries_json='["q"]'))
+        await storage.insert_requirement(Requirement(
+            id="r2", mission_id="m1", title="Left open", status="unmet",
+            attempts=other_attempts, assessment_missing="gap",
+            next_queries_json='["q"]'))
+    asyncio.run(setup())
+
+
+def test_retask_run_keeps_the_previous_reason_while_other_requirements_stay_open(
+        monkeypatch):
+    """The retask settles the one requirement it reopened, so nothing is
+    pending, but r2 still has attempts left: the run is not complete, and
+    the mission keeps the limit it stopped on, so Resume still offers r2."""
+    import app as app_mod
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _retasked_after_a_limit(jid, other_attempts=1)
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+
+    asyncio.run(agent_runner._run_collection("m1"))
+
+    m = asyncio.run(storage.get_mission("m1"))
+    reqs = asyncio.run(storage.get_requirements_for_mission("m1"))
+    assert {r.id: r.status for r in reqs} == {"r1": "satisfied", "r2": "unmet"}
+    assert m.status == "done" and m.stop_reason == "pass_budget"
+    assert app_mod._resumable(m, reqs)
+    assert [r.id for r in app_mod._reopenable(m, reqs)] == ["r2"]
+
+
+def test_retask_run_is_complete_when_the_others_are_capped(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _retasked_after_a_limit(jid, other_attempts=3)          # 3 of 3: capped
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "complete"
+
+
+def test_retask_run_that_stops_itself_stores_its_own_reason(monkeypatch):
+    """Something left pending means this run stopped on a limit of its own,
+    which replaces the previous run's reason."""
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _retasked_after_a_limit(jid, other_attempts=1)
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    assert jobs.request_cancel(jid)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "user_stop"
+
+
 # ---------- the job a worker was given is the one it finishes ----------
 
 def test_worker_whose_mission_was_deleted_still_releases_its_job():

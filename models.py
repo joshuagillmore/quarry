@@ -70,9 +70,12 @@ class Mission(BaseModel):
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
-    # Why the last collection run ended: complete | pass_budget |
-    # source_budget | token_budget | user_stop. None for missions finished
-    # before this was recorded, and while planning, collecting or failed.
+    # Why the last finished collection run ended: complete | pass_budget |
+    # source_budget | token_budget | user_stop. It keeps that reason until a
+    # new run finishes: a retask leaves it in place (so while a retask runs,
+    # and after one that crashed, it is still the previous run's), while a
+    # Resume clears it when it starts. None for missions finished before
+    # this was recorded and for runs that have not finished since a Resume.
     stop_reason: Optional[str] = None
     # How many times the mission was resumed after stopping on a limit.
     resume_count: int = 0

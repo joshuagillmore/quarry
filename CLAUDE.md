@@ -109,11 +109,18 @@ runs a **Mission** against a question using an intelligence-collection loop:
   default, not whatever budget its previous run used.
 - **A mission that stopped on a limit can be resumed.** `_run_collection`
   records why it ended in `missions.stop_reason`, written by `_synthesize`
-  in the same `update_mission` as the brief: `complete` (nothing left
-  pending — every requirement satisfied or capped out, even when a budget
-  ran out on that same last pass), `pass_budget`, `source_budget`,
-  `token_budget` or `user_stop`. It is NULL for missions finished before the
-  column existed and while a mission is running or has failed. A `done`
+  in the same `update_mission` as the brief: `pass_budget`,
+  `source_budget`, `token_budget` or `user_stop` when requirements were
+  still pending, and `complete` when nothing is pending and no unmet
+  requirement has attempts left (even when a budget ran out on that same
+  last pass). A run that leaves nothing pending while unmet requirements
+  still have attempts left — a retask reopens only one requirement — keeps
+  the previous run's reason, so Resume still offers them. The column holds
+  the last finished run's reason until a new run finishes: a retask does
+  not clear it (the carry-forward relies on that), so while a retask runs,
+  and after one that crashed, it is still the previous reason; a Resume
+  clears it when it starts. It is NULL for missions finished before the
+  column existed and for runs that have not finished since a Resume. A `done`
   mission with one of the four limit reasons gets a **Resume** control in
   the done-state telemetry actions (`POST /missions/<id>/resume`, one
   `extra` field). It reopens every requirement still `pending` plus every

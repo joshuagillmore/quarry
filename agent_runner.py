@@ -45,7 +45,8 @@ SOURCE_BUDGET_EXHAUSTED = "source budget exhausted"
 
 # missions.stop_reason for a run that ended with requirements still open,
 # keyed by the reason the loop logged. A run that left nothing pending
-# (every requirement satisfied or capped out) stores "complete" instead.
+# stores "complete" when no unmet requirement has attempts left either,
+# else it keeps the previous run's reason (see the end of _run_collection).
 STOP_REASON_CODES = {
     PASS_BUDGET_EXHAUSTED: "pass_budget",
     SOURCE_BUDGET_EXHAUSTED: "source_budget",
@@ -319,16 +320,26 @@ async def _run_collection(mission_id: str, job_id: str | None = None) -> None:
 
     # Anything still pending after the pass budget is an unmet gap. One that
     # was never attempted says why, rather than looking like a failed search.
-    # With nothing left pending the run is complete, whichever limit it also
-    # happened to reach on its last pass: there is nothing to resume.
-    still_pending = [r for r in await get_requirements_for_mission(mission_id)
-                     if r.status == "pending"]
+    final_reqs = await get_requirements_for_mission(mission_id)
+    still_pending = [r for r in final_reqs if r.status == "pending"]
     for r in still_pending:
         fields = {"status": "unmet"}
         if r.attempts == 0:
             fields["assessment_missing"] = f"not attempted: {stop_reason}"
         await update_requirement(r.id, **fields)
-    stop_code = STOP_REASON_CODES[stop_reason] if still_pending else "complete"
+    if still_pending:
+        stop_code = STOP_REASON_CODES[stop_reason]
+    elif any(r.status == "unmet" and r.attempts < per_req_attempts for r in final_reqs):
+        # Nothing pending, yet requirements this run never worked still have
+        # attempts left: a retask reopens only the one requirement, after an
+        # earlier run stopped on a limit. That earlier stop still stands
+        # (retask leaves stop_reason alone), so carry it forward; storing
+        # "complete" would hide the leftovers from Resume.
+        stop_code = mission.stop_reason
+    else:
+        # Every requirement satisfied or capped out, whichever limit this
+        # run also reached on its last pass: there is nothing to resume.
+        stop_code = "complete"
 
     # Optional LLM extraction over the collected sources (applies regardless of
     # how they were gathered). Not once the token budget stopped collection:
