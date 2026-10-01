@@ -70,6 +70,12 @@ class Mission(BaseModel):
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    # Why the last collection run ended: complete | pass_budget |
+    # source_budget | token_budget | user_stop. None for missions finished
+    # before this was recorded, and while planning, collecting or failed.
+    stop_reason: Optional[str] = None
+    # How many times the mission was resumed after stopping on a limit.
+    resume_count: int = 0
 
 
 class Document(BaseModel):

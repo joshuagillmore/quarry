@@ -40,6 +40,18 @@ SEARCH_STATS_KEEP = 40
 
 STOPPED_BY_USER = "stopped by user"
 TOKEN_BUDGET_REACHED = "token budget reached"
+PASS_BUDGET_EXHAUSTED = "pass budget exhausted"
+SOURCE_BUDGET_EXHAUSTED = "source budget exhausted"
+
+# missions.stop_reason for a run that ended with requirements still open,
+# keyed by the reason the loop logged. A run that left nothing pending
+# (every requirement satisfied or capped out) stores "complete" instead.
+STOP_REASON_CODES = {
+    PASS_BUDGET_EXHAUSTED: "pass_budget",
+    SOURCE_BUDGET_EXHAUSTED: "source_budget",
+    TOKEN_BUDGET_REACHED: "token_budget",
+    STOPPED_BY_USER: "user_stop",
+}
 
 
 def _now() -> str:
@@ -250,7 +262,7 @@ async def _run_collection(mission_id: str, job_id: str | None = None) -> None:
     per_req_cap = max(1, max_sources // max(1, len(all_reqs)))
 
     # Why a requirement that was never tried stayed unmet (see the end).
-    stop_reason = "pass budget exhausted"
+    stop_reason = PASS_BUDGET_EXHAUSTED
     for pass_num in range(1, max_passes + 1):
         reqs = await get_requirements_for_mission(mission_id)
         pending = [r for r in reqs if r.status == "pending"]
@@ -302,17 +314,21 @@ async def _run_collection(mission_id: str, job_id: str | None = None) -> None:
         if len(collected) >= max_sources:
             if job_id:
                 jobs.add_log(job_id, "warn", "source budget reached")
-            stop_reason = "source budget exhausted"
+            stop_reason = SOURCE_BUDGET_EXHAUSTED
             break
 
     # Anything still pending after the pass budget is an unmet gap. One that
     # was never attempted says why, rather than looking like a failed search.
-    for r in await get_requirements_for_mission(mission_id):
-        if r.status == "pending":
-            fields = {"status": "unmet"}
-            if r.attempts == 0:
-                fields["assessment_missing"] = f"not attempted: {stop_reason}"
-            await update_requirement(r.id, **fields)
+    # With nothing left pending the run is complete, whichever limit it also
+    # happened to reach on its last pass: there is nothing to resume.
+    still_pending = [r for r in await get_requirements_for_mission(mission_id)
+                     if r.status == "pending"]
+    for r in still_pending:
+        fields = {"status": "unmet"}
+        if r.attempts == 0:
+            fields["assessment_missing"] = f"not attempted: {stop_reason}"
+        await update_requirement(r.id, **fields)
+    stop_code = STOP_REASON_CODES[stop_reason] if still_pending else "complete"
 
     # Optional LLM extraction over the collected sources (applies regardless of
     # how they were gathered). Not once the token budget stopped collection:
@@ -325,7 +341,7 @@ async def _run_collection(mission_id: str, job_id: str | None = None) -> None:
         else:
             await _extract_sources(mission_id, budget.get("extract_prompt", ""), job_id)
 
-    await _synthesize(mission_id, agent, job_id)
+    await _synthesize(mission_id, agent, job_id, stop_reason=stop_code)
 
 
 def _other_names(doc) -> list[str]:
@@ -528,7 +544,11 @@ def _check_brief(mission, requirements, docs, brief_md: str, job_id) -> str | No
     return json.dumps(warnings)
 
 
-async def _synthesize(mission_id: str, agent, job_id) -> None:
+async def _synthesize(mission_id: str, agent, job_id,
+                      stop_reason: str | None = None) -> None:
+    """Write the brief and finish the mission. `stop_reason` (a
+    STOP_REASON_CODES value or "complete") is stored in the same update as
+    the brief, so a finished mission always says why its collection ended."""
     await update_mission(mission_id, status="synthesizing")
     if job_id:
         jobs.update_job(job_id, stage="synthesizing")
@@ -571,7 +591,7 @@ async def _synthesize(mission_id: str, agent, job_id) -> None:
     await update_mission(
         mission_id, status="done", brief_markdown=brief_md,
         brief_sources_json=sources_json, brief_warnings_json=warnings_json,
-        finished_at=_now(),
+        stop_reason=stop_reason, finished_at=_now(),
     )
     if job_id:
         jobs.add_log(job_id, "ok",

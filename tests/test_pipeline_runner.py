@@ -612,6 +612,149 @@ def test_zero_token_budget_is_unlimited(monkeypatch):
     assert "token budget" not in _log_text(jid)
 
 
+# ---------- why the run ended (missions.stop_reason) ----------
+
+def _stored_stop_reason(mid="m1"):
+    return asyncio.run(storage.get_mission(mid)).stop_reason
+
+
+def test_stop_reason_complete_when_nothing_is_left_pending(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _one_requirement(jid, {"max_passes": 3, "max_sources": 5, "per_req_attempts": 2})
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "complete"
+
+
+def test_stop_reason_complete_when_capped_out(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _one_requirement(jid, {"max_passes": 3, "max_sources": 5, "per_req_attempts": 1})
+    _wire(monkeypatch, ["http://a.example/1"])           # never satisfied
+    asyncio.run(agent_runner._run_collection("m1"))
+    r1 = asyncio.run(storage.get_requirements_for_mission("m1"))[0]
+    assert (r1.status, r1.attempts) == ("unmet", 1)
+    assert _stored_stop_reason() == "complete"
+
+
+def test_stop_reason_complete_when_the_last_pass_resolves_everything(monkeypatch):
+    """The pass budget (or source budget) running out on the same pass that
+    settled the last requirement is a complete run, not a limit stop: there
+    is nothing left for a Resume to do."""
+    _init()
+    jid = jobs.create_mission_job("Q", 1)
+    _one_requirement(jid, {"max_passes": 1, "max_sources": 1, "per_req_attempts": 3})
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "complete"
+
+
+def test_stop_reason_pass_budget(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _one_requirement(jid, {"max_passes": 1, "max_sources": 5, "per_req_attempts": 3})
+    _wire(monkeypatch, ["http://a.example/1"])
+    asyncio.run(agent_runner._run_collection("m1"))
+    r1 = asyncio.run(storage.get_requirements_for_mission("m1"))[0]
+    assert (r1.status, r1.attempts) == ("unmet", 1)
+    assert _stored_stop_reason() == "pass_budget"
+
+
+def test_stop_reason_source_budget(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 1)
+    _two_requirements(jid, {"max_passes": 2, "max_sources": 1, "per_req_attempts": 2})
+    _wire(monkeypatch, ["http://a.example/1", "http://a.example/2"])
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "source_budget"
+
+
+def test_stop_reason_token_budget(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _two_requirements(jid, {"max_passes": 2, "max_sources": 5, "per_req_attempts": 2,
+                            "max_llm_tokens": 100})
+    _wire(monkeypatch, ["http://a.example/1"])
+
+    def costly_assess(req, docs, **k):
+        _spend("m1", 150)
+        return Assessment(False, "low", "gap", [])
+
+    monkeypatch.setattr(agent_runner, "assess_requirement", costly_assess)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "token_budget"
+
+
+def test_stop_reason_user_stop(monkeypatch):
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _two_requirements(jid, {"max_passes": 2, "max_sources": 5, "per_req_attempts": 2})
+    _wire(monkeypatch, ["http://a.example/1"])
+    assert jobs.request_cancel(jid)
+    asyncio.run(agent_runner._run_collection("m1"))
+    assert _stored_stop_reason() == "user_stop"
+
+
+def test_stop_reason_is_written_with_the_brief(monkeypatch):
+    """Stored in the one update that marks the mission done, so no reader
+    ever sees a finished mission without its reason (or a reason on a
+    mission still running)."""
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    _one_requirement(jid, {"max_passes": 1, "max_sources": 5, "per_req_attempts": 3})
+    _wire(monkeypatch, ["http://a.example/1"])
+    writes = []
+    real_update = agent_runner.update_mission
+
+    async def recording_update(mission_id, **fields):
+        writes.append(fields)
+        await real_update(mission_id, **fields)
+
+    monkeypatch.setattr(agent_runner, "update_mission", recording_update)
+    asyncio.run(agent_runner._run_collection("m1"))
+    with_reason = [w for w in writes if "stop_reason" in w]
+    assert len(with_reason) == 1
+    assert with_reason[0]["status"] == "done"
+    assert with_reason[0]["brief_markdown"] == "brief"
+    assert with_reason[0]["stop_reason"] == "pass_budget"
+
+
+def test_resumed_run_only_works_the_reopened_requirements(monkeypatch):
+    """A resume reopens never-reached requirements as pending; the ones
+    already satisfied are neither re-assessed nor re-marked."""
+    _init()
+    jid = jobs.create_mission_job("Q", 5)
+    budget = {"max_passes": 2, "max_sources": 5, "per_req_attempts": 2}
+
+    async def setup():
+        await storage.insert_mission(_mission("m1", jid, budget=budget))
+        await storage.insert_requirement(Requirement(
+            id="r_done", mission_id="m1", title="Done", status="satisfied", attempts=2,
+            assessment_missing="", assessment_confidence="high",
+            satisfied_doc_ids_json='["d-x"]'))
+        await storage.insert_requirement(Requirement(
+            id="r_open", mission_id="m1", title="Open", next_queries_json='["q"]'))
+    asyncio.run(setup())
+    _wire(monkeypatch, ["http://a.example/1"], satisfied=True)
+    assessed = []
+
+    def assess(req, docs, **k):
+        assessed.append(req.id)
+        return Assessment(True, "medium", "", [])
+
+    monkeypatch.setattr(agent_runner, "assess_requirement", assess)
+    asyncio.run(agent_runner._run_collection("m1"))
+
+    assert assessed == ["r_open"]
+    reqs = {r.id: r for r in asyncio.run(storage.get_requirements_for_mission("m1"))}
+    done = reqs["r_done"]
+    assert (done.status, done.attempts, done.assessment_confidence,
+            done.satisfied_doc_ids_json) == ("satisfied", 2, "high", '["d-x"]')
+    assert reqs["r_open"].status == "satisfied"
+    assert _stored_stop_reason() == "complete"
+
+
 # ---------- the job a worker was given is the one it finishes ----------
 
 def test_worker_whose_mission_was_deleted_still_releases_its_job():

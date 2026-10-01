@@ -24,6 +24,7 @@ _MISSION_COLUMNS = frozenset({
     "agent_id", "question", "status", "plan_json", "budget_json",
     "brief_markdown", "brief_sources_json", "brief_warnings_json", "job_id",
     "parent_mission_id", "error", "created_at", "started_at", "finished_at",
+    "stop_reason", "resume_count",
 })
 _REQUIREMENT_COLUMNS = frozenset({
     "mission_id", "title", "description", "rationale", "status", "attempts",
@@ -147,13 +148,18 @@ async def init_db():
                 error TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
-                finished_at TEXT
+                finished_at TEXT,
+                stop_reason TEXT,
+                resume_count INTEGER DEFAULT 0
             )
         """)
         # The citation order the brief was written against, and the quality
         # checks run on it (see models.Mission).
         await _add_column(db, "missions", "brief_sources_json", "TEXT")
         await _add_column(db, "missions", "brief_warnings_json", "TEXT")
+        # Why the last collection run ended, and how often it was resumed.
+        await _add_column(db, "missions", "stop_reason", "TEXT")
+        await _add_column(db, "missions", "resume_count", "INTEGER DEFAULT 0")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS requirements (
                 id TEXT PRIMARY KEY,
@@ -606,13 +612,15 @@ async def insert_mission(mission: Mission) -> bool:
             """INSERT INTO missions
                (id, agent_id, question, status, plan_json, budget_json,
                 brief_markdown, brief_sources_json, brief_warnings_json, job_id,
-                parent_mission_id, error, created_at, started_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                parent_mission_id, error, created_at, started_at, finished_at,
+                stop_reason, resume_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mission.id, mission.agent_id, mission.question, mission.status,
              mission.plan_json, mission.budget_json, mission.brief_markdown,
              mission.brief_sources_json, mission.brief_warnings_json,
              mission.job_id, mission.parent_mission_id, mission.error,
-             mission.created_at, mission.started_at, mission.finished_at),
+             mission.created_at, mission.started_at, mission.finished_at,
+             mission.stop_reason, mission.resume_count),
         )
         await db.commit()
         return True

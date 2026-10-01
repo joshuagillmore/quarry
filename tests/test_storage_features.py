@@ -142,6 +142,47 @@ def test_new_columns_are_allowlisted_but_unknown_keys_still_raise():
     assert asyncio.run(storage.get_mission("m1")).brief_warnings_json is None
 
 
+# --- resume: stop_reason / resume_count ------------------------------------------
+
+def test_init_db_adds_stop_reason_and_resume_count_to_an_older_missions_table():
+    db = sqlite3.connect(storage.DB_PATH)
+    try:
+        for stmt in _PRE_FEATURES_SCHEMA:
+            db.execute(stmt)
+        db.commit()
+    finally:
+        db.close()
+    asyncio.run(storage.init_db())
+    asyncio.run(storage.init_db())  # idempotent
+
+    assert {"stop_reason", "resume_count"} <= _columns("missions")
+    old = asyncio.run(storage.get_mission("old"))
+    # A mission finished before this change has no recorded reason and was
+    # never resumed.
+    assert old.stop_reason is None and old.resume_count == 0
+
+
+def test_stop_reason_and_resume_count_roundtrip_through_insert_and_update():
+    _seed_missions("m1")
+    m = asyncio.run(storage.get_mission("m1"))
+    assert (m.stop_reason, m.resume_count) == (None, 0)
+    asyncio.run(storage.update_mission("m1", stop_reason="token_budget", resume_count=2))
+    m = asyncio.run(storage.get_mission("m1"))
+    assert (m.stop_reason, m.resume_count) == ("token_budget", 2)
+    assert "stop_reason" in storage._MISSION_COLUMNS
+    assert "resume_count" in storage._MISSION_COLUMNS
+
+    async def insert():
+        await storage.insert_mission(Mission(id="m9", agent_id="a1", question="Q",
+                                             created_at="t", stop_reason="user_stop",
+                                             resume_count=1))
+        return await storage.get_mission("m9")
+    m9 = asyncio.run(insert())
+    assert (m9.stop_reason, m9.resume_count) == ("user_stop", 1)
+    listed = {m.id: m for m in asyncio.run(storage.list_missions())}
+    assert listed["m1"].stop_reason == "token_budget"
+
+
 # --- llm_calls -------------------------------------------------------------------
 
 def test_llm_call_defaults_fill_id_and_timestamp():

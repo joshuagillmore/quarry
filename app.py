@@ -1133,6 +1133,7 @@ def mission_view(mission_id):
         ext_ids=ext_ids, budget=budget,
         llm_usage=llm_usage, token_rows=_token_rows(llm_usage),
         max_llm_tokens=_budget_max_llm_tokens(budget),
+        resume=_resume_offer(mission, requirements, budget),
         has_parent=has_parent,
         live_state=live_state,
         live=mission.job_id in get_in_memory_job_ids(),
@@ -1201,6 +1202,96 @@ def _budget_max_sources(budget: dict) -> int:
         return max(1, int(budget.get("max_sources", 30)))
     except (TypeError, ValueError):
         return 30
+
+
+def _budget_max_passes(budget: dict) -> int:
+    try:
+        return max(1, int(budget.get("max_passes", 4)))
+    except (TypeError, ValueError, OverflowError):
+        return 4
+
+
+# --- resume after a limit ---
+
+# missions.stop_reason values a Resume picks up from: the run ended on a
+# limit, or on the user's Stop, with requirements still open.
+_RESUMABLE_STOPS = ("pass_budget", "source_budget", "token_budget", "user_stop")
+
+# Per limit: the budget_json key a Resume raises, its name in plain words,
+# and the most one Resume may add. A user Stop raises nothing.
+_RESUME_LIMITS = {
+    "token_budget": ("max_llm_tokens", "token budget", MAX_LLM_TOKENS_INPUT),
+    "source_budget": ("max_sources", "source budget", 100),
+    "pass_budget": ("max_passes", "pass budget", 10),
+}
+
+_STOP_LABELS = {
+    "token_budget": "Stopped: token budget reached",
+    "source_budget": "Stopped: source budget reached",
+    "pass_budget": "Stopped: pass budget reached",
+    "user_stop": "Stopped by you",
+}
+
+# Prefill for the token field when the stored budget is 0 (unlimited); a
+# mission with no token limit cannot stop on one, so this is a fallback.
+_RESUME_TOKEN_PREFILL = 15000
+
+
+def _reopenable(requirements) -> list:
+    """The requirements a Resume puts back to work: those the stopped run
+    never reached (the runner marks them "not attempted: <reason>"), plus
+    any still pending. Satisfied and capped-out requirements never re-run."""
+    return [r for r in requirements
+            if r.status == "pending"
+            or (r.status == "unmet"
+                and (r.assessment_missing or "").startswith("not attempted:"))]
+
+
+def _resumable(mission, requirements) -> bool:
+    """True when a finished mission stopped on a limit (or a Stop) and has
+    something to reopen. One rule for the page, the API and the route."""
+    return (mission.status == "done" and mission.stop_reason in _RESUMABLE_STOPS
+            and bool(_reopenable(requirements)))
+
+
+def _limit_value(budget: dict, stop_reason: str) -> int:
+    """The current value of the limit that stopped the mission (0 for an
+    unlimited token budget)."""
+    if stop_reason == "token_budget":
+        return _budget_max_llm_tokens(budget)
+    if stop_reason == "source_budget":
+        return _budget_max_sources(budget)
+    return _budget_max_passes(budget)
+
+
+def _form_resume_extra(cap: int, default: int) -> int:
+    """The Resume form's `extra`, clamped to 1..cap. Blank or unreadable
+    input means `default`, the limit's current value (what the field is
+    prefilled with)."""
+    raw = (request.form.get("extra") or "").strip()[:20]
+    try:
+        extra = int(raw)
+    except ValueError:
+        extra = default
+    return max(1, min(cap, extra))
+
+
+def _resume_offer(mission, requirements, budget: dict) -> dict | None:
+    """What the done-state Resume control shows, or None when the mission
+    has nothing to resume. `field` is None after a user Stop (nothing to
+    raise); otherwise it is prefilled with the limit's current value."""
+    if not _resumable(mission, requirements):
+        return None
+    n = len(_reopenable(requirements))
+    offer = {"label": f"{_STOP_LABELS[mission.stop_reason]} · "
+                      f"{n} requirement{'' if n == 1 else 's'} still open",
+             "field": None}
+    limit = _RESUME_LIMITS.get(mission.stop_reason)
+    if limit:
+        _key, name, cap = limit
+        current = _limit_value(budget, mission.stop_reason) or _RESUME_TOKEN_PREFILL
+        offer["field"] = {"name": name, "max": cap, "value": max(1, min(cap, current))}
+    return offer
 
 
 _MAX_PLAN_ROWS = 50   # a drafted plan is a handful of requirements
@@ -1491,6 +1582,86 @@ def requirement_accept(mission_id, req_id):
     return redirect(url_for("mission_view", mission_id=mission_id))
 
 
+@app.route("/missions/<mission_id>/resume", methods=["POST"])
+def mission_resume(mission_id):
+    """Pick a mission back up after its collection stopped on a limit (or a
+    Stop) with requirements still open: raise that limit, reopen the
+    requirements the run never reached, and collect again on a fresh job.
+    Sources already collected are kept, satisfied requirements are never
+    re-run, and the brief is rewritten as after a retask."""
+    mission = run_async(get_mission(mission_id))
+    if not mission:
+        flash("Mission not found.", "error")
+        return redirect(url_for("missions_list"))
+    if mission.status != "done" or mission.stop_reason not in _RESUMABLE_STOPS:
+        flash("This mission has nothing to resume.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    reopen = _reopenable(run_async(get_requirements_for_mission(mission_id)))
+    if not reopen:
+        flash("Every requirement is satisfied or capped out — nothing to resume.", "info")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+
+    # The raised budget, worked out before anything changes. max_llm_tokens
+    # is cumulative across runs; max_sources/max_passes are per run.
+    raised = dict(_mission_budget(mission))
+    raise_note = ""
+    limit = _RESUME_LIMITS.get(mission.stop_reason)
+    if limit:
+        key, name, cap = limit
+        current = _limit_value(raised, mission.stop_reason)
+        if current > 0:            # an unlimited (0) token budget stays unlimited
+            raised[key] = current + _form_resume_extra(cap, current)
+            raise_note = f", {name} raised to {raised[key]:,}"
+
+    # The job first, as for a retask: if the queue is full, nothing about
+    # the mission or its requirements has changed yet.
+    try:
+        job_id = create_mission_job(mission.question, _budget_max_sources(raised))
+    except JobLimitReached as e:
+        flash(f"Busy: {e}.", "error")
+        return redirect(url_for("mission_view", mission_id=mission_id))
+    # From here on, any failure undoes what was done so far, newest first:
+    # the job holds a slot, and a claimed mission with no worker behind it
+    # cannot be stopped or deleted until restart.
+    undo = [("release the new job", lambda: jobs.finish_job(
+        job_id, stage="error", error="resume failed"))]
+    try:
+        # Then claim the transition, so a concurrent resume (or retask)
+        # cannot start a second worker.
+        if not run_async(claim_mission_status(mission_id, "done", "collecting")):
+            jobs.finish_job(job_id, stage="cancelled")
+            flash("This mission changed state in the meantime — nothing was resumed.",
+                  "info")
+            return redirect(url_for("mission_view", mission_id=mission_id))
+        undo.append(("restore status done", lambda: run_async(
+            claim_mission_status(mission_id, "collecting", "done"))))
+        run_async(update_mission(
+            mission_id, budget_json=json.dumps(raised),
+            resume_count=mission.resume_count + 1,
+            error=None, stop_reason=None, job_id=job_id))
+        undo.append(("restore the mission", lambda: run_async(update_mission(
+            mission_id, budget_json=mission.budget_json,
+            resume_count=mission.resume_count, error=mission.error,
+            stop_reason=mission.stop_reason, job_id=mission.job_id))))
+        # Reopened with their attempts kept: one never reached has 0.
+        for r in reopen:
+            run_async(update_requirement(
+                r.id, status="pending", assessment_missing="", assessment_confidence=""))
+            undo.append((f"restore requirement {r.id}", lambda r=r: run_async(
+                update_requirement(r.id, status=r.status,
+                                   assessment_missing=r.assessment_missing,
+                                   assessment_confidence=r.assessment_confidence))))
+        # Handed the job so the worker releases it on every exit path.
+        start_collection(mission_id, job_id)
+    except BaseException:
+        _rollback(mission_id, undo)
+        raise
+    n = len(reopen)
+    flash(f"Resuming — {n} requirement{'' if n == 1 else 's'} reopened{raise_note}.",
+          "success")
+    return redirect(url_for("mission_view", mission_id=mission_id))
+
+
 @app.route("/missions/<mission_id>/brief.md")
 def mission_brief_export(mission_id):
     mission = run_async(get_mission(mission_id))
@@ -1528,6 +1699,8 @@ def api_mission(mission_id):
         "unmet": sum(1 for r in requirements if r.status == "unmet"),
         "total": len(requirements),
         "done": mission.status in ("done", "error"),
+        "stop_reason": mission.stop_reason,
+        "resumable": _resumable(mission, requirements),
     }
     # Prompt + completion across every recorded call; the page's LLM tokens
     # cell ([data-tele-tokens]) follows it live.

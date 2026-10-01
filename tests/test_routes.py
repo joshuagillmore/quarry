@@ -137,8 +137,9 @@ def test_every_endpoint_requires_login(client, app_mod, monkeypatch):
                 assert r.status_code == 302, (method, url, r.status_code)
                 assert _path(r) == "/login", (method, url, r.headers["Location"])
             checked += 1
-    assert checked >= 31, "the sweep should cover every route"
+    assert checked >= 32, "the sweep should cover every route"
     assert "/missions/<mission_id>/compare" in swept
+    assert "/missions/<mission_id>/resume" in swept
 
 
 def test_settings_page_cannot_set_or_clear_the_password(client, monkeypatch):
@@ -623,6 +624,323 @@ def test_retask_allowed_while_the_token_budget_has_room(client, starts, own_budg
     client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
     assert _reqs()["r0"].status == "pending"
     assert _mission().status == "collecting" and len(starts) == 1
+
+
+# --- resume after a limit -----------------------------------------------
+
+_STOPPED_BUDGET = {"max_sources": 7, "max_passes": 2, "per_req_attempts": 3,
+                   "max_llm_tokens": 1000, "extract": True}
+
+
+def _seed_stopped(stop_reason="token_budget", budget=None, status="done"):
+    """A finished mission whose collection stopped on a limit: r0 satisfied,
+    r1 never reached, r2 capped out after every attempt, r3 still pending."""
+    _seed_mission(status=status, n_reqs=4)
+    _run(storage.update_mission(
+        "m1", stop_reason=stop_reason, brief_markdown="old brief",
+        budget_json=json.dumps(_STOPPED_BUDGET if budget is None else budget)))
+    _run(storage.update_requirement("r0", status="satisfied", attempts=1,
+                                    assessment_missing="", assessment_confidence="high"))
+    _run(storage.update_requirement("r1", status="unmet", attempts=0,
+                                    assessment_missing="not attempted: token budget reached"))
+    _run(storage.update_requirement("r2", status="unmet", attempts=3,
+                                    assessment_missing="no primary source",
+                                    assessment_confidence="low"))
+
+
+def _snapshot():
+    return _mission().model_dump(), {k: r.model_dump() for k, r in _reqs().items()}
+
+
+def _budget():
+    return json.loads(_mission().budget_json)
+
+
+def test_resume_token_stopped_mission(client, starts):
+    old = jobs.create_mission_job("Where is it?", 7)
+    jobs.finish_job(old, stage="done")
+    _seed_stopped()
+    _run(storage.update_mission("m1", job_id=old, error="stale"))
+    _spend_tokens("m1", 1200)
+    before = _reqs()
+
+    r = client.post("/missions/m1/resume", data={"extra": "500"})
+    assert _path(r) == "/missions/m1"
+
+    reqs = _reqs()
+    # Exactly the never-reached and still-pending requirements reopen, with
+    # their assessment cleared and their attempts kept.
+    for rid in ("r1", "r3"):
+        assert reqs[rid].status == "pending"
+        assert not reqs[rid].assessment_missing and not reqs[rid].assessment_confidence
+        assert reqs[rid].attempts == before[rid].attempts
+    # Satisfied and capped-out requirements are untouched.
+    assert reqs["r0"] == before["r0"] and reqs["r2"] == before["r2"]
+
+    m = _mission()
+    assert m.status == "collecting"
+    assert (m.resume_count, m.stop_reason, m.error) == (1, None, None)
+    assert _budget() == {**_STOPPED_BUDGET, "max_llm_tokens": 1500}
+    # A fresh live job, already on the row when the worker starts, and
+    # handed to it.
+    assert m.job_id and m.job_id != old
+    assert starts == [("m1", m.job_id, m.job_id)]
+    job = jobs.get_job(m.job_id)
+    assert job is not None and not job.done
+    assert _flashes(client) == [
+        "Resuming — 2 requirements reopened, token budget raised to 1,500."]
+
+
+@pytest.mark.parametrize("stop_reason, key, extra, want, phrase", [
+    ("source_budget", "max_sources", "5", 12, "source budget raised to 12"),
+    ("pass_budget", "max_passes", "3", 5, "pass budget raised to 5"),
+])
+def test_resume_raises_the_limit_that_stopped_it(client, starts, stop_reason, key,
+                                                 extra, want, phrase):
+    _seed_stopped(stop_reason)
+    client.post("/missions/m1/resume", data={"extra": extra})
+    assert _budget() == {**_STOPPED_BUDGET, key: want}
+    assert _mission().status == "collecting" and len(starts) == 1
+    assert _flashes(client) == [f"Resuming — 2 requirements reopened, {phrase}."]
+
+
+def test_resume_job_is_sized_by_the_raised_source_budget(client, starts):
+    _seed_stopped("source_budget")
+    client.post("/missions/m1/resume", data={"extra": "5"})
+    assert jobs.get_job(_mission().job_id).crawl_total == 12
+
+
+def test_resume_after_a_user_stop_raises_nothing(client, starts):
+    _seed_stopped("user_stop")
+    client.post("/missions/m1/resume", data={"extra": "99"})
+    assert _budget() == _STOPPED_BUDGET
+    m = _mission()
+    assert (m.status, m.resume_count) == ("collecting", 1)
+    assert len(starts) == 1
+    assert _flashes(client) == ["Resuming — 2 requirements reopened."]
+
+
+def test_resume_leaves_an_unlimited_token_budget_unlimited(client, starts, monkeypatch):
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 0)
+    _seed_stopped(budget={**_STOPPED_BUDGET, "max_llm_tokens": 0})
+    client.post("/missions/m1/resume", data={"extra": "500"})
+    assert _budget()["max_llm_tokens"] == 0
+    assert _mission().status == "collecting" and len(starts) == 1
+    assert _flashes(client) == ["Resuming — 2 requirements reopened."]
+
+
+def test_resume_raises_the_setting_default_when_the_mission_has_no_own_budget(
+        client, starts, monkeypatch):
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 9000)
+    _seed_stopped(budget={k: v for k, v in _STOPPED_BUDGET.items() if k != "max_llm_tokens"})
+    client.post("/missions/m1/resume", data={"extra": "1000"})
+    assert _budget()["max_llm_tokens"] == 10000
+
+
+def test_resume_counts_every_resume(client, starts):
+    _seed_stopped()
+    _run(storage.update_mission("m1", resume_count=2))
+    client.post("/missions/m1/resume", data={"extra": "1"})
+    assert _mission().resume_count == 3
+
+
+@pytest.mark.parametrize("stop_reason, raw, want", [
+    ("token_budget", "99999999", 1000 + 5_000_000),
+    ("token_budget", "0", 1001),
+    ("token_budget", "-40", 1001),
+    ("token_budget", "lots", 2000),          # unreadable: the original limit again
+    ("token_budget", "", 2000),
+    ("source_budget", "500", 7 + 100),
+    ("source_budget", "0", 8),
+    ("pass_budget", "50", 2 + 10),
+    ("pass_budget", "-1", 3),
+], ids=["tokens-high", "tokens-zero", "tokens-negative", "tokens-junk", "tokens-blank",
+        "sources-high", "sources-zero", "passes-high", "passes-negative"])
+def test_resume_extra_is_clamped(client, starts, stop_reason, raw, want):
+    _seed_stopped(stop_reason)
+    client.post("/missions/m1/resume", data={"extra": raw})
+    key = {"token_budget": "max_llm_tokens", "source_budget": "max_sources",
+           "pass_budget": "max_passes"}[stop_reason]
+    assert _budget()[key] == want
+
+
+@pytest.mark.parametrize("status, stop_reason", [
+    ("done", "complete"), ("done", None), ("error", "token_budget"),
+    ("collecting", "token_budget"), ("awaiting_approval", None),
+])
+def test_resume_refused_for_a_mission_that_did_not_stop_on_a_limit(
+        client, starts, status, stop_reason):
+    _seed_stopped(stop_reason, status=status)
+    before = _snapshot()
+    r = client.post("/missions/m1/resume", data={"extra": "500"})
+    assert _path(r) == "/missions/m1"
+    assert _snapshot() == before
+    assert starts == [] and not jobs._store
+    assert _flashes(client) == ["This mission has nothing to resume."]
+
+
+def test_resume_does_not_reopen_a_requirement_the_run_already_tried(client, starts):
+    """The brief's rule: only never-reached ("not attempted: ...") and
+    pending requirements reopen. One the run tried, that still has
+    attempts left but was marked unmet with its gap when the run ended,
+    stays as it is."""
+    _seed_stopped()
+    _run(storage.update_requirement("r3", status="unmet", attempts=1,
+                                    assessment_missing="gap after one pass"))
+    before = _reqs()
+    client.post("/missions/m1/resume", data={"extra": "500"})
+    reqs = _reqs()
+    assert reqs["r1"].status == "pending"
+    assert reqs["r3"] == before["r3"]
+    assert _flashes(client) == [
+        "Resuming — 1 requirement reopened, token budget raised to 1,500."]
+
+
+def test_resume_refused_when_nothing_is_reopenable(client, starts):
+    _seed_stopped()
+    _run(storage.update_requirement("r1", status="satisfied"))
+    _run(storage.update_requirement("r3", status="unmet", attempts=3,
+                                    assessment_missing="gap"))
+    before = _snapshot()
+    client.post("/missions/m1/resume", data={"extra": "500"})
+    assert _snapshot() == before
+    assert starts == [] and not jobs._store
+    assert _flashes(client) == [
+        "Every requirement is satisfied or capped out — nothing to resume."]
+
+
+def test_resume_unknown_mission(client, starts):
+    r = client.post("/missions/nope/resume", data={"extra": "1"})
+    assert _path(r) == "/missions"
+    assert starts == []
+
+
+def test_resume_when_busy_changes_nothing(client, app_mod, starts, monkeypatch):
+    _seed_stopped()
+    before = _snapshot()
+
+    def full(*_a, **_k):
+        raise jobs.JobLimitReached("6 jobs already running")
+
+    monkeypatch.setattr(app_mod, "create_mission_job", full)
+    r = client.post("/missions/m1/resume", data={"extra": "500"})
+    assert _path(r) == "/missions/m1"
+    assert _snapshot() == before
+    assert starts == []
+    assert any(m.startswith("Busy") for m in _flashes(client))
+
+
+def test_resume_lost_claim_releases_its_job(client, app_mod, starts, monkeypatch):
+    _seed_stopped()
+    before = _snapshot()
+
+    async def lost(*_a):
+        return False
+
+    monkeypatch.setattr(app_mod, "claim_mission_status", lost)
+    client.post("/missions/m1/resume", data={"extra": "500"})
+    assert _snapshot() == before
+    assert starts == []
+    [job] = jobs._store.values()
+    assert job.done and job.stage == "cancelled" and job.finished_at
+    assert _live_jobs() == []
+    assert _flashes(client) == [
+        "This mission changed state in the meantime — nothing was resumed."]
+
+
+def test_resume_worker_start_failure_rolls_everything_back(client, app_mod, monkeypatch):
+    old = jobs.create_mission_job("Where is it?", 7)
+    jobs.finish_job(old, stage="done")
+    _seed_stopped()
+    _run(storage.update_mission("m1", job_id=old, error="earlier note", resume_count=1))
+    before = _snapshot()
+
+    def cannot_start(_mission_id, _job_id=None):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(app_mod, "start_collection", cannot_start)
+    r = client.post("/missions/m1/resume", data={"extra": "500"})
+    assert r.status_code == 500
+    assert _snapshot() == before
+    assert _live_jobs() == []
+
+
+def test_api_mission_reports_stop_reason_and_resumable(client):
+    _seed_stopped()
+    body = client.get("/api/mission/m1").get_json()
+    assert (body["stop_reason"], body["resumable"]) == ("token_budget", True)
+    _run(storage.update_mission("m1", stop_reason="complete"))
+    body = client.get("/api/mission/m1").get_json()
+    assert (body["stop_reason"], body["resumable"]) == ("complete", False)
+    _run(storage.update_mission("m1", stop_reason=None))
+    body = client.get("/api/mission/m1").get_json()
+    assert (body["stop_reason"], body["resumable"]) == (None, False)
+
+
+def test_api_mission_not_resumable_with_nothing_reopenable(client):
+    _seed_stopped("pass_budget")
+    for rid in ("r1", "r3"):
+        _run(storage.update_requirement(rid, status="satisfied"))
+    assert client.get("/api/mission/m1").get_json()["resumable"] is False
+
+
+def _resume_form(html):
+    m = re.search(r'<form[^>]*action="/missions/m1/resume".*?</form>', html, re.S)
+    return m.group(0) if m else None
+
+
+@pytest.mark.parametrize("stop_reason, label, value, cap", [
+    ("token_budget", "Stopped: token budget reached · 2 requirements still open",
+     "1000", "5000000"),
+    ("source_budget", "Stopped: source budget reached · 2 requirements still open",
+     "7", "100"),
+    ("pass_budget", "Stopped: pass budget reached · 2 requirements still open",
+     "2", "10"),
+])
+def test_mission_page_offers_resume_with_the_limit_prefilled(client, stop_reason, label,
+                                                            value, cap):
+    _seed_stopped(stop_reason)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    form = _resume_form(html)
+    assert form is not None
+    assert label in html
+    assert re.search(r'<input[^>]*name="extra"', form)
+    assert f'value="{value}"' in form and f'max="{cap}"' in form and 'min="1"' in form
+    assert re.search(r">\s*Resume\s*</button>", form)
+    # Next to Re-run, in the done-state actions.
+    assert html.index('action="/agents/a1/run"') < html.index('action="/missions/m1/resume"')
+
+
+def test_mission_page_resume_after_a_user_stop_has_no_input(client):
+    _seed_stopped("user_stop")
+    _run(storage.update_requirement("r3", status="satisfied"))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    form = _resume_form(html)
+    assert form is not None and 'name="extra"' not in form
+    assert "Stopped by you · 1 requirement still open" in html
+
+
+def test_mission_page_token_prefill_uses_the_setting_default(client, monkeypatch):
+    monkeypatch.setattr(config.settings, "max_llm_tokens", 9000)
+    _seed_stopped(budget={k: v for k, v in _STOPPED_BUDGET.items() if k != "max_llm_tokens"})
+    form = _resume_form(client.get("/missions/m1").get_data(as_text=True))
+    assert 'value="9000"' in form
+
+
+@pytest.mark.parametrize("stop_reason", ["complete", None])
+def test_mission_page_has_no_resume_without_a_limit_stop(client, stop_reason):
+    _seed_stopped(stop_reason)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "/missions/m1/resume" not in html
+    assert "still open" not in html
+
+
+def test_mission_page_has_no_resume_with_nothing_reopenable(client):
+    _seed_stopped()
+    for rid in ("r1", "r3"):
+        _run(storage.update_requirement(rid, status="satisfied"))
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "/missions/m1/resume" not in html
 
 
 # --- delete -------------------------------------------------------------
