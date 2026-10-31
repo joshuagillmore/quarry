@@ -1387,3 +1387,26 @@ async def get_documents_by_ids(doc_ids: Iterable[str]) -> list[Document]:
                     doc = Document(**dict(row))
                     found[doc.id] = doc
     return [found[doc_id] for doc_id in ids if doc_id in found]
+
+
+async def get_document_mission_ids(document_ids: Iterable[str]) -> dict[str, list[str]]:
+    """document_id -> the ids of every mission that linked it, in link
+    order, duplicates dropped. Every requested id has a key (an empty list
+    for a document no mission collected). The vector export stamps these on
+    each point's payload."""
+    ids = _unique(document_ids)
+    out: dict[str, list[str]] = {doc_id: [] for doc_id in ids}
+    if not ids:
+        return out
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        for batch in _batches(ids):
+            async with db.execute(
+                f"""SELECT document_id, mission_id FROM mission_documents
+                    WHERE document_id IN ({_marks(len(batch))}) ORDER BY rowid""",
+                batch,
+            ) as cur:
+                for doc_id, mission_id in await cur.fetchall():
+                    if mission_id not in out[doc_id]:
+                        out[doc_id].append(mission_id)
+    return out
