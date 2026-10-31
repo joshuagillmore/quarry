@@ -20,6 +20,10 @@ services:
       # exposure guard (insecure_exposure() in app.py) sees the same publish
       # interface Compose actually used, even if QUARRY_BIND isn't in .env.
       QUARRY_BIND: ${QUARRY_BIND:-127.0.0.1}
+      # Corpus export target. The default (.env / config.py) is a Qdrant on
+      # the host via host.docker.internal; with the optional `qdrant` service
+      # below (`docker compose --profile qdrant up -d`), set
+      # QDRANT_URL=http://qdrant:6333 in .env instead.
     shm_size: 1g
     restart: unless-stopped
     # Give gunicorn's graceful_timeout (30s, gunicorn.conf.py) room to finish
@@ -34,3 +38,16 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+
+  # Optional local Qdrant for the corpus export (vector_export.py). Not
+  # started by default: `docker compose --profile qdrant up -d --build`, then
+  # QDRANT_URL=http://qdrant:6333 in .env. Localhost-only publish, like the
+  # app; the collection lives in ./data/qdrant next to the SQLite file.
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    profiles: ["qdrant"]
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    restart: unless-stopped

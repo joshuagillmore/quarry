@@ -119,8 +119,8 @@ class LlmCall:
     actually answered, the tokens the provider reported, and how long it took.
     `mission_id` is None for calls outside a mission (one-shot extraction).
     Keyword-only, so a positional call cannot silently swap two fields."""
-    purpose: str   # plan | assess | brief | extract | chat
-    tier: str      # reasoning | fast (the tier requested, not who answered)
+    purpose: str   # plan | assess | brief | extract | chat | embed | rerank
+    tier: str      # reasoning | fast | embed | rerank (the tier requested, not who answered)
     model: str     # the model id that actually produced the response
     mission_id: Optional[str] = None
     prompt_tokens: int = 0
@@ -128,4 +128,34 @@ class LlmCall:
     duration_ms: int = 0
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass(kw_only=True)
+class ChunkRow:
+    """One stored chunk of a document (`chunks` table). chunk_id is
+    f"{document_id}#{idx}", so it is stable across re-crawls of the same
+    (url, search_query) and a chunk whose text did not change keeps its
+    embeddings. content_sha256 is chunking.chunk_sha256(text), the key that
+    decides whether a stored embedding is still for this text."""
+    chunk_id: str
+    document_id: str
+    idx: int
+    section: Optional[str] = None
+    text: str
+    char_len: int
+    content_sha256: str
+
+
+@dataclass(kw_only=True)
+class DocumentExport:
+    """What was last written to a vector collection for one document
+    (`document_exports` table): the document digest and embedding model at
+    export time, so an unchanged document is skipped on the next export."""
+    document_id: str
+    collection: str
+    content_sha256: str
+    embed_model: str
+    n_chunks: int = 0
+    exported_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat())

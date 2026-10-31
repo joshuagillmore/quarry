@@ -25,4 +25,5 @@ jobs:
             --with aiosqlite==0.22.1 --with python-dotenv==1.2.2 \
             --with Markdown==3.10.2 --with bleach==6.4.0 \
             --with APScheduler==3.11.3 \
+            --with httpx==0.28.1 --with qdrant-client==1.19.0 --with numpy==2.5.1 \
             python -m pytest -q tests

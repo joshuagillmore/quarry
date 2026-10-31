@@ -24,6 +24,7 @@ PYTHONDONTWRITEBYTECODE=1 uv run --no-project --python 3.12 --with pytest --with
   --with Werkzeug==3.1.8 --with pydantic==2.13.4 --with pydantic-settings==2.14.2 \
   --with aiosqlite==0.22.1 --with python-dotenv==1.2.2 --with Markdown==3.10.2 \
   --with bleach==6.4.0 --with APScheduler==3.11.3 \
+  --with httpx==0.28.1 --with qdrant-client==1.19.0 --with numpy==2.5.1 \
   python -m pytest -q tests
 ```
 
@@ -332,14 +333,19 @@ runs a **Mission** against a question using an intelligence-collection loop:
 ### Tests
 
 The `tests/` suite stubs `litellm`/`crawl4ai`/`ddgs` (`tests/stubs/`) so it runs
-without the heavy crawl stack. `pytest.ini` puts the repo root and
-`tests/stubs` on `pythonpath`, so no `PYTHONPATH` env var is needed:
+without the heavy crawl stack. `httpx` is deliberately **not** stubbed (a stub
+there would shadow the real package qdrant-client imports); `conftest.py`'s
+autouse fixture instead replaces `crawler.httpx.stream` with one that raises
+`httpx.ConnectError`, so the crawl fallback never reaches the network.
+`pytest.ini` puts the repo root and `tests/stubs` on `pythonpath`, so no
+`PYTHONPATH` env var is needed:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 uv run --no-project --python 3.12 --with pytest --with Flask==3.1.3 \
   --with Werkzeug==3.1.8 --with pydantic==2.13.4 --with pydantic-settings==2.14.2 \
   --with aiosqlite==0.22.1 --with python-dotenv==1.2.2 --with Markdown==3.10.2 \
   --with bleach==6.4.0 --with APScheduler==3.11.3 \
+  --with httpx==0.28.1 --with qdrant-client==1.19.0 --with numpy==2.5.1 \
   python -m pytest -q tests
 ```
 

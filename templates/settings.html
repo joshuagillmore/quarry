@@ -77,6 +77,89 @@
              class="select" style="width:120px;" value="{{ s.search_max_results }}">
     </div>
 
+    <fieldset style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:grid;gap:16px;">
+      <legend class="tweak-label" style="padding:0 6px;">Embeddings &amp; rerank</legend>
+
+      <datalist id="embed-model-list">
+        {% for m in embed_models %}<option value="{{ m }}"></option>{% endfor %}
+      </datalist>
+      <datalist id="rerank-model-list">
+        {% for m in rerank_models %}<option value="{{ m }}"></option>{% endfor %}
+      </datalist>
+
+      <div>
+        <label class="tweak-label" for="embed_model">Embedding model <span style="font-weight:400; text-transform:none;">(documents)</span></label>
+        <input id="embed_model" name="embed_model" class="select" style="width:100%;" list="embed-model-list"
+               maxlength="200" value="{{ s.embed_model }}" placeholder="cohere/embed-v5.0-pro — leave blank to turn embeddings off">
+        <p style="margin:6px 0 0; color:var(--fg-subtle); font-size:12px;">
+          Every stored document is embedded with this model ({{ s.embed_dim }} dimensions
+          for <code>cohere/</code> models). The corpus export uses the same vectors.
+          Leave blank to turn embeddings off; ranking then keeps search order.
+        </p>
+      </div>
+
+      <div>
+        <label class="tweak-label" for="embed_query_model">Query embedding model <span style="font-weight:400; text-transform:none;">(optional)</span></label>
+        <input id="embed_query_model" name="embed_query_model" class="select" style="width:100%;" list="embed-model-list"
+               maxlength="200" value="{{ s.embed_query_model }}" placeholder="cohere/embed-v5.0-fast — leave blank to reuse the embedding model">
+        <p style="margin:6px 0 0; color:var(--fg-subtle); font-size:12px;">
+          Embed 5 Pro (index) and Fast (queries) share one vector space, so the
+          cheaper model can answer queries. Must share a space with the model above.
+        </p>
+      </div>
+
+      <div>
+        <label class="tweak-label" for="rerank_model">Rerank model</label>
+        <input id="rerank_model" name="rerank_model" class="select" style="width:100%;" list="rerank-model-list"
+               maxlength="200" value="{{ s.rerank_model }}" placeholder="cohere/rerank-v5.0-pro — leave blank to turn rerank off">
+        <p style="margin:6px 0 0; color:var(--fg-subtle); font-size:12px;">
+          Reorders search candidates, assessor sources and the brief's source list.
+          Uses the API key above. A failed call falls back to the unranked order.
+        </p>
+      </div>
+    </fieldset>
+
+    <fieldset style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;display:grid;gap:16px;">
+      <legend class="tweak-label" style="padding:0 6px;">Corpus export</legend>
+
+      <div>
+        <label class="tweak-label" for="qdrant_url">Qdrant URL</label>
+        <input id="qdrant_url" name="qdrant_url" class="select" style="width:100%;"
+               maxlength="300" value="{{ s.qdrant_url }}" placeholder="http://host.docker.internal:6333">
+        <p style="margin:6px 0 0; color:var(--fg-subtle); font-size:12px;">
+          With the compose <code>qdrant</code> profile, use <code>http://qdrant:6333</code>.
+        </p>
+      </div>
+
+      <div>
+        <label class="tweak-label" for="qdrant_api_key">Qdrant API key <span style="font-weight:400; text-transform:none;">(optional)</span></label>
+        <input id="qdrant_api_key" name="qdrant_api_key" type="password" class="select" style="width:100%;"
+               placeholder="{{ '•••••••• set — leave blank to keep' if has_qdrant_key else 'not set — only needed for a secured Qdrant' }}"
+               autocomplete="off">
+      </div>
+
+      <div>
+        <label class="tweak-label" for="qdrant_export_collection">Collection</label>
+        <input id="qdrant_export_collection" name="qdrant_export_collection" class="select" style="width:260px;"
+               maxlength="100" pattern="[A-Za-z0-9_-]+" value="{{ s.qdrant_export_collection }}" placeholder="quarry">
+        <p style="margin:6px 0 0; color:var(--fg-subtle); font-size:12px;">
+          Letters, digits, <code>_</code> and <code>-</code> only. Points carry a
+          named <code>dense</code> vector and Coherence-shaped payloads.
+        </p>
+      </div>
+
+      <div>
+        <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+          <input type="checkbox" name="export_on_mission_done" value="on" {% if s.export_on_mission_done %}checked{% endif %}>
+          Export each mission's sources to the collection when its brief is written
+        </label>
+        <p style="margin:6px 0 0 24px; color:var(--fg-subtle); font-size:12px;">
+          Runs the corpus self-test afterwards and logs its recall. An export
+          failure is logged; it never fails the mission.
+        </p>
+      </div>
+    </fieldset>
+
     <div>
       <button type="submit" class="btn btn-primary">Save settings</button>
     </div>

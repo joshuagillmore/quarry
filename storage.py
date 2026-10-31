@@ -2,11 +2,16 @@ import os
 import json
 import aiosqlite
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterable, Optional
+import chunking
 from models import (Document, ExtractedData, SearchRecord, Agent, Mission,
-                    Requirement, LlmCall)
+                    Requirement, LlmCall, ChunkRow, DocumentExport)
 
 DB_PATH = None
+
+# Rows per `IN (...)` clause. SQLite's variable limit is 32766 on current
+# builds but 999 on older ones; batching keeps every query under both.
+_IN_BATCH = 500
 
 # Mission states with a live worker thread behind them. `awaiting_approval` is
 # deliberately absent: it rests on the user, not on a thread.
@@ -210,6 +215,48 @@ async def init_db():
                 created_at TEXT
             )
         """)
+        # --- Chunks, dense embeddings, corpus export state ---
+        # chunks: a document's body split by chunking.document_chunks, one
+        # row per chunk, replaced whole on every upsert_document. chunk_id is
+        # "<document_id>#<idx>" and content_sha256 the chunk text's digest.
+        # chunk_embeddings: one vector per (chunk, model), little-endian
+        # float32 bytes; storage never decodes them. Kept across a re-crawl
+        # for every chunk whose (chunk_id, content_sha256) did not change.
+        # document_exports: what a vector collection last received for a
+        # document, so an unchanged one is skipped next time.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                section TEXT,
+                text TEXT NOT NULL,
+                char_len INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                UNIQUE(document_id, idx)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                chunk_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, model)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS document_exports (
+                document_id TEXT NOT NULL,
+                collection TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                embed_model TEXT NOT NULL,
+                n_chunks INTEGER NOT NULL DEFAULT 0,
+                exported_at TEXT NOT NULL,
+                PRIMARY KEY (document_id, collection)
+            )
+        """)
         # Lookup indexes for the hot filters and joins: the Library by
         # collection and unfiltered (both paginate by crawled_at), extractions
         # per document, a mission's requirements, reverse document-to-mission
@@ -229,6 +276,8 @@ async def init_db():
             "ON missions(agent_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_mission "
             "ON llm_calls(mission_id)",
+            "CREATE INDEX IF NOT EXISTS idx_chunks_document "
+            "ON chunks(document_id)",
         ):
             await db.execute(_stmt)
 
@@ -492,8 +541,11 @@ async def upsert_document(doc: Document) -> str:
 
     One INSERT ... ON CONFLICT DO UPDATE statement, not select-then-write: two
     concurrent crawls of the same URL cannot both miss the row and then collide
-    on the UNIQUE constraint. The FTS row is replaced in the same transaction."""
+    on the UNIQUE constraint. The FTS row is replaced in the same transaction,
+    and so are the document's chunks (under the authoritative id, so a
+    re-crawl keeps the embeddings of every chunk whose text did not change)."""
     db_path = get_db_path()
+    chunks = chunking.document_chunks(doc)
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
             """INSERT INTO documents
@@ -523,6 +575,7 @@ async def upsert_document(doc: Document) -> str:
                VALUES (?, ?, ?, ?, ?)""",
             (doc_id, doc.title or "", doc.domain, doc.url, doc.content_markdown or ""),
         )
+        await _replace_document_chunks(db, doc_id, chunks)
         await db.commit()
         return doc_id
 
@@ -946,10 +999,16 @@ async def insert_llm_call(call: LlmCall) -> None:
         await db.commit()
 
 
-async def get_mission_llm_usage(mission_id: str) -> dict:
+async def get_mission_llm_usage(mission_id: str,
+                                exclude_purposes: tuple[str, ...] = ()) -> dict:
     """A mission's LLM usage: call count and token sums overall and per
     purpose. A mission with no recorded calls (or no such mission) gets zeros
-    and an empty by_purpose; NULL token columns count as 0."""
+    and an empty by_purpose; NULL token columns count as 0.
+
+    `exclude_purposes` leaves those purposes out of the top-level totals
+    (the token budget skips embed/rerank rows by default) while by_purpose
+    still lists every purpose, so telemetry shows the whole spend."""
+    excluded = frozenset(exclude_purposes)
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
@@ -966,9 +1025,365 @@ async def get_mission_llm_usage(mission_id: str) -> dict:
                   "completion_tokens": int(completion)}
         for purpose, calls, prompt, completion in rows
     }
+    counted = [p for purpose, p in by_purpose.items() if purpose not in excluded]
     return {
-        "calls": sum(p["calls"] for p in by_purpose.values()),
-        "prompt_tokens": sum(p["prompt_tokens"] for p in by_purpose.values()),
-        "completion_tokens": sum(p["completion_tokens"] for p in by_purpose.values()),
+        "calls": sum(p["calls"] for p in counted),
+        "prompt_tokens": sum(p["prompt_tokens"] for p in counted),
+        "completion_tokens": sum(p["completion_tokens"] for p in counted),
         "by_purpose": by_purpose,
     }
+
+
+async def get_requirement_document_map(mission_id: str) -> dict[str, list[str]]:
+    """requirement_id -> [document_id] for a mission, from mission_documents
+    in link order. Every requirement of the mission has a key (an empty list
+    when nothing was linked to it), in plan order; a link whose requirement
+    row is gone still appears under its id, after those."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT id FROM requirements WHERE mission_id = ? ORDER BY rowid",
+            (mission_id,),
+        ) as cur:
+            out: dict[str, list[str]] = {row[0]: [] for row in await cur.fetchall()}
+        async with db.execute(
+            """SELECT requirement_id, document_id FROM mission_documents
+               WHERE mission_id = ? ORDER BY rowid""",
+            (mission_id,),
+        ) as cur:
+            for req_id, doc_id in await cur.fetchall():
+                out.setdefault(req_id, []).append(doc_id)
+    return out
+
+
+# --- Chunks, embeddings, export state ---
+
+def _batches(items: list, size: int = _IN_BATCH) -> Iterable[list]:
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _marks(n: int) -> str:
+    return ",".join("?" * n)
+
+
+def _unique(ids: Iterable[str]) -> list[str]:
+    """Input order, duplicates dropped."""
+    return list(dict.fromkeys(ids))
+
+
+def chunk_rows_for(document_id: str, chunks) -> list[ChunkRow]:
+    """The `chunks` rows a document's chunking.Chunk list becomes."""
+    rows = []
+    for chunk in chunks:
+        text = chunk.text
+        rows.append(ChunkRow(
+            chunk_id=f"{document_id}#{chunk.idx}", document_id=document_id,
+            idx=int(chunk.idx), section=chunk.section, text=text,
+            char_len=len(text), content_sha256=chunking.chunk_sha256(text)))
+    return rows
+
+
+async def _replace_document_chunks(db, document_id: str, chunks) -> None:
+    """Replace a document's chunk rows on an open connection, inside the
+    caller's transaction. Embeddings survive for every chunk whose
+    (chunk_id, content_sha256) is unchanged; those of a chunk that vanished
+    or whose text changed are deleted, so no vector can describe text that
+    is no longer there."""
+    rows = chunk_rows_for(document_id, chunks)
+    async with db.execute(
+        "SELECT chunk_id, content_sha256 FROM chunks WHERE document_id = ?",
+        (document_id,),
+    ) as cur:
+        old = {cid: sha for cid, sha in await cur.fetchall()}
+    unchanged = {r.chunk_id for r in rows if old.get(r.chunk_id) == r.content_sha256}
+    stale = [cid for cid in _unique([*old, *(r.chunk_id for r in rows)])
+             if cid not in unchanged]
+    for batch in _batches(stale):
+        await db.execute(
+            f"DELETE FROM chunk_embeddings WHERE chunk_id IN ({_marks(len(batch))})",
+            batch)
+    await db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+    await db.executemany(
+        """INSERT INTO chunks
+           (chunk_id, document_id, idx, section, text, char_len, content_sha256)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [(r.chunk_id, r.document_id, r.idx, r.section, r.text, r.char_len,
+          r.content_sha256) for r in rows],
+    )
+
+
+async def replace_document_chunks(document_id: str, chunks) -> None:
+    """Rebuild a document's chunks from a chunking.Chunk list in one
+    transaction (see _replace_document_chunks for what happens to its
+    embeddings). upsert_document does this itself; this is for rebuilding
+    chunks of documents stored before chunking existed."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        await _replace_document_chunks(db, document_id, chunks)
+        await db.commit()
+
+
+_CHUNK_COLUMNS = "chunk_id, document_id, idx, section, text, char_len, content_sha256"
+
+
+def _chunk_row(row) -> ChunkRow:
+    return ChunkRow(**dict(row))
+
+
+async def get_document_chunks(document_id: str) -> list[ChunkRow]:
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"SELECT {_CHUNK_COLUMNS} FROM chunks WHERE document_id = ? ORDER BY idx",
+            (document_id,),
+        ) as cur:
+            return [_chunk_row(r) for r in await cur.fetchall()]
+
+
+async def get_chunks_for_documents(document_ids: Iterable[str]) -> dict[str, list[ChunkRow]]:
+    """document_id -> its chunks in idx order. Every requested id has a key
+    (an empty list for a document without chunks, or no such document), in
+    input order."""
+    ids = _unique(document_ids)
+    out: dict[str, list[ChunkRow]] = {doc_id: [] for doc_id in ids}
+    if not ids:
+        return out
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        for batch in _batches(ids):
+            async with db.execute(
+                f"""SELECT {_CHUNK_COLUMNS} FROM chunks
+                    WHERE document_id IN ({_marks(len(batch))})
+                    ORDER BY document_id, idx""",
+                batch,
+            ) as cur:
+                for row in await cur.fetchall():
+                    chunk = _chunk_row(row)
+                    out[chunk.document_id].append(chunk)
+    return out
+
+
+async def get_chunks_missing_embeddings(model: str,
+                                        document_ids: Optional[Iterable[str]] = None,
+                                        limit: int = 2000) -> list[ChunkRow]:
+    """Chunks with no chunk_embeddings row for `model`, optionally only of
+    the given documents, in (document_id, idx) order, at most `limit`."""
+    limit = max(0, int(limit))
+    if limit == 0:
+        return []
+    ids = None if document_ids is None else _unique(document_ids)
+    if ids is not None and not ids:
+        return []
+    base = f"""SELECT {", ".join("c." + col.strip() for col in _CHUNK_COLUMNS.split(","))}
+               FROM chunks c
+               LEFT JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model = ?
+               WHERE e.chunk_id IS NULL"""
+    out: list[ChunkRow] = []
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        if ids is None:
+            async with db.execute(
+                base + " ORDER BY c.document_id, c.idx LIMIT ?", (model, limit)
+            ) as cur:
+                return [_chunk_row(r) for r in await cur.fetchall()]
+        for batch in _batches(ids):
+            remaining = limit - len(out)
+            if remaining <= 0:
+                break
+            async with db.execute(
+                base + f" AND c.document_id IN ({_marks(len(batch))})"
+                       " ORDER BY c.document_id, c.idx LIMIT ?",
+                (model, *batch, remaining),
+            ) as cur:
+                out.extend(_chunk_row(r) for r in await cur.fetchall())
+    return out
+
+
+async def upsert_chunk_embeddings(rows: list[tuple[str, str, int, bytes]]) -> None:
+    """Store vectors as (chunk_id, model, dim, vector) tuples, replacing any
+    existing row for the same (chunk_id, model). `vector` is little-endian
+    float32 bytes, so it must be exactly dim * 4 bytes long; callers convert
+    (storage never imports numpy)."""
+    if not rows:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    params = []
+    for chunk_id, model, dim, vector in rows:
+        dim = int(dim)
+        vector = bytes(vector)
+        if dim <= 0 or len(vector) != dim * 4:
+            raise ValueError(
+                f"embedding for {chunk_id!r}: {len(vector)} bytes is not "
+                f"{dim} little-endian float32 values")
+        params.append((chunk_id, model, dim, vector, now))
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        await db.executemany(
+            """INSERT INTO chunk_embeddings (chunk_id, model, dim, vector, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(chunk_id, model) DO UPDATE SET
+                   dim=excluded.dim, vector=excluded.vector,
+                   created_at=excluded.created_at""",
+            params,
+        )
+        await db.commit()
+
+
+async def get_chunk_embeddings(model: str, document_ids: Optional[Iterable[str]] = None
+                               ) -> list[tuple[str, str, bytes]]:
+    """(chunk_id, document_id, vector) for every embedded chunk of `model`,
+    optionally only of the given documents, in (document_id, idx) order.
+    Only chunks that still exist are returned."""
+    ids = None if document_ids is None else _unique(document_ids)
+    if ids is not None and not ids:
+        return []
+    base = """SELECT e.chunk_id, c.document_id, e.vector
+              FROM chunk_embeddings e
+              JOIN chunks c ON c.chunk_id = e.chunk_id
+              WHERE e.model = ?"""
+    order = " ORDER BY c.document_id, c.idx"
+    out: list[tuple[str, str, bytes]] = []
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        if ids is None:
+            async with db.execute(base + order, (model,)) as cur:
+                return [(cid, did, bytes(vec)) for cid, did, vec in await cur.fetchall()]
+        for batch in _batches(ids):
+            async with db.execute(
+                base + f" AND c.document_id IN ({_marks(len(batch))})" + order,
+                (model, *batch),
+            ) as cur:
+                out.extend((cid, did, bytes(vec)) for cid, did, vec in await cur.fetchall())
+    return out
+
+
+async def get_embedding_coverage(model: str) -> dict:
+    """How much of the library `model` has embedded: document and chunk
+    counts, how many chunks have a vector, how many documents have every
+    chunk embedded, and how many chunks still need one."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("SELECT COUNT(*) FROM documents") as cur:
+            documents = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT document_id) FROM chunks"
+        ) as cur:
+            chunks, documents_chunked = await cur.fetchone()
+        async with db.execute(
+            """SELECT COUNT(*) FROM chunk_embeddings e
+               JOIN chunks c ON c.chunk_id = e.chunk_id WHERE e.model = ?""",
+            (model,),
+        ) as cur:
+            embedded = (await cur.fetchone())[0]
+        async with db.execute(
+            """SELECT COUNT(*) FROM (
+                   SELECT c.document_id FROM chunks c
+                   LEFT JOIN chunk_embeddings e
+                     ON e.chunk_id = c.chunk_id AND e.model = ?
+                   GROUP BY c.document_id
+                   HAVING COUNT(e.chunk_id) = COUNT(*))""",
+            (model,),
+        ) as cur:
+            documents_embedded = (await cur.fetchone())[0]
+    return {
+        "model": model,
+        "documents": int(documents),
+        "documents_chunked": int(documents_chunked),
+        "documents_embedded": int(documents_embedded),
+        "chunks": int(chunks),
+        "embedded": int(embedded),
+        "missing": int(chunks) - int(embedded),
+    }
+
+
+_EXPORT_COLUMNS = "document_id, collection, content_sha256, embed_model, n_chunks, exported_at"
+
+
+async def get_document_exports(document_ids: Iterable[str], collection: str
+                               ) -> dict[str, DocumentExport]:
+    """document_id -> its export row for `collection`; documents never
+    exported there have no key."""
+    ids = _unique(document_ids)
+    out: dict[str, DocumentExport] = {}
+    if not ids:
+        return out
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        for batch in _batches(ids):
+            async with db.execute(
+                f"""SELECT {_EXPORT_COLUMNS} FROM document_exports
+                    WHERE collection = ? AND document_id IN ({_marks(len(batch))})""",
+                (collection, *batch),
+            ) as cur:
+                for row in await cur.fetchall():
+                    exp = DocumentExport(**dict(row))
+                    out[exp.document_id] = exp
+    return out
+
+
+async def list_exported_document_ids(collection: str) -> list[str]:
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT document_id FROM document_exports WHERE collection = ? ORDER BY document_id",
+            (collection,),
+        ) as cur:
+            return [row[0] for row in await cur.fetchall()]
+
+
+async def upsert_document_export(row: DocumentExport) -> None:
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """INSERT INTO document_exports
+               (document_id, collection, content_sha256, embed_model, n_chunks, exported_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(document_id, collection) DO UPDATE SET
+                   content_sha256=excluded.content_sha256,
+                   embed_model=excluded.embed_model,
+                   n_chunks=excluded.n_chunks,
+                   exported_at=excluded.exported_at""",
+            (row.document_id, row.collection, row.content_sha256, row.embed_model,
+             int(row.n_chunks), row.exported_at),
+        )
+        await db.commit()
+
+
+async def delete_document_exports(document_ids: Iterable[str], collection: str) -> None:
+    ids = _unique(document_ids)
+    if not ids:
+        return
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        for batch in _batches(ids):
+            await db.execute(
+                f"""DELETE FROM document_exports
+                    WHERE collection = ? AND document_id IN ({_marks(len(batch))})""",
+                (collection, *batch),
+            )
+        await db.commit()
+
+
+async def get_documents_by_ids(doc_ids: Iterable[str]) -> list[Document]:
+    """Full documents (bodies included) in the order the ids were given,
+    duplicates dropped, unknown ids skipped."""
+    ids = _unique(doc_ids)
+    if not ids:
+        return []
+    found: dict[str, Document] = {}
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        for batch in _batches(ids):
+            async with db.execute(
+                f"SELECT * FROM documents WHERE id IN ({_marks(len(batch))})", batch
+            ) as cur:
+                for row in await cur.fetchall():
+                    doc = Document(**dict(row))
+                    found[doc.id] = doc
+    return [found[doc_id] for doc_id in ids if doc_id in found]

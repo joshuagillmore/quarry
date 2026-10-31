@@ -21,6 +21,7 @@ import brief
 import jobs
 import scheduler
 from config import (settings, save_overrides, known_models,
+                    known_embed_models, known_rerank_models,
                     persistent_secret_key, active_api_key)
 from search import web_search
 from storage import (
@@ -1804,6 +1805,10 @@ def api_mission(mission_id):
     return state
 
 
+# Qdrant collection names: no spaces, slashes or quotes reach the client URL.
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings_page():
     if request.method == "POST":
@@ -1821,13 +1826,34 @@ def settings_page():
         key = request.form.get("llm_api_key", "").strip()
         if key:
             vals["llm_api_key"] = key
+        # Embeddings & rerank. Blank is meaningful here: no embed model turns
+        # embeddings off, no query model reuses embed_model, no rerank model
+        # turns rerank off.
+        vals["embed_model"] = request.form.get("embed_model", "").strip()[:200]
+        vals["embed_query_model"] = request.form.get("embed_query_model", "").strip()[:200]
+        vals["rerank_model"] = request.form.get("rerank_model", "").strip()[:200]
+        # Corpus export.
+        vals["qdrant_url"] = request.form.get("qdrant_url", "").strip()[:300] or settings.qdrant_url
+        collection = request.form.get("qdrant_export_collection", "").strip()[:100]
+        if collection and not _COLLECTION_NAME_RE.match(collection):
+            flash("Collection name not saved: use letters, digits, '_' and '-' only.", "error")
+        elif collection:
+            vals["qdrant_export_collection"] = collection
+        # An unchecked checkbox is absent from the form, so absence means off.
+        vals["export_on_mission_done"] = request.form.get("export_on_mission_done") == "on"
+        # Same rule as llm_api_key: blank keeps the stored key.
+        qdrant_key = request.form.get("qdrant_api_key", "").strip()
+        if qdrant_key:
+            vals["qdrant_api_key"] = qdrant_key
         save_overrides(vals)
         flash("Settings saved — applied immediately, no restart needed.", "success")
         return redirect(url_for("settings_page"))
 
     return render_template(
         "settings.html", s=settings, models=known_models(),
-        has_key=bool(active_api_key()), active_page="settings",
+        embed_models=known_embed_models(), rerank_models=known_rerank_models(),
+        has_key=bool(active_api_key()), has_qdrant_key=bool(settings.qdrant_api_key),
+        active_page="settings",
     )
 
 
