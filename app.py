@@ -13,14 +13,17 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from flask import (Flask, Response, render_template, request, redirect,
-                   url_for, flash, session, stream_with_context)
+                   url_for, flash, session, stream_with_context, jsonify)
 from werkzeug.exceptions import SecurityError
 
 import auth
 import brief
 import jobs
+import ranking
 import scheduler
+import vector_export
 from config import (settings, save_overrides, known_models,
+                    known_embed_models, known_rerank_models,
                     persistent_secret_key, active_api_key)
 from search import web_search
 from storage import (
@@ -29,23 +32,25 @@ from storage import (
     get_extractions_for_document, get_search_history,
     count_documents, count_searches, count_extractions, count_domains,
     get_doc_ids_with_extractions, get_search_history_enriched,
-    get_related_documents, search_documents_fts,
+    get_related_documents,
     insert_agent, get_agent, list_agents, update_agent, delete_agent,
     insert_mission, update_mission, get_mission, list_missions,
-    get_requirements_for_mission, get_mission_documents,
+    get_requirements_for_mission, get_mission_documents, get_mission_document_ids,
     get_missions_enriched, get_distinct_search_queries,
     insert_requirement, update_requirement, delete_requirement,
     get_requirement_documents, get_agent_track_records,
     reconcile_interrupted_missions, delete_mission,
     claim_mission_status, agent_has_active_mission,
     get_mission_llm_usage, get_mission_pair_documents,
+    get_document_exports,
 )
 from jobs import (
     create_job, get_job, job_state, run_job_in_background,
     get_sidebar_jobs, get_in_memory_job_ids, create_mission_job,
     request_cancel, JobLimitReached,
 )
-from agent_runner import start_planning, start_collection, _token_budget
+from agent_runner import (start_planning, start_collection, _token_budget,
+                          _budget_exclusions)
 from brief import linkify_citations
 from scheduler import (start_scheduler, sync_agent_jobs, validate_cron,
                        describe_next_run, scheduled_jobs)
@@ -610,6 +615,17 @@ PAGE_SIZE = 60
 PREVIEW_CHARS = 4000
 
 
+def _search_mode_label(mode: str) -> str:
+    """ranking.hybrid_search's mode ("fts", "hybrid", "<mode>+rerank") as
+    the label shown beside the Library's match count."""
+    base, _sep, rerank = (mode or "fts").partition("+")
+    label = "hybrid" if base == "hybrid" else "full-text"
+    if rerank == "rerank":
+        model = (settings.rerank_model or "").strip()
+        return f"ranked: {label} + rerank" + (f" · {model}" if model else "")
+    return label
+
+
 @app.route("/documents")
 def documents_list():
     search_filter = request.args.get("search", "").strip()
@@ -622,6 +638,7 @@ def documents_list():
 
     mission_obj = None
     total = None  # set only for the paged listings
+    search_mode = ""  # set only when the cards are full-text matches
     if mission_filter:
         # Mission filter takes precedence; full-text within a mission is handled
         # client-side by the page's filter (the same input, seeded with `q`).
@@ -629,7 +646,11 @@ def documents_list():
         mission_obj = run_async(get_mission(mission_filter))
         documents = run_async(get_mission_documents(mission_filter))
     elif full_text:
-        documents = run_async(search_documents_fts(full_text, search_filter or None))
+        # FTS fused with the dense index and reranked where those are on;
+        # hybrid_search degrades to plain FTS on its own and never raises.
+        # Like the FTS path it is capped (100), so it is unpaged.
+        documents, search_mode = run_async(
+            ranking.hybrid_search(full_text, search_filter or None))
     else:
         if search_filter:
             # No COUNT helper for one collection in storage: count metadata
@@ -692,6 +713,7 @@ def documents_list():
         # then leave alone (their hit may be in the body it cannot see).
         lib_query=full_text,
         full_text_query="" if mission_filter else full_text,
+        search_mode_label=_search_mode_label(search_mode) if not mission_filter else "",
         search_queries=search_queries,
         missions=missions,
         pager=pager,
@@ -1048,12 +1070,13 @@ def _search_passes(raw) -> list[dict]:
     return lines
 
 
-_PURPOSE_ORDER = ("plan", "assess", "extract", "brief")
+_PURPOSE_ORDER = ("plan", "assess", "extract", "brief", "rerank", "embed")
 
 
 def _token_rows(usage: dict) -> list[dict]:
     """get_mission_llm_usage's by_purpose as rows in pipeline order (plan,
-    assess, extract, brief, then anything else alphabetically)."""
+    assess, extract, brief, rerank, embed, then anything else
+    alphabetically)."""
     by = usage.get("by_purpose") or {}
     rank = {p: i for i, p in enumerate(_PURPOSE_ORDER)}
     return [
@@ -1062,6 +1085,17 @@ def _token_rows(usage: dict) -> list[dict]:
          "total": by[p]["prompt_tokens"] + by[p]["completion_tokens"]}
         for p in sorted(by, key=lambda p: (rank.get(p, len(rank)), p))
     ]
+
+
+def _budget_tokens_used(mission_id: str) -> int:
+    """The spend the token budget counts: prompt + completion over the
+    recorded calls minus agent_runner._budget_exclusions() (embed/rerank
+    rows unless settings count them), so a retask/resume refusal and the
+    Resume form's prefill agree with what the runner would decide. The
+    telemetry strip and api_mission's llm_tokens stay unfiltered."""
+    usage = run_async(get_mission_llm_usage(
+        mission_id, exclude_purposes=_budget_exclusions()))
+    return usage["prompt_tokens"] + usage["completion_tokens"]
 
 
 def _budget_max_llm_tokens(budget: dict) -> int:
@@ -1118,6 +1152,11 @@ def mission_view(mission_id):
 
     budget = _mission_budget(mission)
     llm_usage = run_async(get_mission_llm_usage(mission_id))
+    # The spend the budget counts (embed/rerank rows excluded unless the
+    # setting says otherwise): what the strip compares with max_llm_tokens
+    # and what the Resume form's "used" prefill feeds the raise math. The
+    # grand total and the per-purpose rows stay unfiltered.
+    budget_tokens = _budget_tokens_used(mission_id)
     # The compare link only when there is a previous run to compare with.
     has_parent = bool(mission.parent_mission_id) and \
         run_async(get_mission(mission.parent_mission_id)) is not None
@@ -1125,6 +1164,7 @@ def mission_view(mission_id):
     live_state = job_state(mission.job_id) if mission.job_id else None
     return render_template(
         "mission.html", mission=mission, agent=agent,
+        export_state=_export_state([d.id for d in documents], mission_id),
         requirements=requirements, documents=documents,
         numbered_sources=numbered,
         rail_available=sum(1 for _n, d in numbered if d is not None),
@@ -1132,9 +1172,9 @@ def mission_view(mission_id):
         brief_html=brief_html, brief_checks=_brief_checks(mission.brief_warnings_json),
         ext_ids=ext_ids, budget=budget,
         llm_usage=llm_usage, token_rows=_token_rows(llm_usage),
+        budget_tokens=budget_tokens,
         max_llm_tokens=_budget_max_llm_tokens(budget),
-        resume=_resume_offer(mission, requirements, budget, agent,
-                             llm_usage["prompt_tokens"] + llm_usage["completion_tokens"]),
+        resume=_resume_offer(mission, requirements, budget, agent, budget_tokens),
         has_parent=has_parent,
         live_state=live_state,
         live=mission.job_id in get_in_memory_job_ids(),
@@ -1544,8 +1584,7 @@ def requirement_retask(mission_id, req_id):
     # re-extract and re-write the brief: refuse it before anything changes.
     token_budget = _token_budget(_mission_budget(mission))
     if token_budget > 0:
-        usage = run_async(get_mission_llm_usage(mission_id))
-        used = usage["prompt_tokens"] + usage["completion_tokens"]
+        used = _budget_tokens_used(mission_id)
         if used >= token_budget:
             flash(f"This mission has used {used:,} of {token_budget:,} tokens; "
                   "raise the budget before re-tasking.", "error")
@@ -1663,10 +1702,7 @@ def mission_resume(mission_id):
     # is cumulative across runs; max_sources/max_passes are per run.
     budget = _mission_budget(mission)
     token_cap = _budget_max_llm_tokens(budget)
-    used = 0
-    if token_cap > 0:
-        usage = run_async(get_mission_llm_usage(mission_id))
-        used = usage["prompt_tokens"] + usage["completion_tokens"]
+    used = _budget_tokens_used(mission_id) if token_cap > 0 else 0
     raised = dict(budget)
     notes = []
     limit = _RESUME_LIMITS.get(mission.stop_reason)
@@ -1744,6 +1780,111 @@ def mission_resume(mission_id):
     return redirect(url_for("mission_view", mission_id=mission_id))
 
 
+# --- Corpus export (Qdrant) ---
+
+def _valid_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+def _export_collection() -> str:
+    return (settings.qdrant_export_collection or "").strip()
+
+
+def _export_state(doc_ids: list[str], mission_id: str | None = None) -> dict:
+    """How much of a document set is in the export collection, for the
+    mission page and its poll: {"exported", "total", "collection", "latest"
+    (max exported_at or None), "running" (a background export of this
+    mission is in flight), "line" (the plain-text state line)}. The line is
+    text, never markup: the template autoescapes it and the poll sets it
+    as textContent."""
+    collection = _export_collection()
+    rows = run_async(get_document_exports(doc_ids, collection)) if doc_ids else {}
+    latest = max((r.exported_at for r in rows.values()), default=None)
+    status = vector_export.export_status()
+    running = bool(status.get("running")) and mission_id is not None \
+        and status.get("mission_id") == mission_id
+    parts = [f"exported {len(rows)} of {len(doc_ids)} → {collection or '(no collection)'}"]
+    if latest:
+        parts.append(f"last {_export_stamp(latest)}")
+    if running:
+        parts.append("export running")
+    return {"exported": len(rows), "total": len(doc_ids), "collection": collection,
+            "latest": latest, "running": running, "line": " · ".join(parts)}
+
+
+def _export_stamp(iso: str) -> str:
+    """An exported_at ISO timestamp as 'YYYY-MM-DD HH:MMZ' (UTC); unparsable
+    values are shown as stored, cut short."""
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return str(iso)[:16]
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%MZ")
+
+
+def _start_export(doc_ids: list[str], mission_id: str | None) -> None:
+    """Hand a document set to the background exporter and flash the outcome."""
+    if not doc_ids:
+        flash("Nothing to export: no documents in this collection.", "info")
+        return
+    if vector_export.start_export_in_background(doc_ids, mission_id=mission_id):
+        flash(f"Export started → '{_export_collection()}'", "success")
+    else:
+        flash("An export is already running", "info")
+
+
+@app.route("/missions/<mission_id>/export", methods=["POST"])
+def mission_export(mission_id):
+    """Embed this mission's sources and write them to the Qdrant corpus, in
+    the background; the mission page's state line follows the result."""
+    if not _valid_uuid(mission_id):
+        flash("Invalid mission id.", "error")
+        return redirect(url_for("missions_list"))
+    mission = run_async(get_mission(mission_id))
+    if not mission:
+        flash("Mission not found.", "error")
+        return redirect(url_for("missions_list"))
+    docs = run_async(get_mission_documents(mission_id))
+    _start_export([d.id for d in docs], mission_id)
+    return redirect(url_for("mission_view", mission_id=mission_id))
+
+
+@app.route("/documents/export", methods=["POST"])
+def documents_export():
+    """Export one Library collection: the documents of a search
+    (`search=<query>`) or of a mission (`mission=<id>`), back to that view."""
+    search_filter = request.form.get("search", "").strip()[:500]
+    mission_filter = request.form.get("mission", "").strip()
+    if mission_filter:
+        if not _valid_uuid(mission_filter):
+            flash("Invalid mission id.", "error")
+            return redirect(url_for("documents_list"))
+        if not run_async(get_mission(mission_filter)):
+            flash("Mission not found.", "error")
+            return redirect(url_for("documents_list"))
+        docs = run_async(get_mission_documents(mission_filter))
+        _start_export([d.id for d in docs], mission_filter)
+        return redirect(url_for("documents_list", mission=mission_filter))
+    if search_filter:
+        docs = run_async(get_documents_by_search(search_filter, preview_chars=0))
+        _start_export([d.id for d in docs], None)
+        return redirect(url_for("documents_list", search=search_filter))
+    flash("Choose a search or a mission to export.", "error")
+    return redirect(url_for("documents_list"))
+
+
+@app.route("/api/export/status")
+def api_export_status():
+    """The current or last background export, including its corpus check."""
+    return jsonify(vector_export.export_status())
+
+
 @app.route("/missions/<mission_id>/brief.md")
 def mission_brief_export(mission_id):
     mission = run_async(get_mission(mission_id))
@@ -1788,6 +1929,14 @@ def api_mission(mission_id):
     # cell ([data-tele-tokens]) follows it live.
     usage = run_async(get_mission_llm_usage(mission_id))
     state["llm_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    # What the token budget counts ([data-tele-budget-tokens] and the bar):
+    # the same number the runner's checkpoints compare with max_llm_tokens.
+    state["budget_tokens"] = _budget_tokens_used(mission_id)
+    # The done-state "exported n of total" line ([data-export-state]) follows
+    # this while a background export writes rows. Ids only: a ~1.2s poll
+    # must not pull every source body out of SQLite each time.
+    state["export_state"] = _export_state(
+        run_async(get_mission_document_ids(mission_id)), mission_id)
     if mission.job_id:
         js = job_state(mission.job_id)
         if js:
@@ -1802,6 +1951,10 @@ def api_mission(mission_id):
                 "cancel_requested": js["cancel_requested"],
             }
     return state
+
+
+# Qdrant collection names: no spaces, slashes or quotes reach the client URL.
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -1821,13 +1974,34 @@ def settings_page():
         key = request.form.get("llm_api_key", "").strip()
         if key:
             vals["llm_api_key"] = key
+        # Embeddings & rerank. Blank is meaningful here: no embed model turns
+        # embeddings off, no query model reuses embed_model, no rerank model
+        # turns rerank off.
+        vals["embed_model"] = request.form.get("embed_model", "").strip()[:200]
+        vals["embed_query_model"] = request.form.get("embed_query_model", "").strip()[:200]
+        vals["rerank_model"] = request.form.get("rerank_model", "").strip()[:200]
+        # Corpus export.
+        vals["qdrant_url"] = request.form.get("qdrant_url", "").strip()[:300] or settings.qdrant_url
+        collection = request.form.get("qdrant_export_collection", "").strip()[:100]
+        if collection and not _COLLECTION_NAME_RE.match(collection):
+            flash("Collection name not saved: use letters, digits, '_' and '-' only.", "error")
+        elif collection:
+            vals["qdrant_export_collection"] = collection
+        # An unchecked checkbox is absent from the form, so absence means off.
+        vals["export_on_mission_done"] = request.form.get("export_on_mission_done") == "on"
+        # Same rule as llm_api_key: blank keeps the stored key.
+        qdrant_key = request.form.get("qdrant_api_key", "").strip()
+        if qdrant_key:
+            vals["qdrant_api_key"] = qdrant_key
         save_overrides(vals)
         flash("Settings saved — applied immediately, no restart needed.", "success")
         return redirect(url_for("settings_page"))
 
     return render_template(
         "settings.html", s=settings, models=known_models(),
-        has_key=bool(active_api_key()), active_page="settings",
+        embed_models=known_embed_models(), rerank_models=known_rerank_models(),
+        has_key=bool(active_api_key()), has_qdrant_key=bool(settings.qdrant_api_key),
+        active_page="settings",
     )
 
 

@@ -206,3 +206,128 @@ def test_requery_is_capped_at_200_characters(monkeypatch):
     [q] = agent_assessor.assess_requirement(req, []).next_queries
     assert len(q) <= 200 and q.startswith("Battery import rules regulation")
     assert set(q.split()[3:]) == {"regulation"}, "cut at a word boundary"
+
+
+# ---------- reranked excerpts (WP7) ----------
+
+import asyncio  # noqa: E402
+
+import litellm  # noqa: E402
+
+import ranking  # noqa: E402
+import storage  # noqa: E402
+from config import settings  # noqa: E402
+
+# The key term sits in the second heading-bounded chunk, so the body head
+# (what the excerpt was before reranking) never shows it to the grader.
+_LATE_BODY = ("# Intro\n\n" + "sourdough bread and pastry recipes " * 30 +
+              "\n\n# Later\n\nlithium battery degradation mechanisms shorten lifetime")
+
+
+def _late_doc(doc_id="late", title="Late page"):
+    return Document(id=doc_id, url=f"http://x/{doc_id}", domain="x", title=title,
+                    search_query="q", crawled_at="t", content_fit="",
+                    content_markdown=_LATE_BODY, word_count=200)
+
+
+def _bread_doc():
+    return Document(id="bread", url="http://x/bread", domain="x", title="Bread page",
+                    search_query="q", crawled_at="t", content_fit="",
+                    content_markdown="bread " * 200, word_count=200)
+
+
+def _capture_prompt(monkeypatch):
+    seen = {}
+
+    def fake(s, u, **k):
+        seen["prompt"] = u
+        return {"satisfied": True, "confidence": "high"}, "raw"
+
+    monkeypatch.setattr(agent_assessor, "chat_json", fake)
+    return seen
+
+
+def test_assessor_uses_reranked_best_chunk_excerpts(monkeypatch):
+    litellm.reset_calls()
+    monkeypatch.setattr(settings, "rerank_model", "cohere/rerank-v5.0-pro")
+    asyncio.run(storage.init_db())
+    seen = _capture_prompt(monkeypatch)
+
+    a = agent_assessor.assess_requirement(_termed_req(), [_bread_doc(), _late_doc()])
+
+    assert a.satisfied
+    prompt = seen["prompt"]
+    assert prompt.index("[1] Late page") < prompt.index("[2] Bread page"), "best first"
+    assert "Later\n\nlithium battery degradation" in prompt, "the best chunk is the excerpt"
+    assert "sourdough" not in prompt, "not the body head"
+    [kw] = litellm.rerank_calls
+    assert kw["query"] == "Lithium battery degradation What mechanisms shorten battery lifetime?"
+    # Charged to the requirement's mission.
+    usage = asyncio.run(storage.get_mission_llm_usage("m"))
+    assert usage["by_purpose"]["rerank"]["calls"] == 1
+    litellm.reset_calls()
+
+
+def test_assessor_falls_back_to_body_heads_when_rerank_is_off(monkeypatch):
+    litellm.reset_calls()
+    monkeypatch.setattr(settings, "rerank_model", "")
+    seen = _capture_prompt(monkeypatch)
+    agent_assessor.assess_requirement(_termed_req(), [_bread_doc(), _late_doc()])
+    prompt = seen["prompt"]
+    assert prompt.index("[1] Bread page") < prompt.index("[2] Late page"), "input order"
+    assert "sourdough" in prompt, "the body head is the excerpt"
+    assert litellm.rerank_calls == []
+
+
+def test_assessor_falls_back_when_rank_documents_returns_none(monkeypatch):
+    monkeypatch.setattr(settings, "rerank_model", "cohere/rerank-v5.0-pro")
+    calls = []
+
+    def none(query, docs, **kw):
+        calls.append((query, kw))
+        return None
+
+    monkeypatch.setattr(ranking, "rank_documents", none)
+    seen = _capture_prompt(monkeypatch)
+    agent_assessor.assess_requirement(_termed_req(), [_bread_doc(), _late_doc()])
+    assert "[1] Bread page" in seen["prompt"] and "sourdough" in seen["prompt"]
+    [(query, kw)] = calls
+    assert query == "Lithium battery degradation What mechanisms shorten battery lifetime?"
+    assert (kw["top_n"], kw["excerpt_chars"], kw["mission_id"]) == (6, 2000, "m")
+
+
+def test_sources_block_without_a_query_is_todays_path(monkeypatch):
+    monkeypatch.setattr(settings, "rerank_model", "cohere/rerank-v5.0-pro")
+
+    def never(*a, **k):
+        raise AssertionError("no query, no rerank")
+
+    monkeypatch.setattr(ranking, "rank_documents", never)
+    junk = Document(id="j", url="http://x/j", domain="x", title="Just a moment...",
+                    search_query="q", crawled_at="t", content_markdown="w " * 5,
+                    word_count=5)
+    block = agent_assessor._sources_block([junk, _bread_doc()])
+    assert block.startswith("[1] Bread page (http://x/bread)\nbread ")
+    assert "[2] Just a moment... (http://x/j)" in block
+
+
+def test_sources_block_uses_ranked_excerpts_and_respects_max_docs(monkeypatch):
+    docs = [_bread_doc(), _late_doc()]
+    monkeypatch.setattr(ranking, "rank_documents", lambda q, d, **kw: [
+        ranking.RankedDoc(doc=docs[1], score=0.9, excerpt="the late excerpt", chunk_id="late#1"),
+        ranking.RankedDoc(doc=docs[0], score=0.1, excerpt="the bread excerpt", chunk_id="bread#0"),
+    ])
+    block = agent_assessor._sources_block(docs, query="q", mission_id="m")
+    assert block == ("[1] Late page (http://x/late)\nthe late excerpt\n\n"
+                     "[2] Bread page (http://x/bread)\nthe bread excerpt")
+    assert agent_assessor._sources_block(docs, max_docs=1, query="q") == (
+        "[1] Late page (http://x/late)\nthe late excerpt")
+
+
+def test_key_term_short_circuit_runs_before_any_rerank(monkeypatch):
+    litellm.reset_calls()
+    monkeypatch.setattr(settings, "rerank_model", "cohere/rerank-v5.0-pro")
+    _no_llm(monkeypatch)
+    a = agent_assessor.assess_requirement(_termed_req(), [_bread_doc()])
+    assert a.missing == agent_assessor.NO_TERM_OVERLAP
+    assert litellm.rerank_calls == [], "nothing on topic: no rerank call either"

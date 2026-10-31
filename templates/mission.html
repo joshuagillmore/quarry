@@ -121,12 +121,13 @@
     {% set llm_total = llm_usage.prompt_tokens + llm_usage.completion_tokens %}
     <div class="tele-cell tele-tokens"{% if token_rows %} title="{% for t in token_rows %}{{ t.purpose }}: {{ t.calls }} call{{ '' if t.calls == 1 else 's' }}, {{ '{:,}'.format(t.prompt) }} prompt + {{ '{:,}'.format(t.completion) }} completion{% if not loop.last %}&#10;{% endif %}{% endfor %}"{% endif %}>
       <div class="tele-k">LLM tokens</div>
-      <div class="tele-v"><span data-tele-tokens>{{ '{:,}'.format(llm_total) }}</span>{% if max_llm_tokens %} <small>/ {{ '{:,}'.format(max_llm_tokens) }}</small>{% endif %}</div>
+      {# The grand total counts every recorded call; "N of M budgeted" and the bar compare the budget's own number (embed/rerank rows excluded unless the setting counts them) with the cap, as the runner does. #}
+      <div class="tele-v"><span data-tele-tokens>{{ '{:,}'.format(llm_total) }}</span>{% if max_llm_tokens %} <small>· <span data-tele-budget-tokens>{{ '{:,}'.format(budget_tokens) }}</span> of {{ '{:,}'.format(max_llm_tokens) }} budgeted</small>{% endif %}</div>
       <small class="tele-sub">
         {%- for t in token_rows %}{{ t.purpose }} {{ kfmt(t.total) }}{{ ' · ' if not loop.last }}{% else %}none recorded{% endfor -%}
       </small>
       {% if max_llm_tokens %}
-      <div class="tele-bar"><span data-tele-tokens-bar style="width:{{ [100, (100 * llm_total / max_llm_tokens) | round | int] | min }}%"></span></div>
+      <div class="tele-bar"><span data-tele-tokens-bar style="width:{{ [100, (100 * budget_tokens / max_llm_tokens) | round | int] | min }}%"></span></div>
       {% endif %}
     </div>
     {% if mission.status in ('collecting', 'synthesizing') and live %}
@@ -171,10 +172,19 @@
         </button>
       </form>
       {% endif %}
+      {# Embed the sources and write them to the Qdrant corpus, in the
+         background; the state line follows document_exports via the poll. #}
+      <form method="post" action="/missions/{{ mission.id }}/export" style="margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px">
+        <button type="submit" class="btn btn-sm" title="Embed this mission's sources and write them to the vector corpus">
+          <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V5M5 8l3-3 3 3M3 13h10"/></svg>
+          Export to corpus
+        </button>
+        <span class="mono" style="font-size:11px;color:var(--fg-subtle)" data-export-state>{{ export_state.line }}</span>
+      </form>
       {% if mission.brief_markdown %}
-      <a class="btn btn-sm" href="/missions/{{ mission.id }}/brief.md">
+      <a class="btn btn-sm" href="/missions/{{ mission.id }}/brief.md" title="Download the brief as Markdown">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M5 7l3 3 3-3M3 13h10"/></svg>
-        Export
+        Brief .md
       </a>
       {% endif %}
       {{ delete_form() }}
@@ -678,12 +688,12 @@
       // navigator.clipboard exists only in secure contexts (HTTPS or
       // localhost); over plain HTTP on a LAN it is undefined.
       if (!navigator.clipboard || !navigator.clipboard.writeText) {
-        flashLabel('Copy failed — use Export', 2500);
+        flashLabel('Copy failed — use Brief .md', 2500);
         return;
       }
       navigator.clipboard.writeText(src ? src.textContent : '')
         .then(() => flashLabel('Copied', 1200))
-        .catch(() => flashLabel('Copy failed — use Export', 2500));
+        .catch(() => flashLabel('Copy failed — use Brief .md', 2500));
     });
   }
 
@@ -738,11 +748,19 @@
       seg('cov-satisfied', sat); seg('cov-unmet', unmet); seg('cov-pending', total - sat - unmet);
     }
 
-    // Tokens are counted per recorded LLM call, trace or not.
+    // Tokens are counted per recorded LLM call, trace or not; the budget
+    // cell and bar follow the budget's own number (embed/rerank excluded).
     if (typeof s.llm_tokens === 'number') {
       setTxt('[data-tele-tokens]', s.llm_tokens.toLocaleString('en-US'));
+    }
+    if (typeof s.budget_tokens === 'number') {
+      setTxt('[data-tele-budget-tokens]', s.budget_tokens.toLocaleString('en-US'));
       const tb = document.querySelector('[data-tele-tokens-bar]');
-      if (tb && maxLlmTokens) tb.style.width = Math.min(100, 100 * s.llm_tokens / maxLlmTokens) + '%';
+      if (tb && maxLlmTokens) tb.style.width = Math.min(100, 100 * s.budget_tokens / maxLlmTokens) + '%';
+    }
+    // The corpus export line is plain text from the server (never markup).
+    if (s.export_state && typeof s.export_state.line === 'string') {
+      setTxt('[data-export-state]', s.export_state.line);
     }
 
     if (s.trace) {

@@ -13,8 +13,14 @@ reads os.environ directly; tests doing that clear the keys they exercise
 (see test_config.py).
 
 Per test (autouse fixture): a fresh SQLite file, a clean job store and login
-rate limiter, zero retry/backoff delays, and the settings singleton restored
-afterwards so a test that saves overrides cannot leak them into the next one.
+rate limiter, zero retry/backoff delays, the crawler's plain-HTTP fallback cut
+off from the network, and the settings singleton restored afterwards so a
+test that saves overrides cannot leak them into the next one.
+
+httpx is the real package here, not a stub: qdrant-client imports it, and a
+stub on tests/stubs would shadow it for the export tests too. The crawler is
+the only module that talks HTTP through it, and only via httpx.stream, which
+the fixture below replaces.
 """
 import atexit
 import os
@@ -88,7 +94,10 @@ class _NoSleepTime:
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
+    import httpx
+
     import auth
+    import crawler
     import jobs
     import llm
     import search
@@ -111,6 +120,15 @@ def _isolate(tmp_path, monkeypatch):
 
     monkeypatch.setattr(llm, "RETRY_DELAY_S", 0)
     monkeypatch.setattr(search, "time", _NoSleepTime())
+
+    # The crawler's plain-HTTP fallback must never reach the network from a
+    # unit test. A test that exercises the fallback patches this itself (see
+    # test_pipeline_crawler); every other test gets a refused connection,
+    # the same shape a real outage produces.
+    def _no_network(method, url, **kwargs):
+        raise httpx.ConnectError(f"network disabled in unit tests: {method} {url}")
+
+    monkeypatch.setattr(crawler.httpx, "stream", _no_network)
 
     # The Flask app is module-global across tests; make its lazy DB init run
     # again against this test's fresh database.

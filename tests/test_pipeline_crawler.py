@@ -216,7 +216,7 @@ def test_aliases_map_every_name_to_the_stored_url(monkeypatch):
 import json  # noqa: E402
 import threading  # noqa: E402
 
-import httpx  # noqa: E402  (tests/stubs/httpx.py)
+import httpx  # noqa: E402  (the real package; conftest cuts stream() off from the network)
 
 _GOOD_HTML = ("<html><head><title>Plain page</title></head><body>"
               + "<p>" + "fact " * 200 + "</p></body></html>")

@@ -56,12 +56,18 @@ PYTHONDONTWRITEBYTECODE=1 uv run --no-project --python 3.12 --with pytest --with
   --with Werkzeug==3.1.8 --with pydantic==2.13.4 --with pydantic-settings==2.14.2 \
   --with aiosqlite==0.22.1 --with python-dotenv==1.2.2 --with Markdown==3.10.2 \
   --with bleach==6.4.0 --with APScheduler==3.11.3 \
+  --with httpx==0.28.1 --with qdrant-client==1.19.0 --with numpy==2.5.1 \
   python -m pytest -q tests
 ```
 
 No `PYTHONPATH` needed — `pytest.ini` sets `pythonpath` for you. The `--with` flags pin the
 versions this was last verified against; `.github/workflows/tests.yml` runs the same command on
-every push and pull request.
+every push and pull request. The suite stubs the LLM and crawl stack, so it never calls a
+provider; `tests/live_cohere_v5.py` is a separate, manual check of the Cohere Embed 5 / Rerank 5
+ids against the real API (`COHERE_API_KEY=... python tests/live_cohere_v5.py` from the repo venv;
+without a key it prints `SKIP`). Chunk parity with Coherence is checked by
+`COHERENCE_SRC=/path/to/coherence/src python tests/tools/freeze_coherence_expected.py --check`
+when a Coherence checkout is at hand.
 
 ## Configuration
 
@@ -80,6 +86,23 @@ All settings come from `.env` (see `.env.example`):
 | `CRAWL_FALLBACK` | Retry a failed or blocked page with a plain HTTP fetch instead of giving up on it (see "Collection reliability and telemetry" below) | `true` |
 | `LLM_TIMEOUT_S` | Per-call LLM request timeout (seconds) — a hung provider can't hold a mission worker (and its job slot) forever | `120` |
 | `MAX_LLM_TOKENS` | Default per-mission LLM token budget (prompt + completion); a mission stops cleanly once it crosses this. `0` = unlimited | `0` |
+| `EMBED_MODEL` | Dense embedding model for every stored document chunk (LiteLLM id; `cohere/` models use `LLM_API_KEY`). Empty = embeddings off | `cohere/embed-v5.0-pro` |
+| `EMBED_QUERY_MODEL` | Model for query-side embeddings; Embed 5 Pro and Fast share one vector space. Empty = same as `EMBED_MODEL` | `cohere/embed-v5.0-fast` |
+| `EMBED_DIM` | `dimensions=` sent to `cohere/` embedding models (256–2048); other providers return their native width. The export uses the same vectors | `1024` |
+| `RERANK_MODEL` | Reranker for search candidates, assessor sources, brief source order and Library search. Empty = rerank off; a failed call keeps the unranked order | `cohere/rerank-v5.0-pro` |
+| `EMBED_TIMEOUT_S` | Per-call timeout for embed/rerank requests (seconds) | `60` |
+| `EMBED_TOKENS_COUNT_TOWARD_BUDGET` | Count embed/rerank tokens toward `MAX_LLM_TOKENS` (they show in telemetry either way) | `false` |
+| `QDRANT_URL` | Qdrant the corpus export writes to; `http://qdrant:6333` with the compose `qdrant` profile | `http://host.docker.internal:6333` |
+| `QDRANT_API_KEY` | Qdrant API key, only for a secured instance | *(empty)* |
+| `QDRANT_EXPORT_COLLECTION` | Collection the export writes (letters, digits, `_`, `-`) | `quarry` |
+| `EXPORT_CLEARANCE_RANK` | `clearance_rank` stamped on every exported point (Coherence's ACL filter reads it) | `0` |
+| `EXPORT_CLASSIFICATION` | `classification` stamped on every exported point | `NATO UNCLASSIFIED` |
+| `EXPORT_COMPARTMENTS` | Comma-separated `compartments` list stamped on every exported point | *(empty)* |
+| `EXPORT_RELEASABILITY` | Comma-separated `releasability` list stamped on every exported point | *(empty)* |
+| `EXPORT_ON_MISSION_DONE` | Export a mission's sources (and run the corpus self-test) as soon as its brief is written; also on the Settings page | `false` |
+| `EXPORT_DIR` | Where export manifests and self-test eval files go. Empty = `export/` next to the SQLite file | *(empty)* |
+| `CORPUS_CHECK_K` | The `k` the corpus self-test reports recall@k at | `10` |
+| `CORPUS_CHECK_FLOOR` | The self-test passes when recall@k ≥ this. `0.0` = report only, never fail | `0.0` |
 | `FLASK_HOST` / `FLASK_PORT` | Bind address. Loopback by default; widening it is covered by the exposure guard below | `127.0.0.1:5000` |
 | `FLASK_DEBUG` | Flask debug + auto-reload | `false` |
 | `FLASK_SECRET_KEY` | Override Flask session signing key. Empty → generated once into `data/secret_key` | *(empty)* |
@@ -117,7 +140,9 @@ fall back to the reasoning model automatically.
 Providers and the key can also be changed at runtime on the **Settings** page
 (`/settings`), which links to each vendor's key page. Those choices persist to
 `data/settings.json` (never the repo), apply immediately, and take precedence
-over `.env`.
+over `.env`. The same page has an **Embeddings & rerank** section (the three
+model ids; blank turns that feature off) and a **Corpus export** section
+(Qdrant URL and key, collection name, export-on-done).
 
 ### Using a local Ollama from Docker
 
@@ -239,6 +264,89 @@ run.
   Resume asks for more tokens too, since the run would otherwise stop
   straight away.
 
+### Embeddings and rerank
+
+Every stored page is split into chunks the way Coherence's long-form chunker
+cuts its corpus (one section per chunk, about 2,000 characters, a paragraph
+never split) and each chunk is embedded with `EMBED_MODEL` as `title + chunk`.
+Re-crawling a page keeps the vectors of chunks whose text did not change, so an
+unchanged page costs no embedding call. `RERANK_MODEL` reorders search
+candidates before the collection cap, picks the best-matching chunk of each
+source as the assessor's excerpt, fixes the brief's source order (the `[n]`
+numbers in the text and the source rail come from the same reranked list), and
+sorts the Library's full-text search, which fuses FTS with the dense index when
+vectors exist. Both are optional: leave the model blank and every path keeps
+today's order. A failed embedding or rerank call is one log line, never a
+failed mission. Embed/rerank calls show on the mission telemetry strip under
+their own purposes but do not count toward `MAX_LLM_TOKENS` unless
+`EMBED_TOKENS_COUNT_TOWARD_BUDGET=true`. Defaults are Cohere Embed 5 and
+Rerank 5; `tests/live_cohere_v5.py` checks those ids against the real API.
+
+### Export to Coherence (Fathom)
+
+The library can be exported into a Qdrant collection shaped for Coherence
+(renamed Fathom): one point per chunk, a named dense vector `dense` (1024
+floats, cosine), and the payload Coherence's access-control filter and
+citation resolver expect (`chunk_id`, `doc_id`, `clearance_rank`,
+`compartments`, `releasability`, `title`, `text`, …). The full contract, and
+what remains to be done on the Coherence side, is in
+[`docs/coherence-export.md`](docs/coherence-export.md).
+
+1. **Point at a Qdrant.** Either enable the bundled one —
+   `docker compose --profile qdrant up -d --build`, with
+   `QDRANT_URL=http://qdrant:6333` in `.env` (its data lives in `data/qdrant`,
+   published on `127.0.0.1:6333` only) — or set `QDRANT_URL` (and
+   `QDRANT_API_KEY` if needed) to an existing Qdrant. The collection name is
+   `QDRANT_EXPORT_COLLECTION` (default `quarry`); set the `EXPORT_*` markings
+   if the corpus should carry something other than `NATO UNCLASSIFIED`, rank
+   0, no caveats. The export needs `EMBED_MODEL` set: the points carry the
+   same vectors the app stores, so nothing already embedded is bought twice.
+2. **Run a mission, then export it.** Three ways: set
+   `EXPORT_ON_MISSION_DONE=true` (or tick it on the Settings page) and a
+   mission's sources are exported, and self-tested, as soon as its brief is
+   written, with the result as one line in the mission trace; press
+   **Export to corpus** on a finished mission page (its state line then
+   reads `exported n of total → quarry · last 2026-08-11 06:48Z`), or the
+   Library's export button when a search or mission filter is set — both run
+   in the background, one export at a time, with `GET /api/export/status`
+   reporting the last run and its check; or export from the command line:
+
+   ```bash
+   # inside the container (docker compose exec web-researcher ...) or the venv
+   python -m vector_export --mission <mission-id>          # one mission's sources
+   python -m vector_export --search "your query"            # one search's pages
+   python -m vector_export --all --dry-run                  # list what would change; writes nothing
+   ```
+
+   A document is skipped when its content and embedding model are unchanged
+   since the last export; a changed one has its old points removed and
+   re-written, so a re-run of the same mission is mostly `skipped` and never
+   duplicates a point. The collection is created if missing and never
+   deleted; an existing collection with a different vector size is refused.
+   Points the export did not write (Coherence's own) are left alone.
+3. **Read the manifest and the self-test report.** The export writes
+   `data/export/manifest-quarry.json` (what was exported, skipped or failed,
+   per document) and, for a mission, runs a corpus self-test: each
+   requirement's query (and the mission question) is embedded, run against
+   the collection, and scored against the documents the mission's own
+   assessor linked to that requirement. Its files land in
+   `data/export/eval/quarry/<mission-id>/` as `queries.yaml`, `qrels.jsonl`
+   and `report.json` (recall@`CORPUS_CHECK_K` and MRR per query), in the
+   format Coherence's `evals/graded.py` reads. The grades come from the
+   mission itself, so the number is a regression tripwire — "does the corpus
+   retrieve what the mission used?" — not ground truth. By default the check
+   only reports; `CORPUS_CHECK_FLOOR` turns a low recall into a failed check
+   (the mission is never affected either way).
+4. **What remains on the Coherence side.** Coherence `main` queries a dense
+   arm and a BM25 arm and refuses to start without a BM25 statistics file for
+   the collection, and its query embedder defaults to Embed v4. Serving
+   `quarry` needs a dense-only retrieval mode, `COHERE_MODEL_EMBED` set to an
+   Embed 5 model (the corpus is in the Embed 5 space; the payload's
+   `embedding` field records which) with `COHERE_EMBED_DIM=1024`, and
+   `"quarry"` added to its `LIVE_COLLECTIONS` guard. The eval files above can
+   be registered in `evals/graded.py` so the same judgments run there. All of
+   this is spelled out, with file references, in `docs/coherence-export.md`.
+
 ## Architecture
 
 ```
@@ -250,7 +358,16 @@ crawler.py        crawl4ai async wrapper; emits per-URL progress to the job stor
 extractor.py      LiteLLM call; tries to parse JSON, falls back to {"raw_response": ...}.
 jobs.py           In-memory job store + threaded async runner.
                   Tracks recent job IDs for the sidebar.
-storage.py        aiosqlite: documents / extractions / searches tables.
+storage.py        aiosqlite: documents / extractions / searches tables, plus the
+                  chunk, embedding and export tables.
+chunking.py       Splits a stored page into chunks (a port of Coherence's long-form
+                  chunker); defines the one string that gets embedded.
+embeddings.py     LiteLLM embed + rerank calls, batching, retries, telemetry rows.
+ranking.py        The rerank slots (search candidates, assessor sources, brief
+                  order) and the Library's hybrid FTS + dense search.
+vector_export.py  Export documents into a Coherence-shaped Qdrant collection (CLI:
+                  python -m vector_export).
+corpus_check.py   Self-test of the exported collection against a mission's record.
 templates/        Jinja2: base.html (shell + sidebar) extended by per-page templates.
 static/style.css  Hand-rolled CSS, supports light/dark themes + accent swatches.
 ```
@@ -266,9 +383,12 @@ static/style.css  Hand-rolled CSS, supports light/dark themes + accent swatches.
 ### Data model
 
 ```
-documents       crawled pages, keyed by UUID, unique on (url, search_query)
-extractions     LLM output per document, with the prompt that produced it
-searches        one row per agent run, with job_id back-reference for trace lookup
+documents         crawled pages, keyed by UUID, unique on (url, search_query)
+extractions       LLM output per document, with the prompt that produced it
+searches          one row per agent run, with job_id back-reference for trace lookup
+chunks            a document's body split for embedding; chunk_id = "<document_id>#<idx>"
+chunk_embeddings  one float32 vector per (chunk, model); kept across re-crawls while the chunk text is unchanged
+document_exports  what each Qdrant collection last received per document, so an unchanged one is skipped
 ```
 
 ## Security posture

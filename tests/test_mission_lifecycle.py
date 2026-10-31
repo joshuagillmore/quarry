@@ -126,7 +126,7 @@ def test_synthesize_stores_the_citation_order(tmp_path, monkeypatch):
 
     asyncio.run(go())
 
-    def fake_brief(mission, reqs, docs, new_urls):
+    def fake_brief(mission, reqs, docs, new_urls, ordered=None):
         captured["docs"] = docs
         return "brief citing [1]"
 

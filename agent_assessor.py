@@ -21,7 +21,23 @@ class Assessment:
 from content_quality import is_usable  # noqa: F401  (re-exported for brief.py)
 
 
-def _sources_block(docs: list[Document], max_docs: int = 6, excerpt_chars: int = 2000) -> str:
+def _sources_block(docs: list[Document], max_docs: int = 6, excerpt_chars: int = 2000,
+                   query: str | None = None, mission_id: str | None = None) -> str:
+    """The numbered sources the grader reads. With `query` and a reranker
+    on, ranking.rank_documents orders the usable documents by their best
+    chunk against the query and that chunk is the excerpt, so a long page
+    whose relevant passage sits past the first 2000 characters is still
+    judged on it. Otherwise (no query, reranking off or failed: it returns
+    None), today's path: usable first in input order, the body head as the
+    excerpt."""
+    if query:
+        import ranking  # here, not at module level: ranking → brief → this module
+        ranked = ranking.rank_documents(query, docs, top_n=max_docs,
+                                        excerpt_chars=excerpt_chars, mission_id=mission_id)
+        if ranked is not None:
+            return "\n\n".join(
+                f"[{i}] {r.doc.title or r.doc.domain} ({r.doc.url})\n{r.excerpt}"
+                for i, r in enumerate(ranked[:max_docs], 1))
     # Deprioritize junk (captcha/near-empty) rather than dropping it: every
     # collected doc can still feed the assessment when slots remain, so a
     # short-but-valid page is never invisible to the grader.
@@ -113,8 +129,11 @@ def assess_requirement(requirement: Requirement, docs: list[Document],
               file=sys.stderr, flush=True)
         return Assessment(False, "low", NO_TERM_OVERLAP, _requery(requirement))
 
+    sources = _sources_block(
+        docs, query=f"{requirement.title} {requirement.description or ''}".strip(),
+        mission_id=requirement.mission_id)
     prompt = build_assess_prompt(requirement.title, requirement.description,
-                                 _sources_block(docs), search_note=search_note)
+                                 sources, search_note=search_note)
     # The persona isn't needed for grading; a tight system message keeps it cheap.
     try:
         parsed, _raw = chat_json(

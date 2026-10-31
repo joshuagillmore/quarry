@@ -10,3 +10,5 @@ markdown>=3.6
 bleach>=6.1
 gunicorn>=21.2
 apscheduler>=3.10
+qdrant-client==1.19.0  # corpus export (vector_export.py); pinned exact, the client checks server compatibility
+numpy==2.5.1  # float32 vector blobs + cosine over chunk_embeddings; already in the crawl4ai tree

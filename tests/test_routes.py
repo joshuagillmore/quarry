@@ -178,11 +178,12 @@ def test_search_inputs_are_bounded(client, app_mod, monkeypatch):
 def test_full_text_query_is_bounded(client, app_mod, monkeypatch):
     seen = []
 
-    async def fake_fts(q, search_filter=None):
+    async def fake_hybrid(q, search_filter=None, *, limit=100):
         seen.append(q)
-        return []
+        return [], "fts"
 
-    monkeypatch.setattr(app_mod, "search_documents_fts", fake_fts)
+    # The Library's full-text search goes through ranking.hybrid_search.
+    monkeypatch.setattr(app_mod.ranking, "hybrid_search", fake_hybrid)
     assert client.get("/documents?q=" + "z" * 300).status_code == 200
     assert seen == ["z" * 200]
 
@@ -624,6 +625,43 @@ def test_retask_allowed_while_the_token_budget_has_room(client, starts, own_budg
     client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
     assert _reqs()["r0"].status == "pending"
     assert _mission().status == "collecting" and len(starts) == 1
+
+
+def _spend_embed_tokens(mission_id, prompt, purpose="embed"):
+    from models import LlmCall
+    _run(storage.insert_llm_call(LlmCall(
+        purpose=purpose, tier=purpose, model="cohere/embed-v5.0-pro",
+        mission_id=mission_id, prompt_tokens=prompt)))
+
+
+def test_retask_budget_ignores_embed_and_rerank_rows_like_the_runner(client, starts,
+                                                                     monkeypatch):
+    """Embedding and rerank calls are recorded (the strip shows them) but
+    the runner leaves them out of the token budget by default: a mission
+    whose only spend over budget is those rows is not refused a retask."""
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", False)
+    _budget_mission(1000)
+    _spend_tokens("m1", 500)                       # LLM spend: half the budget
+    _spend_embed_tokens("m1", 5000)                # embed rows: far over it
+    _spend_embed_tokens("m1", 700, purpose="rerank")
+    client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert _reqs()["r0"].status == "pending"
+    assert _mission().status == "collecting" and len(starts) == 1
+    # The telemetry still counts every row.
+    assert client.get("/api/mission/m1").get_json()["llm_tokens"] == 6200
+
+
+def test_retask_counts_embed_rows_when_the_setting_says_so(client, starts, monkeypatch):
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", True)
+    _budget_mission(1000)
+    _spend_tokens("m1", 500)
+    _spend_embed_tokens("m1", 5000)
+    r = client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert _path(r) == "/missions/m1"
+    assert _reqs()["r0"].status == "unmet"
+    assert _mission().status == "done" and starts == []
+    assert _flashes(client) == [
+        "This mission has used 5,500 of 1,000 tokens; raise the budget before re-tasking."]
 
 
 # --- resume after a limit -----------------------------------------------
@@ -1778,7 +1816,8 @@ def test_mission_page_shows_llm_tokens(client):
     _seed_llm_calls()
     html = client.get("/missions/m1").get_data(as_text=True)
     assert "LLM tokens" in html
-    assert "<span data-tele-tokens>2,200</span> <small>/ 50,000</small>" in html
+    assert ("<span data-tele-tokens>2,200</span> <small>· "
+            "<span data-tele-budget-tokens>2,200</span> of 50,000 budgeted</small>") in html
     assert 'data-tele-tokens-bar style="width:4%"' in html
     # By purpose: compact on the cell, exact in its hover title.
     assert re.search(r'<small class="tele-sub">\s*plan 1.2k · assess 1k\s*</small>', html)
@@ -1790,7 +1829,8 @@ def test_mission_page_token_cap_defaults_to_the_setting(client, monkeypatch):
     _seed_mission(status="done")          # its budget sets no max_llm_tokens
     monkeypatch.setattr(config.settings, "max_llm_tokens", 9000)
     html = client.get("/missions/m1").get_data(as_text=True)
-    assert "<span data-tele-tokens>0</span> <small>/ 9,000</small>" in html
+    assert ("<span data-tele-tokens>0</span> <small>· "
+            "<span data-tele-budget-tokens>0</span> of 9,000 budgeted</small>") in html
     assert "none recorded" in html
     monkeypatch.setattr(config.settings, "max_llm_tokens", 0)   # unlimited
     html = client.get("/missions/m1").get_data(as_text=True)
@@ -1988,3 +2028,34 @@ def test_log_cursor_template_strings_present(name):
         src = f.read()
     assert "log_total" in src
     assert "renderedLogs = " in src
+
+
+# --- mission page: the budget compares the budgeted spend (review F6) --------
+
+def test_telemetry_strip_compares_the_budgeted_spend_with_the_cap(client, monkeypatch):
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", False)
+    _seed_mission(status="done")
+    _run(storage.update_mission("m1", budget_json=json.dumps(
+        {"max_sources": 7, "max_llm_tokens": 1000})))
+    _spend_tokens("m1", 500)
+    _spend_embed_tokens("m1", 5000)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    # The grand total still counts every row ...
+    assert "<span data-tele-tokens>5,500</span>" in html
+    assert re.search(r'<small class="tele-sub">\s*assess 500 · embed 5k\s*</small>', html)
+    assert "embed: 1 call, 5,000 prompt + 0 completion" in html
+    # ... while "N of M" and the bar are the budget's number.
+    assert "<span data-tele-budget-tokens>500</span> of 1,000 budgeted" in html
+    assert 'data-tele-tokens-bar style="width:50%"' in html
+    body = client.get("/api/mission/m1").get_json()
+    assert body["llm_tokens"] == 5500 and body["budget_tokens"] == 500
+    with open("templates/mission.html", encoding="utf-8") as f:
+        src = f.read()
+    assert "'[data-tele-budget-tokens]'" in src and "s.budget_tokens" in src
+
+    # When the setting counts embed rows, the two agree.
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", True)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "<span data-tele-budget-tokens>5,500</span> of 1,000 budgeted" in html
+    assert 'data-tele-tokens-bar style="width:100%"' in html
+    assert client.get("/api/mission/m1").get_json()["budget_tokens"] == 5500
