@@ -366,11 +366,335 @@ the stylesheet against corruption — a stray shell line once landed in it, and
 browsers silently drop **every rule after** a malformed one, so the file still
 "contains" styles that never load.
 
+`test_chunking` compares the LONG_FORM port against the frozen Coherence
+fixture (see "Embeddings, rerank and corpus export"); `test_embeddings` /
+`test_rerank` / `test_config_embed` pin the Cohere 5.0 ids and wire
+parameters against the `litellm` stub's `embedding`/`rerank`;
+`test_storage_chunks` covers the chunk/embedding/export tables;
+`test_ranking`, `test_vector_export` (a `QdrantClient(":memory:")` injected
+through `client=`) and `test_corpus_check` (whose shuffled-vector case proves
+the self-test can fail) cover the ranking slots, the export and the check;
+`test_runner_rerank`, `test_routes_export` and `test_library_search` cover
+their wiring into the runner, the export routes and the Library search.
+
 `tests/qa_harness.py`, `qa_lifecycle.py`, `qa_mission_ui.py`, `qa_ollama.py`, and
 `qa_schedule.py` are end-to-end drivers (not pytest): copy one into the running
 container and execute it there, e.g. `docker compose cp ./tests/qa_mission_ui.py
 web-researcher:/tmp/x.py && docker compose exec -T web-researcher python
-/tmp/x.py`.
+/tmp/x.py`. `tests/live_cohere_v5.py` is the manual check of the Cohere 5.0
+ids against the real API (`COHERE_API_KEY=... python tests/live_cohere_v5.py`
+from the repo venv, not pytest's path — it refuses the `litellm` stub); without
+a key it prints `SKIP` and exits 0, so "not run" is distinguishable from
+"failed".
+
+## Embeddings, rerank and corpus export
+
+A dense index and a reranker under the pipeline, and an export of the library
+into a Qdrant collection shaped so Coherence (renamed Fathom by the user; the
+rename is not on the coherence repo's `main`) can serve it. Four modules:
+`chunking.py` (stdlib only — `storage` imports it on every document write),
+`embeddings.py` (LiteLLM embed/rerank, the way `llm.py` does chat),
+`ranking.py` (the four places the pipeline ranks something), and
+`vector_export.py` + `corpus_check.py` (the Qdrant export and the self-test
+on what it wrote). The dense-only decision came from the user: the BM25
+sparse arm is dropped, with the consequences spelled out under the Qdrant
+contract below.
+
+- **`indexed_text` is the ONE string that is embedded.**
+  `chunking.indexed_text(title, text)` is `f"{title}\n\n{text}"`. Every path
+  that embeds or reranks a chunk — `embeddings.embed_pending_documents`,
+  `vector_export._vectors_for`, `ranking._chunk_candidates` — builds its
+  string through it and nothing else, so what one arm indexed is exactly
+  what another arm (or a query-time re-embed) would build; Coherence learned
+  this with five f-strings, two of which disagreed. `chunks.text`, and the
+  point payload's `text`, hold the section-prefixed chunk **without** the
+  title (`f"{section}\n\n{body}"` when a heading is in force): the title
+  makes a mid-page chunk findable, and keeping it out of the stored text
+  keeps it out of what a brief quotes back. `document_title` is `title or
+  domain`, `document_body` is `content_fit or content_markdown or ""` (the
+  crawler's `''` fit-markdown again), and `document_digest` is
+  `sha256(indexed_text(title, body))` — the export's change key, so a
+  changed title re-exports a document even when its body did not change.
+- **The chunker is a port of Coherence LONG_FORM, cross-checked against a
+  frozen fixture.** `chunk_markdown` parses markdown into spans (a
+  paragraph, one list item, or a whole fenced code block; an ATX heading
+  sets `section` and is not a span), then applies Coherence's `chunk_spans`
+  boundary rule as written: section change, or `size + len(text) >
+  target_chars and buf`, with `CHUNK_TARGET_CHARS = 2000`. Two deliberate
+  departures, both commented in the code: Coherence's `kind != cur_kind`
+  term is left out (every markdown span is kind "body", so it could only
+  ever fire on an empty buffer, where it cannot flush) and `HARD_MAX_CHARS =
+  8000` cuts a single giant span (a minified page, a table dumped on one
+  line) at its last whitespace, which never fires on prose. A body with no
+  spans at all is one chunk, as Coherence's `chunk_paragraphs` falls back
+  to `[body]`. `tests/test_chunking.py` compares the port, chunk text for
+  chunk text, against `tests/fixtures/coherence_chunks_expected.json`
+  without importing Coherence (CI has no checkout of it);
+  `COHERENCE_SRC=/home/user/coherence/src python
+  tests/tools/freeze_coherence_expected.py --check` regenerates that file
+  from Coherence's real `chunk_spans(spans, LONG_FORM)` and diffs it, exit 1
+  on any difference (drop `--check` to re-freeze after a deliberate change).
+  The generator's markdown-to-span parse is written independently of
+  `chunking.py` on purpose: otherwise the fixture would only prove the port
+  agrees with itself.
+- **Storage: three tables, rebuilt per document inside `upsert_document`.**
+  `chunks` (`chunk_id` = `f"{document_id}#{idx}"`, `UNIQUE(document_id,
+  idx)`, `content_sha256` of the chunk text), `chunk_embeddings` (`PRIMARY
+  KEY (chunk_id, model)`, `dim`, `vector` as little-endian float32 bytes via
+  `embeddings.vector_to_blob`/`blob_to_vector` — storage only checks the
+  byte length and never imports numpy) and `document_exports` (`PRIMARY KEY
+  (document_id, collection)`: the digest, `embed_model` and `n_chunks` a
+  collection last received). `upsert_document` calls
+  `chunking.document_chunks(doc)` and `_replace_document_chunks` inside its
+  existing transaction under the authoritative id: the chunk rows are
+  replaced whole, but a vector survives for every chunk whose `(chunk_id,
+  content_sha256)` is unchanged and is deleted for one that moved, changed
+  or vanished — a re-crawl of an unchanged page costs no embedding call, and
+  no vector can describe text that is no longer there. The chunk id is
+  stable because the document id is (the `(url, search_query)` upsert).
+  Readers: `get_document_chunks`, `get_chunks_for_documents`,
+  `get_chunks_missing_embeddings(model, document_ids=None, limit=2000)`,
+  `get_chunk_embeddings(model, document_ids=None)` (only chunks that still
+  exist), `get_embedding_coverage(model)`, the `document_exports` CRUD
+  (`get_document_exports`, `list_exported_document_ids`,
+  `upsert_document_export`, `delete_document_exports`),
+  `get_documents_by_ids` (full bodies, input order, batched `IN`),
+  `get_document_mission_ids` and `get_requirement_document_map`.
+  `replace_document_chunks` is the standalone form for documents stored
+  before chunking existed; the export rebuilds through it.
+- **The degrade rule — every ranking and export path, no exceptions.** An
+  empty model setting means off; a failed call is never a mission's problem.
+  The primitives raise so a caller that needs a vector finds out:
+  `embed_texts`/`embed_query` raise `EmbeddingDisabled`, `rerank` raises
+  `RerankDisabled`, otherwise the provider's error after `llm.RETRY_ATTEMPTS`
+  tries of a transient failure (`llm._NON_RETRYABLE` fails on the first).
+  The entry points the pipeline calls never raise: `try_rerank` → `None` +
+  one stderr line; `embed_pending_documents` → `0` + one line, nothing
+  written for the failed round; every `ranking.py` function → exactly what
+  the caller had before the module existed, plus one line;
+  `corpus_check.run` → a report with `passed=False` and `error` set;
+  `export_documents` → per-document failures in `ExportResult.failed`. The
+  export raises `ExportError` only before its first write (Qdrant
+  unreachable, `EMBED_MODEL` empty, bad collection name, vector-size
+  mismatch). A mission never fails over ranking, export or the self-test.
+- **`embeddings.py` mirrors `llm.py`.** `embed_texts` sends
+  `EMBED_BATCH = 96` texts per call (Cohere's `/v2/embed` cap, so a
+  document's chunks are as few calls and telemetry rows as possible), with
+  `timeout=settings.embed_timeout_s`, `drop_params=True` and
+  `llm._provider_kwargs(model)` (Ollama base URL, or `active_api_key()`),
+  and puts `dimensions=settings.embed_dim` + `input_type` on the wire only
+  for `cohere/` models — other providers return their native width. A
+  `200` with the wrong number of rows (`BadEmbeddingResponse`) is retried
+  inside the loop like an empty completion in `llm.py`, so a glitch gets
+  one more try instead of misaligning vectors with texts. `embed_query`
+  uses `embed_query_model` (empty → `embed_model`) as
+  `input_type="search_query"`: Embed 5 Pro (index) and Fast (query) share
+  one space, so queries can use the cheaper model. `rerank` passes
+  `max_tokens_per_doc=RERANK_MAX_TOKENS_PER_DOC` (2048, covering a
+  2000-char chunk) and returns `(index, score)` pairs sorted desc, ties by
+  lower index, whatever order the provider used; `relevant_spans` is not
+  used. `embed_pending_documents` runs its body off the event loop
+  (`asyncio.to_thread`, storage coroutines on a loop of their own — the
+  `llm._run_insert` pattern) and loops over
+  `get_chunks_missing_embeddings` pages until nothing is missing, so a
+  stored vector is never re-bought.
+- **Telemetry purposes `embed` and `rerank`, and the budget.** Every
+  embed/rerank call that returns is one `LlmCall` row via `llm._record`,
+  tier `"embed"`/`"rerank"` and purpose the same (export and `rank_*` calls
+  thread `mission_id` through): embed rows carry the provider's
+  `prompt_tokens`, rerank rows `0` tokens (rerank providers report no usage;
+  the row is for call counts and duration). `storage.get_mission_llm_usage(
+  mission_id, exclude_purposes=())` leaves the named purposes out of the
+  top-level totals while `by_purpose` still lists them, so the telemetry
+  strip shows the whole spend and the budget can skip it;
+  `agent_runner._budget_exclusions()` is `("embed", "rerank")` unless
+  `settings.embed_tokens_count_toward_budget` (default `False`) is true, and
+  is the one rule behind every budget decision: `_stop_reason` (the pass /
+  requirement checkpoints) and `app._budget_tokens_used` (the retask and
+  Resume refusals and the Resume form's prefill) both pass it, so the
+  runner and the routes agree on what counts. The telemetry strip,
+  `api_mission`'s `llm_tokens` and the `by_purpose` rows stay unfiltered;
+  `app._PURPOSE_ORDER` is `("plan", "assess", "extract", "brief", "rerank",
+  "embed")`, so the two new purposes sort after the pipeline's.
+- **The four rerank slots** (`ranking.py`), one per place the pipeline ranks
+  something. `rank_search_results(query, results)` reorders search-engine
+  candidates by rerank relevance of `title + snippet`, so a cap taken
+  afterwards keeps the most relevant rather than the engine's first page
+  (input order on `None`; results the provider left out follow in input
+  order; fewer than two are never sent). `rank_documents(query, docs,
+  top_n, excerpt_chars)` is the chunk-level rerank: usable documents
+  (`content_quality.is_usable`) are split with `document_chunks`, up to
+  `MAX_RERANK_CHUNKS = 200` strings go round-robin per document in one
+  call (every document's first chunk, then every second, so a long page
+  cannot crowd a short one out), each document's best chunk becomes its
+  `RankedDoc.excerpt`/`score`/`chunk_id`, usable first, and unusable ones
+  follow in input order only when `top_n` leaves room — a short-but-valid
+  page is never invisible to a caller that had room for it.
+  `rank_for_brief(mission, docs, max_docs=brief.MAX_BRIEF_SOURCES)` is
+  **the one source order the brief is numbered with**: the prompt's `[n]`
+  block and `missions.brief_sources_json` must both come from this list,
+  or the rail cites a different document than the text; with rerank off,
+  no usable document, a failed call or any error it is exactly
+  `brief.ordered_sources(docs, max_docs)`, today's order.
+  `hybrid_search(query, search_filter, limit=100)` is the Library's
+  full-text box in up to three stages and returns `(docs, mode)`, `mode`
+  naming the last stage that worked: `"fts"` (`search_documents_fts`, cut
+  to `limit`); `"hybrid"` (+ numpy cosine over the stored
+  `chunk_embeddings` of the configured model within the search filter, the
+  top `DENSE_TOP_K = 50` chunks collapsed to documents, fused with the FTS
+  list by reciprocal rank fusion with `RRF_K = 60`, dense-only hits loaded
+  by id); `"<mode>+rerank"` (the top `RERANK_POOL = 30` reranked by best
+  chunk, the rest keeping their order). The dense stage runs only when
+  embeddings are on and a vector exists to fuse with; a failing FTS stage
+  gives `([], "fts")`. Rerank strings are `indexed_text(title, chunk.text)`
+  built from `chunking.document_chunks` on the in-memory document, so a
+  document not yet in the database ranks like one that is.
+  **Where each slot is wired.** `agent_runner._collect_one` reranks only
+  when a requirement has more candidates than its cap (`cap and
+  len(candidates) > cap`), against `f"{req.title}. {req.description}"`,
+  and logs `reranked N candidates → crawling top K` only when the order
+  actually changed; after its upsert loop it calls
+  `embeddings.embed_pending_documents(new_ids, mission_id=...)` and logs
+  `embedded N chunks · <model>` when `n > 0`. `jobs._run_job` does the
+  same embed after `set_document_ids`. `assess_requirement` passes
+  `_sources_block(docs, query=f"{title} {description}", mission_id=...)`,
+  which uses `rank_documents(top_n=max_docs, excerpt_chars=2000)` so a long
+  page is judged on its relevant passage rather than its first 2000
+  characters, and falls back to today's usable-first, body-head block when
+  it returns `None` (the key-term short-circuit still runs first).
+  `_synthesize` computes `ordered = rank_for_brief(mission, docs)` once
+  (logging `brief sources reranked` only when it differs from
+  `ordered_sources(docs)`), passes it as `synthesize_brief(...,
+  ordered=ordered)` — which numbers both its sources block and its delta
+  block with it — and persists `brief_sources_json = [d.id for d in
+  ordered]`, so the rail and the text cannot disagree. After
+  `update_mission(status="done")`, `settings.export_on_mission_done` runs
+  `_export_sources` → `vector_export.export_documents(ids, mission_id)`
+  and logs `res.summary()` (`exported N · skipped M · failed F · K chunks
+  → 'quarry' · check recall@10 0.xx mrr 0.xx (pass)`) as `ok`, or `warn`
+  when something failed; an exception is one `export failed: …` warn line
+  and the mission stays `done`. `app.documents_list` sends a full-text `q`
+  through `hybrid_search(q, search_filter)` and shows
+  `_search_mode_label(mode)` beside the match count ("full-text",
+  "hybrid", "ranked: hybrid + rerank · <model>"). `POST
+  /missions/<id>/export` and `POST /documents/export` (`search=` or
+  `mission=`, ids validated as UUIDs) hand the document set to
+  `start_export_in_background` (flash "Export started" / "An export is
+  already running"); `GET /api/export/status` returns `export_status()`
+  with the check report; `app._export_state` builds the mission page's
+  plain-text state line (`exported n of total → collection · last
+  YYYY-MM-DD HH:MMZ · export running`) from `document_exports`, and
+  `api_mission` returns it so the poll updates it as `textContent` — never
+  markup. The brief download is labelled "Brief .md" to sit beside "Export
+  to corpus".
+- **Dense-only Qdrant contract** (`vector_export.py`; the handoff for the
+  Coherence side is `docs/coherence-export.md`). One point per chunk:
+  `id = uuid5(NAMESPACE_URL, chunk_id)` (stable, so a re-export overwrites
+  its own point), `vector = {"dense": [...]}` — a **named** vector of
+  `settings.embed_dim` (1024) floats, `COSINE`, named so a sparse arm can
+  be added later without re-creating the collection — and the payload of
+  `build_payload`: `chunk_id` `QRY-<doc.id>#<idx>` / `doc_id`
+  `QRY-<doc.id>`; `title` / `text` (the chunk text, no title); `section`;
+  `kind: "body"`; markings `clearance_rank` (int), `classification`,
+  `compartments` and `releasability` (lists) from the `EXPORT_*` settings;
+  `int_type: "OSINT"`; `trust_tier: "EXTERNAL_UNVERIFIED"`; `originator`
+  (hostname), `source_designator` and `source_url` (the url);
+  `date_time_group` (`"110648Z AUG 26"`) and `published_date` from
+  `crawled_at` (metadata `published_date` when it is `YYYY-MM-DD`);
+  `source_reliability: "C"`, `info_credibility: 3`; `provenance {url,
+  fetched_at: crawled_at, sha256: document_digest}`; `doc_type:
+  "web_page"`, `cluster = search_query`, `topics` / `decoy_for` `[]`;
+  `embedding {model, dim, input_type: "search_document"}` so a consumer can
+  pick the matching query model; and a `quarry` sub-object
+  (`document_id, search_query, domain, word_count, crawled_at,
+  mission_ids, exported_by`). Never `canary-`/`contra-`/`OSINT:` ids,
+  never `is_product` (Coherence treats those specially).
+  `ensure_collection` creates the collection when missing, with payload
+  indexes `clearance_rank` (integer) and `compartments`, `releasability`,
+  `doc_id`, `cluster` (keyword), refuses with `ExportError` an existing
+  collection whose `dense` vector is another size or absent, and **never
+  calls `delete_collection`** — a wrong collection is the operator's to
+  fix. `export_documents` skips a document whose `document_exports` row
+  matches `document_digest` and `embed_model` (`force` overrides), reuses
+  stored `chunk_embeddings` of the right model and width and embeds only
+  the rest (storing them back), deletes a changed document's old points
+  **by `doc_id` filter** — never a drop — and upserts the new ones in
+  `UPSERT_BATCH = 400` with `wait=True`; a refused batch fails every
+  document in it with no export row, so the next run redoes them, and a
+  document that failed before the delete keeps its old points. Foreign
+  points — anything without a `QRY-` doc_id, Coherence's own product
+  points — are never touched (`test_foreign_points_in_collection_survive`).
+  It writes `export_dir()/manifest-<collection>.json` (`collection,
+  exported_at, embed_model, dim, vectors: ["dense"], n_docs, n_chunks,
+  skipped, failed, mission_id, markings, docs[]`); `config.export_dir()` is
+  `EXPORT_DIR` or `<dir of DB_PATH>/export`, i.e. the data volume under
+  Docker. `start_export_in_background` runs one export at a time (a
+  non-blocking lock; `False` when one is running) and `export_status()`
+  reports the last/current run with its check report. The CLI is `python
+  -m vector_export (--mission ID | --search Q | --doc ID... | --all)
+  [--collection C] [--force] [--dry-run] [--no-check]`: `--dry-run` writes
+  and contacts nothing, `--mission` checks itself, `--all` checks every
+  mission whose documents it touched; exit 2 on `ExportError`, 1 when a
+  document failed or a check did not pass. `qdrant_client` is imported
+  inside the functions that need it, so the module imports without it.
+- **The corpus self-test** (`corpus_check.py`) answers "did the collection
+  we just wrote retrieve what the mission found?" `build_eval_set` makes
+  `Q00` = the mission question and `Q01..Qnn` = one query per requirement
+  in plan order (the first of its `next_queries_json` — the query the
+  collector actually ran — else its title), and qrels rows `{query_id,
+  doc_id: "QRY-<id>", grade}` from `get_requirement_document_map`: 2 for a
+  document linked to a satisfied requirement, 1 for one linked to an unmet
+  requirement, 0 for a document the same mission linked only elsewhere
+  (`Q00` takes each document's best grade). `run` embeds each query on the
+  `search_query` side, calls `client.query_points(using="dense",
+  limit=k*4)` (chunk hits collapse to documents, so more than `k` hits are
+  needed for `k` distinct documents), and scores recall@k over grade ≥ 1
+  and the reciprocal rank of the first grade ≥ 2 document, each mean taken
+  over the queries that have something to measure; `passed = recall_at_k
+  >= settings.corpus_check_floor` (default `0.0`: report only). **The
+  grades come from Quarry's own assessor, so this is a regression
+  tripwire, not ground truth** — the number says "the corpus retrieves what
+  the mission used", nothing more, and `report.json` carries that note.
+  Its honesty is tested: a corpus whose vectors are shuffled scores ≈ 0
+  (`test_shuffled_vectors_fail_the_check`). Files land under
+  `export_dir()/eval/<collection>/<mission_id>/` as `queries.yaml`
+  (declares `collection`; written by hand with JSON-escaped scalars, no
+  YAML dependency), `qrels.jsonl` and `report.json`, in the shape
+  Coherence's `evals/graded.py` reads, so the same judgments can be re-run
+  there — with one difference to know: Coherence counts grade ≥ 2 as
+  relevant for recall where this check counts ≥ 1. The check never changes
+  mission state and never raises into the export.
+- **Cohere 5.0 is the default, and WP0's tests pin it.** `embed_model =
+  cohere/embed-v5.0-pro`, `embed_query_model = cohere/embed-v5.0-fast`,
+  `rerank_model = cohere/rerank-v5.0-pro`, `embed_dim = 1024`.
+  `test_embeddings.py::test_default_models_are_cohere_v5` and
+  `test_config_embed.py` assert those ids; `test_embeddings`/`test_rerank`
+  assert the wire parameters (`input_type`, `dimensions=1024`,
+  `max_tokens_per_doc=2048`, batches of 96, one `LlmCall` each) against the
+  `tests/stubs/litellm.py` stub's recorded `last_embedding_kwargs` /
+  `last_rerank_kwargs`; `tests/live_cohere_v5.py` checks the real API.
+  Changing a default means changing those tests on purpose. The pinned
+  `unclecode-litellm==1.81.13` already routes `cohere/embed-*` to
+  `/v2/embed` (`dimensions` → `output_dimension`, `input_type` passed
+  through) and rerank to `/v2/rerank` with `max_tokens_per_doc`; unknown
+  5.0 ids pass through with only pricing metadata missing. Settings-page
+  dropdowns accumulate used ids under `known_embed_models` /
+  `known_rerank_models` like `known_models`.
+- **Coherence-side follow-up (outside this repo).** Coherence `main`
+  cannot serve a dense-only collection today: `retrieval/store.search`
+  queries both arms and `get_bm25()` (`store.py:74-99`) refuses to start
+  without `var/bm25-<collection>.json`, which `api/main.lifespan`
+  (`main.py:119-176`) now calls at startup. Serving `quarry` needs (1) a
+  dense-only retrieval mode that skips the `bm25` prefetch and the stats
+  file when the collection has no sparse vector; (2) `COHERE_MODEL_EMBED`
+  set to an Embed 5 model (`embed-v5.0-fast` for queries) with
+  `COHERE_EMBED_DIM=1024`, because the corpus is in the Embed 5 space and
+  v4 is not stated to be compatible — the payload `embedding` field
+  records the model used; (3) `"quarry"` added to `ingest/indexer.py`
+  `LIVE_COLLECTIONS` (`indexer.py:173-180`) and the two copies
+  `tests/test_kestrel_ml.py` pins equal to it. Details, file:line
+  references and the eval-set registration are in
+  `docs/coherence-export.md`.
 
 ## Security-relevant invariants (preserve these)
 
@@ -429,13 +753,15 @@ web-researcher:/tmp/x.py && docker compose exec -T web-researcher python
 
 All settings come from `.env` via Pydantic Settings (`config.py`). The singleton `settings` is imported across modules. Key vars: `LLM_API_KEY` (legacy alias `COHERE_API_KEY`), `LLM_PROVIDER`, `LLM_PROVIDER_FAST`, `OLLAMA_API_BASE`, `DB_PATH` (default `data/research.db`), `CRAWL_TIMEOUT` (ms), `LLM_TIMEOUT_S` (per-call LLM timeout, seconds, default 120), `FLASK_HOST/PORT/DEBUG` (`FLASK_HOST` defaults to `127.0.0.1`), `FLASK_SECRET_KEY`, `QUARRY_BIND` (compose-level publish interface), `QUARRY_TRUSTED_HOSTS` (extra Host-header names accepted beyond localhost). Never set `FLASK_DEBUG=true` on a network-reachable host (Werkzeug console is an RCE primitive).
 
+Embeddings, rerank and export (see that section): `EMBED_MODEL` (`cohere/embed-v5.0-pro`; empty = off), `EMBED_QUERY_MODEL` (`cohere/embed-v5.0-fast`; empty = same as `EMBED_MODEL`), `EMBED_DIM` (1024, `cohere/` only), `RERANK_MODEL` (`cohere/rerank-v5.0-pro`; empty = off), `EMBED_TIMEOUT_S` (60), `EMBED_TOKENS_COUNT_TOWARD_BUDGET` (false), `QDRANT_URL` (`http://host.docker.internal:6333`; `http://qdrant:6333` with the compose `qdrant` profile), `QDRANT_API_KEY`, `QDRANT_EXPORT_COLLECTION` (`quarry`; `[A-Za-z0-9_-]+`), `EXPORT_CLEARANCE_RANK` (0), `EXPORT_CLASSIFICATION` (`NATO UNCLASSIFIED`), `EXPORT_COMPARTMENTS` / `EXPORT_RELEASABILITY` (comma-separated, `config.csv_list`), `EXPORT_ON_MISSION_DONE` (false), `EXPORT_DIR` (empty = `<dir of DB_PATH>/export`, `config.export_dir()`), `CORPUS_CHECK_K` (10), `CORPUS_CHECK_FLOOR` (0.0 = report only). The export uses the app's own `EMBED_MODEL`/`EMBED_DIM` — one vector space, stored vectors reused — there is no separate export model.
+
 `.env` tolerates unknown keys (`extra="ignore"` — a vendor's own `OPENAI_API_KEY`-style variables
 are fine) and a leading UTF-8 BOM. `env_ignore_empty=True` changes precedence: an explicitly empty
 value — in `.env` or in the process environment — is treated as "not set" rather than "clear this",
 so an exported `LLM_PROVIDER_FAST=` no longer overrides a non-empty value already in `.env`; it
 just falls through to it.
 
-**UI-editable overrides:** the Settings page (`/settings`) persists `llm_provider`, `llm_provider_fast`, `ollama_api_base`, `llm_api_key` (legacy `cohere_api_key` still read), and `search_max_results` to `data/settings.json` (`config.save_overrides`), which is layered over `.env` at import (`load_overrides`) and mutated live on save — **`settings.json` wins over `.env`** for those keys. `known_models()` accumulates every model id ever saved so the Settings dropdowns never lose a previously used value.
+**UI-editable overrides:** the Settings page (`/settings`) persists `llm_provider`, `llm_provider_fast`, `ollama_api_base`, `llm_api_key` (legacy `cohere_api_key` still read), `search_max_results`, and — its "Embeddings & rerank" and "Corpus export" sections — `embed_model`, `embed_query_model`, `rerank_model`, `qdrant_url`, `qdrant_api_key` (kept when the field is submitted blank, the `llm_api_key` rule), `qdrant_export_collection` and `export_on_mission_done` to `data/settings.json` (`config.save_overrides`, `OVERRIDE_KEYS`), which is layered over `.env` at import (`load_overrides`) and mutated live on save — **`settings.json` wins over `.env`** for those keys. `_coerce_override` casts a hand-edited bool/int back to the field's type. `known_models()` / `known_embed_models()` / `known_rerank_models()` accumulate every model id ever saved so the Settings dropdowns never lose a previously used value.
 
 ## Deployment notes
 
