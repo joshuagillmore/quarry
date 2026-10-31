@@ -171,10 +171,19 @@
         </button>
       </form>
       {% endif %}
+      {# Embed the sources and write them to the Qdrant corpus, in the
+         background; the state line follows document_exports via the poll. #}
+      <form method="post" action="/missions/{{ mission.id }}/export" style="margin:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px">
+        <button type="submit" class="btn btn-sm" title="Embed this mission's sources and write them to the vector corpus">
+          <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V5M5 8l3-3 3 3M3 13h10"/></svg>
+          Export to corpus
+        </button>
+        <span class="mono" style="font-size:11px;color:var(--fg-subtle)" data-export-state>{{ export_state.line }}</span>
+      </form>
       {% if mission.brief_markdown %}
-      <a class="btn btn-sm" href="/missions/{{ mission.id }}/brief.md">
+      <a class="btn btn-sm" href="/missions/{{ mission.id }}/brief.md" title="Download the brief as Markdown">
         <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M5 7l3 3 3-3M3 13h10"/></svg>
-        Export
+        Brief .md
       </a>
       {% endif %}
       {{ delete_form() }}
@@ -678,12 +687,12 @@
       // navigator.clipboard exists only in secure contexts (HTTPS or
       // localhost); over plain HTTP on a LAN it is undefined.
       if (!navigator.clipboard || !navigator.clipboard.writeText) {
-        flashLabel('Copy failed — use Export', 2500);
+        flashLabel('Copy failed — use Brief .md', 2500);
         return;
       }
       navigator.clipboard.writeText(src ? src.textContent : '')
         .then(() => flashLabel('Copied', 1200))
-        .catch(() => flashLabel('Copy failed — use Export', 2500));
+        .catch(() => flashLabel('Copy failed — use Brief .md', 2500));
     });
   }
 
@@ -743,6 +752,10 @@
       setTxt('[data-tele-tokens]', s.llm_tokens.toLocaleString('en-US'));
       const tb = document.querySelector('[data-tele-tokens-bar]');
       if (tb && maxLlmTokens) tb.style.width = Math.min(100, 100 * s.llm_tokens / maxLlmTokens) + '%';
+    }
+    // The corpus export line is plain text from the server (never markup).
+    if (s.export_state && typeof s.export_state.line === 'string') {
+      setTxt('[data-export-state]', s.export_state.line);
     }
 
     if (s.trace) {

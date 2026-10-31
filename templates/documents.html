@@ -10,7 +10,8 @@
       <h1 class="page-title">Library <em>&middot;</em> <span style="font-family: var(--font-mono); font-size: 16px; color: var(--fg-subtle); letter-spacing: 0;" id="libCount">{{ total }} documents</span></h1>
       {% if full_text_query %}
       <p class="page-sub">
-        <strong>{{ documents|length }}</strong> match{{ '' if documents|length == 1 else 'es' }} for <em>"{{ full_text_query }}"</em>{% if search_filter %} within search <em>"{{ search_filter }}"</em>{% endif %} &middot;
+        <strong>{{ documents|length }}</strong> match{{ '' if documents|length == 1 else 'es' }} for <em>"{{ full_text_query }}"</em>{% if search_filter %} within search <em>"{{ search_filter }}"</em>{% endif %}
+        {%- if search_mode_label %} &middot; <span class="mono" id="libSearchMode" title="How these matches were found and ordered">{{ search_mode_label }}</span>{% endif %} &middot;
         <a href="/documents" style="color: var(--accent);">clear</a>
       </p>
       {% elif mission_filter %}
@@ -97,7 +98,22 @@
       <option value="domain">Domain</option>
     </select>
     {% endif %}
+    {% if search_filter or mission_filter %}
+    {# Submits the POST form below (forms cannot nest): export this whole
+       search or mission collection to the vector corpus, not only the cards
+       on this page. #}
+    <button type="submit" form="libExport" class="btn btn-sm" title="Embed every document in this collection and write it to the vector corpus">
+      <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V5M5 8l3-3 3 3M3 13h10"/></svg>
+      Export to corpus
+    </button>
+    {% endif %}
   </form>
+  {% if search_filter or mission_filter %}
+  <form id="libExport" method="post" action="/documents/export" hidden>
+    {% if mission_filter %}<input type="hidden" name="mission" value="{{ mission_filter }}">
+    {% else %}<input type="hidden" name="search" value="{{ search_filter }}">{% endif %}
+  </form>
+  {% endif %}
   {% endif %}
 
   {% if documents %}

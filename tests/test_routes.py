@@ -178,11 +178,12 @@ def test_search_inputs_are_bounded(client, app_mod, monkeypatch):
 def test_full_text_query_is_bounded(client, app_mod, monkeypatch):
     seen = []
 
-    async def fake_fts(q, search_filter=None):
+    async def fake_hybrid(q, search_filter=None, *, limit=100):
         seen.append(q)
-        return []
+        return [], "fts"
 
-    monkeypatch.setattr(app_mod, "search_documents_fts", fake_fts)
+    # The Library's full-text search goes through ranking.hybrid_search.
+    monkeypatch.setattr(app_mod.ranking, "hybrid_search", fake_hybrid)
     assert client.get("/documents?q=" + "z" * 300).status_code == 200
     assert seen == ["z" * 200]
 
@@ -624,6 +625,43 @@ def test_retask_allowed_while_the_token_budget_has_room(client, starts, own_budg
     client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
     assert _reqs()["r0"].status == "pending"
     assert _mission().status == "collecting" and len(starts) == 1
+
+
+def _spend_embed_tokens(mission_id, prompt, purpose="embed"):
+    from models import LlmCall
+    _run(storage.insert_llm_call(LlmCall(
+        purpose=purpose, tier=purpose, model="cohere/embed-v5.0-pro",
+        mission_id=mission_id, prompt_tokens=prompt)))
+
+
+def test_retask_budget_ignores_embed_and_rerank_rows_like_the_runner(client, starts,
+                                                                     monkeypatch):
+    """Embedding and rerank calls are recorded (the strip shows them) but
+    the runner leaves them out of the token budget by default: a mission
+    whose only spend over budget is those rows is not refused a retask."""
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", False)
+    _budget_mission(1000)
+    _spend_tokens("m1", 500)                       # LLM spend: half the budget
+    _spend_embed_tokens("m1", 5000)                # embed rows: far over it
+    _spend_embed_tokens("m1", 700, purpose="rerank")
+    client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert _reqs()["r0"].status == "pending"
+    assert _mission().status == "collecting" and len(starts) == 1
+    # The telemetry still counts every row.
+    assert client.get("/api/mission/m1").get_json()["llm_tokens"] == 6200
+
+
+def test_retask_counts_embed_rows_when_the_setting_says_so(client, starts, monkeypatch):
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", True)
+    _budget_mission(1000)
+    _spend_tokens("m1", 500)
+    _spend_embed_tokens("m1", 5000)
+    r = client.post("/missions/m1/requirements/r0/retask", data={"query": "new angle"})
+    assert _path(r) == "/missions/m1"
+    assert _reqs()["r0"].status == "unmet"
+    assert _mission().status == "done" and starts == []
+    assert _flashes(client) == [
+        "This mission has used 5,500 of 1,000 tokens; raise the budget before re-tasking."]
 
 
 # --- resume after a limit -----------------------------------------------
