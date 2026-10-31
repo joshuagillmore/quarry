@@ -408,6 +408,15 @@ async def _run_job(job_id: str) -> None:
         set_document_ids(job_id, [d.id for d in stored])
         add_log(job_id, "ok", f"stored <em>{len(stored)}</em> documents")
 
+        # Dense-index what was stored. Never raises: embeddings off or a
+        # failed call is one stderr line and 0, and the job goes on.
+        from embeddings import embed_pending_documents
+        n_embedded = await embed_pending_documents([d.id for d in stored])
+        if n_embedded > 0:
+            from config import settings as _settings
+            add_log(job_id, "info",
+                    f"embedded <em>{n_embedded}</em> chunks · {_esc(_settings.embed_model)}")
+
         search_record = SearchRecord(
             id=str(uuid.uuid4()),
             query=job.query,

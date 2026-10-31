@@ -365,3 +365,55 @@ def test_brief_prompt_asks_for_citations_in_the_summary_too():
     prompt = build_brief_prompt("Q?", "- [x] R", "[1] src")
     summary = prompt.split("## Summary", 1)[1].split("## Key Findings", 1)[0]
     assert "[n]" in summary
+
+
+# ---------- a caller-fixed source order (WP7) ----------
+
+def _bodied(doc_id, url, domain="d"):
+    return Document(id=doc_id, url=url, domain=domain, title="title " + doc_id,
+                    search_query="Q", crawled_at="t", content_markdown="body " + doc_id,
+                    word_count=100)
+
+
+def test_synthesize_brief_numbers_sources_with_the_given_order(monkeypatch):
+    a, b = _bodied("a", "http://a/1", "a.example"), _bodied("b", "http://b/1", "b.example")
+    captured = {}
+    monkeypatch.setattr(brief, "chat", lambda p, prompt, **k: (
+        captured.setdefault("prompt", prompt) and "ok"))
+
+    brief.synthesize_brief(_mission(), [_req("satisfied")], [a, b], {"http://a/1"},
+                           ordered=[b, a])
+
+    prompt = captured["prompt"]
+    assert prompt.index("[1] title b — http://b/1") < prompt.index("[2] title a — http://a/1")
+    # The delta block cites by the same numbers: a is [2] in the given order.
+    assert "- [2] a.example" in prompt and "[1] a.example" not in prompt
+
+
+def test_synthesize_brief_default_order_is_ordered_sources(monkeypatch):
+    junk = Document(id="junk", url="http://j/1", domain="j", title="Just a moment...",
+                    search_query="Q", crawled_at="t", content_markdown="w", word_count=5)
+    good = _bodied("good", "http://g/1")
+    captured = {}
+    monkeypatch.setattr(brief, "chat", lambda p, prompt, **k: (
+        captured.setdefault("prompt", prompt) and "ok"))
+    brief.synthesize_brief(_mission(), [_req("satisfied")], [junk, good], set())
+    prompt = captured["prompt"]
+    assert prompt.index("[1] title good") < prompt.index("[2] Just a moment...")
+    assert [d.id for d in brief.ordered_sources([junk, good])] == ["good", "junk"]
+
+
+def test_sources_block_and_delta_block_take_the_order():
+    a, b = _bodied("a", "http://a/1", "a.example"), _bodied("b", "http://b/1", "b.example")
+    block = brief._sources_block([a, b], ordered=[b, a])
+    assert block.startswith("[1] title b — http://b/1\nbody b\n\n[2] title a — http://a/1")
+    assert brief._sources_block([a, b]) == brief._sources_block([a, b], ordered=[a, b])
+    delta = brief._delta_block([a, b], {"http://a/1"}, ordered=[b, a])
+    assert "- [2] a.example" in delta
+    assert "- [1] a.example" in brief._delta_block([a, b], {"http://a/1"})
+
+
+def test_synthesize_brief_signature_has_the_ordered_kwarg():
+    import inspect
+    params = inspect.signature(brief.synthesize_brief).parameters
+    assert "ordered" in params and params["ordered"].default is None

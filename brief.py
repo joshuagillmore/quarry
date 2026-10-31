@@ -32,9 +32,15 @@ def ordered_sources(docs: list[Document], max_docs: int = MAX_BRIEF_SOURCES) -> 
 
 
 def _sources_block(docs: list[Document], max_docs: int = MAX_BRIEF_SOURCES,
-                   excerpt_chars: int = 2200) -> str:
+                   excerpt_chars: int = 2200,
+                   ordered: list[Document] | None = None) -> str:
+    """The numbered sources the prompt cites: `ordered` when the caller
+    fixed the order (ranking.rank_for_brief, persisted as the mission's
+    brief_sources_json), else ordered_sources(docs, max_docs)."""
+    if ordered is None:
+        ordered = ordered_sources(docs, max_docs)
     lines = []
-    for i, d in enumerate(ordered_sources(docs, max_docs), 1):
+    for i, d in enumerate(ordered, 1):
         body = (d.content_fit or d.content_markdown or "")[:excerpt_chars]
         lines.append(f"[{i}] {d.title or d.domain} — {d.url}\n{body}")
     return "\n\n".join(lines)
@@ -269,14 +275,18 @@ def brief_warnings(mission: Mission, requirements: list[Requirement],
     return warnings
 
 
-def _delta_block(docs: list[Document], new_urls: set[str], max_items: int = 10) -> str:
+def _delta_block(docs: list[Document], new_urls: set[str], max_items: int = 10,
+                 ordered: list[Document] | None = None) -> str:
     """What this run found that its previous run did not, referred to by the
-    same [n] the sources block uses plus the domain. Never the page title:
-    it is page-controlled text (a prompt-injection vector) and duplicates
-    what the numbered source already shows."""
+    same [n] the sources block uses (`ordered`, else ordered_sources(docs))
+    plus the domain. Never the page title: it is page-controlled text (a
+    prompt-injection vector) and duplicates what the numbered source
+    already shows."""
     if not new_urls:
         return ""
-    numbered = [(n, d) for n, d in enumerate(ordered_sources(docs), 1) if d.url in new_urls]
+    if ordered is None:
+        ordered = ordered_sources(docs)
+    numbered = [(n, d) for n, d in enumerate(ordered, 1) if d.url in new_urls]
     if not numbered:
         return ""
     lines = ["NEW SINCE LAST RUN — these sources were not in the previous run; "
@@ -294,12 +304,21 @@ def synthesize_brief(
     requirements: list[Requirement],
     docs: list[Document],
     new_urls: set[str] | None = None,
+    ordered: list[Document] | None = None,
 ) -> str:
     """Return Markdown. On LLM failure, return a minimal fallback brief built
-    from coverage so a run always produces something readable."""
+    from coverage so a run always produces something readable.
+
+    `ordered` is the source order the prompt numbers [n] with (both the
+    sources block and the delta block); the caller persists that same list
+    as the mission's brief_sources_json. None means ordered_sources(docs),
+    the order the rail falls back to when nothing is stored."""
+    if ordered is None:
+        ordered = ordered_sources(docs)
     coverage = _coverage_block(requirements)
-    delta = _delta_block(docs, new_urls or set())
-    prompt = build_brief_prompt(mission.question, coverage, _sources_block(docs), delta)
+    delta = _delta_block(docs, new_urls or set(), ordered=ordered)
+    prompt = build_brief_prompt(mission.question, coverage,
+                                _sources_block(docs, ordered=ordered), delta)
     persona = "You are an expert analyst writing a concise, source-grounded research brief."
     try:
         return chat(persona, prompt, max_tokens=2000, tier="fast",

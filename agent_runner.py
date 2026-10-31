@@ -17,7 +17,10 @@ import traceback
 from datetime import datetime, timezone
 from html import escape as _esc
 
+import embeddings
 import jobs
+import ranking
+import vector_export
 from config import settings
 from jobs import JobUrl, EXTRACT_CONCURRENCY
 from search import web_search_ex
@@ -195,6 +198,14 @@ def _token_budget(budget: dict) -> int:
         return max(0, int(settings.max_llm_tokens or 0))
 
 
+def _budget_exclusions() -> tuple[str, ...]:
+    """LlmCall purposes the token budget does not count: embed and rerank
+    rows (their tokens are not the LLM spend the budget bounds) unless
+    settings.embed_tokens_count_toward_budget says otherwise. Only the budget
+    decision filters; the page/API telemetry still shows every row."""
+    return () if settings.embed_tokens_count_toward_budget else ("embed", "rerank")
+
+
 async def _stop_reason(mission_id: str, job_id, token_budget: int,
                        mid_pass: bool) -> str | None:
     """Why collection must stop now, or None to carry on. Checked at every
@@ -208,7 +219,8 @@ async def _stop_reason(mission_id: str, job_id, token_budget: int,
                      else "stop requested — writing the brief from what was collected")
         return STOPPED_BY_USER
     if token_budget > 0:
-        usage = await get_mission_llm_usage(mission_id)
+        usage = await get_mission_llm_usage(
+            mission_id, exclude_purposes=_budget_exclusions())
         used = usage["prompt_tokens"] + usage["completion_tokens"]
         if used > token_budget:
             if job_id:
@@ -443,10 +455,24 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
     # remaining global source budget.
     remaining = max_sources - len(collected)
     cap = max(0, min(per_req_cap, remaining))
-    to_crawl = [sr for sr in results
-                if aliases.get(sr.url, sr.url) not in collected
-                and sr.url not in attempted
-                and aliases.get(sr.url, sr.url) not in attempted][:cap]
+    candidates = [sr for sr in results
+                  if aliases.get(sr.url, sr.url) not in collected
+                  and sr.url not in attempted
+                  and aliases.get(sr.url, sr.url) not in attempted]
+    if cap and len(candidates) > cap:
+        # More candidates than this requirement may crawl: rerank them
+        # against the requirement so the cap keeps the most relevant pages,
+        # not the engine's first page. Off or failed, ranking returns the
+        # search order (ranking.py's degrade rule) and nothing is logged.
+        query_text = f"{req.title}. {req.description}" if req.description else req.title
+        ranked = await asyncio.to_thread(ranking.rank_search_results, query_text,
+                                         candidates, mission_id=mission_id)
+        if job_id and [sr.url for sr in ranked] != [sr.url for sr in candidates]:
+            jobs.add_log(job_id, "info",
+                         f"reranked {len(candidates)} candidates → crawling top {cap}")
+        to_crawl = ranked[:cap]
+    else:
+        to_crawl = candidates[:cap]
 
     if to_crawl:
         fresh_for_trace = [JobUrl(url=sr.url, title=sr.title or sr.url)
@@ -456,12 +482,20 @@ async def _collect_one(mission, req, collected, job_urls, job_id,
             job_urls.update(u.url for u in fresh_for_trace)
         docs = await crawl_urls_with_progress(to_crawl, mission.question, job_id or "",
                                               attempted=attempted, aliases=aliases)
+        new_ids: list[str] = []
         for doc in docs:
             doc_id = await upsert_document(doc)
             collected[doc.url] = doc_id
+            new_ids.append(doc_id)
             await link_mission_document(mission_id, req.id, doc_id)
         if job_id:
             jobs.update_job(job_id, sources_used=len(collected))
+        # Dense-index the pages just stored. Never raises: off or failed is
+        # one stderr line and 0, and the requirement goes on as before.
+        n_embedded = await embeddings.embed_pending_documents(new_ids, mission_id=mission_id)
+        if job_id and n_embedded > 0:
+            jobs.add_log(job_id, "info",
+                         f"embedded {n_embedded} chunks · {_esc(settings.embed_model)}")
 
     # Link any already-held URLs that resurfaced for this requirement (crawled
     # earlier in this run, or before a retask; under any of their names), so
@@ -591,9 +625,15 @@ async def _synthesize(mission_id: str, agent, job_id,
     # The order the brief's [n] markers refer to, fixed now and stored with
     # the brief, so the source rail cannot drift from the text if the
     # mission's documents change later (e.g. a retask adds sources).
-    # synthesize_brief numbers `docs` with this same ordered_sources call.
-    ordered = ordered_sources(docs)
-    brief_md = await asyncio.to_thread(synthesize_brief, mission, requirements, docs, new_urls)
+    # rank_for_brief reranks the usable sources against the question when a
+    # reranker is on and is exactly ordered_sources(docs) otherwise; the one
+    # list goes to synthesize_brief (which numbers its prompt with it) and
+    # into brief_sources_json, so the rail and the text can never disagree.
+    ordered = await asyncio.to_thread(ranking.rank_for_brief, mission, docs)
+    if job_id and [d.id for d in ordered] != [d.id for d in ordered_sources(docs)]:
+        jobs.add_log(job_id, "info", "brief sources reranked")
+    brief_md = await asyncio.to_thread(synthesize_brief, mission, requirements, docs,
+                                       new_urls, ordered=ordered)
     sources_json = json.dumps([d.id for d in ordered])
     warnings_json = _check_brief(mission.model_copy(update={"brief_sources_json": sources_json}),
                                  requirements, docs, brief_md, job_id)
@@ -608,4 +648,27 @@ async def _synthesize(mission_id: str, agent, job_id,
         jobs.add_log(job_id, "ok",
                      f"done · {n_sat}/{len(requirements)} requirements satisfied · "
                      f"{len(docs)} sources")
+    # Optional corpus export (with its self-test) once the mission is done.
+    # It reports into the trace only: a failure never raises or touches the
+    # mission's status, which was written above.
+    if settings.export_on_mission_done:
+        await _export_sources(mission_id, docs, job_id)
+    if job_id:
         jobs.finish_job(job_id, stage="done")
+
+
+async def _export_sources(mission_id: str, docs, job_id) -> None:
+    """Export a finished mission's sources to the Qdrant corpus and log the
+    result (vector_export's one-line summary, check report included). Any
+    failure — Qdrant unreachable, embeddings off, a bug — is one warn line."""
+    try:
+        res = await vector_export.export_documents([d.id for d in docs],
+                                                   mission_id=mission_id)
+    except Exception as e:  # noqa: BLE001 - export never fails a mission
+        traceback.print_exc()
+        if job_id:
+            jobs.add_log(job_id, "warn",
+                         f"export failed: {_esc(type(e).__name__)}: {_esc(str(e))}")
+        return
+    if job_id:
+        jobs.add_log(job_id, "warn" if res.failed else "ok", _esc(res.summary()))

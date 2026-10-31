@@ -156,7 +156,7 @@ def _wire(monkeypatch, urls, satisfied=False, crawled=None, seen_attempted=None,
     monkeypatch.setattr(agent_runner, "assess_requirement", lambda req, docs, **k: Assessment(
         satisfied, "high" if satisfied else "low", "" if satisfied else "gap", []))
     monkeypatch.setattr(agent_runner, "synthesize_brief",
-                        lambda mission, reqs, docs, new_urls: "brief")
+                        lambda mission, reqs, docs, new_urls, ordered=None: "brief")
 
 
 def test_retask_skips_held_urls_and_keeps_its_budget(monkeypatch):
@@ -262,7 +262,7 @@ def _delta_fixture():
 def _captured_new_urls(monkeypatch, mission_id):
     captured = {}
 
-    def fake_brief(mission, reqs, docs, new_urls):
+    def fake_brief(mission, reqs, docs, new_urls, ordered=None):
         captured["new"] = set(new_urls)
         return "brief"
 
@@ -875,7 +875,7 @@ def test_synthesize_stores_brief_warnings_and_logs_them(monkeypatch):
                     _doc("http://junk.example/1", title="Just a moment...", words=5)):
             await storage.link_mission_document("m1", "r1", await storage.upsert_document(doc))
     asyncio.run(setup())
-    monkeypatch.setattr(agent_runner, "synthesize_brief", lambda mission, reqs, docs, new_urls: (
+    monkeypatch.setattr(agent_runner, "synthesize_brief", lambda mission, reqs, docs, new_urls, ordered=None: (
         "## Key Findings\n- Lithium battery cells fade quickly when stored hot and fully "
         "charged for long periods.\n- Cells fade [2].\n"))
 
@@ -895,7 +895,7 @@ def test_synthesize_stores_empty_warnings_for_a_clean_brief(monkeypatch):
         await storage.insert_requirement(Requirement(id="r1", mission_id="m1", title="T"))
     asyncio.run(setup())
     monkeypatch.setattr(agent_runner, "synthesize_brief",
-                        lambda mission, reqs, docs, new_urls: "Fine.")
+                        lambda mission, reqs, docs, new_urls, ordered=None: "Fine.")
     asyncio.run(agent_runner._synthesize("m1", None, None))
     assert json.loads(asyncio.run(storage.get_mission("m1")).brief_warnings_json) == []
 
