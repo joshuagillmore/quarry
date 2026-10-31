@@ -261,9 +261,14 @@ def _embed_pending(doc_ids: list[str], mission_id: Optional[str]) -> int:
     coroutines it needs run to completion on a loop of their own (there is
     none in this thread), the way llm._run_insert does."""
     model = settings.embed_model.strip()
+    # The width a stored vector must have to count as present: the
+    # configured one for cohere/ models (the only ones `dimensions` goes on
+    # the wire for, so a changed EMBED_DIM re-embeds every chunk), any for
+    # a provider that returns its native width.
+    dim = int(settings.embed_dim) if model.startswith(_COHERE_EMBED_PREFIX) else None
     embedded = 0
     while True:
-        pending = asyncio.run(storage.get_chunks_missing_embeddings(model, doc_ids))
+        pending = asyncio.run(storage.get_chunks_missing_embeddings(model, doc_ids, dim=dim))
         if not pending:
             return embedded
         docs = asyncio.run(storage.get_documents_by_ids(

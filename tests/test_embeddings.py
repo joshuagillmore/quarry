@@ -320,3 +320,50 @@ def test_embed_disabled_when_model_empty(monkeypatch, capsys):
 
 def test_embed_enabled_when_model_set():
     assert embeddings.embed_enabled() is True
+
+
+# ---------- an EMBED_DIM change must not strand the index (review F2) ----------
+
+def _stored_dims(doc_id):
+    return [r[0] for r in _sql("""SELECT e.dim FROM chunk_embeddings e
+                                  JOIN chunks c ON c.chunk_id = e.chunk_id
+                                  WHERE c.document_id = ? ORDER BY c.idx""", (doc_id,))]
+
+
+def test_embed_dim_change_re_embeds_cohere_chunks_at_the_new_width(monkeypatch):
+    import ranking
+    asyncio.run(storage.init_db())
+    doc = Document(id="d1", url="https://a/1", domain="a", title="Alpha",
+                   search_query="q", crawled_at="2026-01-01",
+                   content_markdown="alpha body text one.", content_fit="")
+    doc_id = asyncio.run(storage.upsert_document(doc))
+    assert asyncio.run(embeddings.embed_pending_documents([doc_id])) == 1
+    assert _stored_dims(doc_id) == [DIM]
+    assert asyncio.run(ranking.hybrid_search("alpha", None))[1] == "hybrid"
+
+    monkeypatch.setattr(settings, "embed_dim", 512)
+    missing = asyncio.run(storage.get_chunks_missing_embeddings(PRO, [doc_id], dim=512))
+    assert [c.chunk_id for c in missing] == [f"{doc_id}#0"], \
+        "a vector of the old width is missing for the new one"
+    assert asyncio.run(embeddings.embed_pending_documents([doc_id])) == 1
+    assert litellm.last_embedding_kwargs["dimensions"] == 512
+    assert _stored_dims(doc_id) == [512], "replaced in place, not kept beside the old width"
+    docs, mode = asyncio.run(ranking.hybrid_search("alpha", None))
+    assert mode == "hybrid" and [d.id for d in docs] == [doc_id]
+    assert litellm.last_embedding_kwargs["dimensions"] == 512
+    # And nothing is bought twice at the new width.
+    assert asyncio.run(embeddings.embed_pending_documents([doc_id])) == 0
+
+
+def test_non_cohere_models_are_judged_at_their_native_width(monkeypatch):
+    """A provider that ignores `dimensions` stores its native width; the
+    settings value must not make every one of its vectors look missing."""
+    monkeypatch.setattr(settings, "embed_model", "ollama/nomic-embed-text")
+    monkeypatch.setattr(settings, "embed_dim", DIM)
+    asyncio.run(storage.init_db())
+    doc_id = asyncio.run(storage.upsert_document(Document(
+        id="d1", url="https://a/1", domain="a", title="Alpha", search_query="q",
+        crawled_at="2026-01-01", content_markdown="alpha body text one.", content_fit="")))
+    assert asyncio.run(embeddings.embed_pending_documents([doc_id])) == 1
+    assert _stored_dims(doc_id) == [8], "the stub's native width, not settings.embed_dim"
+    assert asyncio.run(embeddings.embed_pending_documents([doc_id])) == 0

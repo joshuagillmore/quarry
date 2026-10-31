@@ -234,6 +234,9 @@ def test_report_files_written(client):
         saved = json.load(f)
     assert saved["recall_at_k"] == 1.0 and saved["passed"] is True
     assert saved["k"] == 10 and saved["floor"] == 0.0
+    # Four documents in the collection: recall is measured at k_effective = 3.
+    assert saved["k_effective"] == 3 and saved["n_docs_in_collection"] == 4
+    assert saved["n_measured"] == 2
     assert saved["queries"][0]["query_id"] == "Q00"
     assert "not ground truth" in saved["note"]
 
@@ -259,7 +262,9 @@ def test_export_attaches_the_check(client):
                                                  check=True))
     assert result.check is not None
     assert result.check.mission_id == "m1" and result.check.recall_at_k == 1.0
-    assert "check recall@10 1.00" in result.summary()
+    # One document in the collection: k_effective is capped at 1.
+    assert result.check.k == 10 and result.check.k_effective == 1
+    assert "check recall@1 1.00 mrr 1.00 over 2 measured queries (pass)" in result.summary()
     status = result.to_dict()
     assert status["check"]["passed"] is True
 
@@ -290,3 +295,113 @@ def test_a_failing_query_never_raises_into_the_export(client, monkeypatch):
     assert "check failed" in result.summary()
     assert not os.path.exists(os.path.join(settings.export_dir, "eval")), \
         "no half-written eval files"
+
+
+# --- the self-test cannot pass trivially (review F3) ---------------------------------
+
+def test_k_is_capped_below_the_collection_size_so_recall_is_not_free(client, monkeypatch):
+    """Six documents in the collection and the default k=10: before the cap
+    every query returned the whole collection, so recall@10 was 1.0 whatever
+    the vectors held. k_effective = min(k, n_docs - 1) leaves the worst hit
+    out, and a document whose vector is the opposite of the query is that
+    worst hit, so recall drops below 1.0 for the two queries that expect it."""
+    monkeypatch.setattr(settings, "corpus_check_floor", 0.75)
+    query = "the one query both Q00 and Q01 ask"
+    ids = [_run(storage.upsert_document(_doc(f"d{i}", f"Doc {i}", f"body {i} words here.",
+                                             f"https://a/{i}"))) for i in range(6)]
+    _seed_mission(_mission(question=query),
+                  [_req("r1", title="EEI", status="satisfied", queries=[query])],
+                  [("r1", ids[0]), ("r1", ids[1])])
+    res = _run(vector_export.export_documents(ids, client=client, check=False))
+    assert len(res.exported) == 6
+
+    qvec = embeddings_for_query(query)
+    worst = [r for r in client.scroll(COLLECTION, limit=100, with_payload=True)[0]
+             if r.payload["doc_id"] == f"QRY-{ids[0]}"]
+    assert len(worst) == 1
+    client.upsert(COLLECTION, points=[qm.PointStruct(
+        id=worst[0].id, vector={"dense": [-x for x in qvec]}, payload=worst[0].payload)],
+        wait=True)
+
+    report = _run(corpus_check.run("m1", client=client))
+    assert report.error is None
+    assert report.k == 10 and report.n_docs_in_collection == 6 and report.k_effective == 5
+    assert report.n_measured == 2
+    for q in report.queries:
+        assert len(q.hits) == 5 and f"QRY-{ids[0]}" not in q.hits
+        assert q.recall_at_k == 0.5
+    assert report.recall_at_k == 0.5
+    assert report.passed is False
+
+
+def embeddings_for_query(text):
+    import embeddings
+    return [float(x) for x in embeddings.embed_query(text)]
+
+
+def test_nothing_measured_is_not_a_pass(client):
+    d1 = _run(storage.upsert_document(_doc("d1", "T", "body", "https://a/1")))
+    _seed_mission(_mission(), [_req("r1", title="t", status="unmet")], [])
+    _run(vector_export.export_documents([d1], client=client, check=False))
+    report = _run(corpus_check.run("m1", client=client))
+    assert report.n_measured == 0
+    assert report.passed is False
+    assert report.error == "nothing measured"
+    assert report.n_docs_in_collection == 1
+
+
+def test_summary_and_cli_lines_say_what_was_measured(client, capsys):
+    d1 = _self_consistent_corpus(client)
+    result = _run(vector_export.export_documents([d1], client=client, mission_id="m1",
+                                                 check=True))
+    assert result.check.n_docs_in_collection == 4 and result.check.k_effective == 3
+    assert "check recall@3 1.00 mrr 1.00 over 2 measured queries (pass)" in result.summary()
+
+
+# --- the YAML is pure ASCII and round-trips odd strings (review F8) -------------------
+
+# Each odd character sits mid-string: build_eval_set strips the question and
+# titles, and Python counts NEL (U+0085) as whitespace, so a trailing one
+# would be gone before the YAML writer ever saw it.
+ODD_STRINGS = ["del \x7f here", "nel \x85 here", "c1 \x9f here", "sep \u2028 here",
+               "emoji \U0001F600 here", "bom \ufeff here", "tab\there", "- leading dash",
+               "key: value", "'single'", 'back\\slash "quoted" \\u0085 literal']
+
+
+@pytest.mark.parametrize("s", ODD_STRINGS)
+def test_yaml_scalars_are_ascii(s):
+    text = corpus_check.queries_yaml(corpus_check.build_eval_set(
+        _mission(question=s), [_req("r1", title=s)], {"r1": []})[0])
+    assert text.isascii(), repr(text)
+
+
+@pytest.mark.parametrize("s", ODD_STRINGS)
+def test_yaml_scalars_round_trip_odd_strings(s):
+    yaml = pytest.importorskip("yaml")
+    text = corpus_check.queries_yaml(corpus_check.build_eval_set(
+        _mission(question=s), [_req("r1", title=s)], {"r1": []})[0])
+    loaded = yaml.safe_load(text)
+    assert loaded["queries"][0]["text"] == s
+    assert loaded["queries"][1]["text"] == s and loaded["queries"][1]["topic"] == s
+
+
+# --- the query is the one the collector ran (review F9) ------------------------------
+
+def test_first_query_prefers_the_last_search_the_collector_ran():
+    req = _req("r1", title="The title", queries=["planned first", "planned second"])
+    req.search_stats_json = json.dumps([
+        {"pass": 1, "query": "ran in pass one", "engine": "brave", "results": 3},
+        {"pass": 2, "query": "ran in pass two", "engine": "bing", "results": 5},
+    ])
+    assert corpus_check._first_query(req) == "ran in pass two"
+    doc, _ = corpus_check.build_eval_set(_mission(), [req], {"r1": []})
+    assert doc["queries"][1]["text"] == "ran in pass two"
+    # No search recorded yet: the first planned query, then the title.
+    req.search_stats_json = None
+    assert corpus_check._first_query(req) == "planned first"
+    req.search_stats_json = "not json"
+    assert corpus_check._first_query(req) == "planned first"
+    req.search_stats_json = json.dumps([{"pass": 1, "query": "   ", "engine": "x", "results": 0}])
+    assert corpus_check._first_query(req) == "planned first"
+    req.next_queries_json = None
+    assert corpus_check._first_query(req) == "The title"

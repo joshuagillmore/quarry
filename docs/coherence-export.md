@@ -241,9 +241,13 @@ requirements (an explicit non-relevant row, as Coherence's qrels carry).
 The `CheckReport` dataclass plus `generated_at`, `floor` and a `note`:
 `{collection, mission_id, k, queries: [{query_id, text, expected: [doc ids
 graded ≥ 1], hits: [top-k doc ids], recall_at_k, rr}], recall_at_k, mrr,
-passed, eval_dir, error}`. recall@k is over grade ≥ 1 documents; the
-reciprocal rank is of the first grade ≥ 2 document; each mean is over the
-queries that have something to measure. `passed = recall_at_k >=
+passed, eval_dir, error, n_measured, n_docs_in_collection, k_effective}`.
+recall@k is over grade ≥ 1 documents, measured at `k_effective = min(k,
+max(1, n_docs_in_collection - 1))` so a collection no bigger than k cannot
+score 1.0 for free; the reciprocal rank is of the first grade ≥ 2
+document; each mean is over the queries that have something to measure,
+and a run that measured nothing (`n_measured == 0`) is `passed: false`
+with `error: "nothing measured"`. Otherwise `passed = recall_at_k >=
 CORPUS_CHECK_FLOOR` (default `0.0`: report only).
 
 **What the number means.** The grades come from Quarry's own assessor —
@@ -396,7 +400,7 @@ From the plan's verification list, on the user's box:
    `embedded N chunks · cohere/embed-v5.0-pro` after each requirement's
    crawl, `brief sources reranked` (only when the reranked order differs
    from the newest-first one), and the export line
-   `exported N · skipped M · failed 0 · K chunks → 'quarry' · check recall@10 0.xx mrr 0.xx (pass)`.
+   `exported N · skipped M · failed 0 · K chunks → 'quarry' · check recall@k 0.xx mrr 0.xx over n measured queries (pass)` (that k is `k_effective`, capped below the collection's document count; see `corpus_check.py`).
    `python -m vector_export --mission <id>` prints the same summary line on
    stderr.
 3. Inspect `data/export/manifest-quarry.json` (every document `exported`,

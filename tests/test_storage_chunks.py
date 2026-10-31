@@ -460,3 +460,76 @@ def test_get_requirement_document_map():
     assert list(m1) == ["r1", "r2", "r3"]            # plan order
     assert m2 == {"r-m2": ["dZ"]}
     assert none == {}
+
+
+# --- vectors of another width are missing, and are replaced (review F2) ---------------
+
+def test_missing_and_stored_embeddings_filter_by_dim(paragraph_chunking):
+    _run(storage.init_db())
+    _run(storage.upsert_document(_doc("d1", "a\n\nb", url="http://x/1")))
+    _run(storage.upsert_chunk_embeddings([("d1#0", "m", 1, _blob(1.0)),
+                                          ("d1#1", "m", 2, _blob(1.0, 2.0))]))
+    ids = lambda rows: [c.chunk_id for c in rows]  # noqa: E731
+    assert ids(_run(storage.get_chunks_missing_embeddings("m"))) == []
+    assert ids(_run(storage.get_chunks_missing_embeddings("m", dim=1))) == ["d1#1"]
+    assert ids(_run(storage.get_chunks_missing_embeddings("m", ["d1"], dim=2))) == ["d1#0"]
+    assert ids(_run(storage.get_chunks_missing_embeddings("m", dim=3))) == ["d1#0", "d1#1"]
+    assert _run(storage.get_chunk_embeddings("m", dim=1)) == [("d1#0", "d1", _blob(1.0))]
+    assert _run(storage.get_chunk_embeddings("m", ["d1"], dim=2)) == [
+        ("d1#1", "d1", _blob(1.0, 2.0))]
+    assert _run(storage.get_chunk_embeddings("m", dim=3)) == []
+    # A re-embed at another width replaces the (chunk_id, model) row: never
+    # two widths for one chunk.
+    _run(storage.upsert_chunk_embeddings([("d1#1", "m", 1, _blob(5.0))]))
+    assert _sql("SELECT COUNT(*) FROM chunk_embeddings WHERE chunk_id = 'd1#1'") == [(1,)]
+    assert _run(storage.get_chunk_embeddings("m", dim=1)) == [
+        ("d1#0", "d1", _blob(1.0)), ("d1#1", "d1", _blob(5.0))]
+    assert ids(_run(storage.get_chunks_missing_embeddings("m", dim=1))) == []
+
+
+# --- the dense arm is bounded, most recent first (review F5) -------------------------
+
+def test_get_chunk_embeddings_limit_keeps_the_most_recent_chunks(paragraph_chunking):
+    _run(storage.init_db())
+    _run(storage.upsert_document(_doc("old", "a\n\nb", url="http://x/1", crawled_at="2026-01-01")))
+    _run(storage.upsert_document(_doc("new", "c\n\nd", url="http://x/2", crawled_at="2026-03-01")))
+    _run(storage.upsert_document(_doc("mid", "e", url="http://x/3", crawled_at="2026-02-01")))
+    _run(storage.upsert_chunk_embeddings([
+        ("old#0", "m", 1, _blob(1.0)), ("old#1", "m", 1, _blob(2.0)),
+        ("new#0", "m", 1, _blob(3.0)), ("new#1", "m", 1, _blob(4.0)),
+        ("mid#0", "m", 1, _blob(5.0))]))
+    ids = lambda rows: [cid for cid, _d, _b in rows]  # noqa: E731
+    assert ids(_run(storage.get_chunk_embeddings("m", limit=3))) == ["new#0", "new#1", "mid#0"]
+    assert ids(_run(storage.get_chunk_embeddings("m", limit=1))) == ["new#0"]
+    assert ids(_run(storage.get_chunk_embeddings("m", ["old", "mid"], limit=2))) == \
+        ["mid#0", "old#0"]
+    assert ids(_run(storage.get_chunk_embeddings("m", limit=0))) == []
+    assert len(_run(storage.get_chunk_embeddings("m"))) == 5, "no limit: everything"
+    assert ids(_run(storage.get_chunk_embeddings("m", limit=2, dim=1))) == ["new#0", "new#1"]
+
+
+# --- a mission's document ids without their bodies (review F4) -----------------------
+
+def test_get_mission_document_ids_matches_get_mission_documents():
+    _run(storage.init_db())
+
+    async def go():
+        await storage.insert_agent(Agent(id="a1", name="N", expertise="x",
+                                         persona_prompt="p", created_at="t"))
+        await storage.insert_mission(Mission(id="m1", agent_id="a1", question="q",
+                                             status="done", created_at="t"))
+        await storage.insert_mission(Mission(id="m2", agent_id="a1", question="q",
+                                             status="done", created_at="t"))
+        for doc_id, when in (("d1", "2026-01-01"), ("d2", "2026-03-01"), ("d3", "2026-02-01")):
+            await storage.upsert_document(_doc(doc_id, "body " * 50, url=f"http://x/{doc_id}",
+                                               crawled_at=when))
+        await storage.link_mission_document("m1", "r1", "d1")
+        await storage.link_mission_document("m1", "r1", "d2")
+        await storage.link_mission_document("m1", "r2", "d2")   # linked twice: once
+        await storage.link_mission_document("m2", "r9", "d3")
+    _run(go())
+    ids = _run(storage.get_mission_document_ids("m1"))
+    assert ids == ["d2", "d1"]
+    assert ids == [d.id for d in _run(storage.get_mission_documents("m1"))]
+    assert _run(storage.get_mission_document_ids("m2")) == ["d3"]
+    assert _run(storage.get_mission_document_ids("nope")) == []

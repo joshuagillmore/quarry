@@ -453,9 +453,21 @@ contract below.
   no vector can describe text that is no longer there. The chunk id is
   stable because the document id is (the `(url, search_query)` upsert).
   Readers: `get_document_chunks`, `get_chunks_for_documents`,
-  `get_chunks_missing_embeddings(model, document_ids=None, limit=2000)`,
-  `get_chunk_embeddings(model, document_ids=None)` (only chunks that still
-  exist), `get_embedding_coverage(model)`, the `document_exports` CRUD
+  `get_chunks_missing_embeddings(model, document_ids=None, limit=2000, *,
+  dim=None)` (with `dim`, a row of another width is missing too: the LEFT
+  JOIN is on model AND dim, so a changed `EMBED_DIM` re-embeds every
+  chunk; `embed_pending_documents` passes `settings.embed_dim` for
+  `cohere/` models only, the ones `dimensions` goes on the wire for, and
+  `None` for a provider that returns its native width),
+  `get_chunk_embeddings(model, document_ids=None, *, dim=None, limit=None)`
+  (only chunks that still exist, newest document first — `documents.
+  crawled_at DESC`, then id, idx — `dim` keeping only vectors of that
+  width and `limit` capping the rows SQL-side; `upsert_chunk_embeddings`
+  replaces the `(chunk_id, model)` row, so a re-embed at another width
+  never leaves two), `get_embedding_coverage(model)`,
+  `get_mission_document_ids(mission_id)` (the ids `get_mission_documents`
+  would return, same order, no bodies — what `api_mission`'s poll counts
+  against `document_exports`), the `document_exports` CRUD
   (`get_document_exports`, `list_exported_document_ids`,
   `upsert_document_export`, `delete_document_exports`),
   `get_documents_by_ids` (full bodies, input order, batched `IN`),
@@ -512,8 +524,14 @@ contract below.
   is the one rule behind every budget decision: `_stop_reason` (the pass /
   requirement checkpoints) and `app._budget_tokens_used` (the retask and
   Resume refusals and the Resume form's prefill) both pass it, so the
-  runner and the routes agree on what counts. The telemetry strip,
-  `api_mission`'s `llm_tokens` and the `by_purpose` rows stay unfiltered;
+  runner and the routes agree on what counts. The telemetry strip's
+  grand total, `api_mission`'s `llm_tokens` and the `by_purpose` rows stay
+  unfiltered, while the strip's "N of M budgeted" text and its bar use
+  `budget_tokens` (`_budget_tokens_used`, passed to the template and
+  returned by `api_mission`, which the poll sets on
+  `[data-tele-budget-tokens]`) — the number the cap is actually enforced
+  against, so a mission with 500 assess and 5,000 embed tokens under a
+  1,000 budget reads "5,500 · 500 of 1,000 budgeted", not as over budget.
   `app._PURPOSE_ORDER` is `("plan", "assess", "extract", "brief", "rerank",
   "embed")`, so the two new purposes sort after the pipeline's.
 - **The four rerank slots** (`ranking.py`), one per place the pipeline ranks
@@ -540,10 +558,13 @@ contract below.
   full-text box in up to three stages and returns `(docs, mode)`, `mode`
   naming the last stage that worked: `"fts"` (`search_documents_fts`, cut
   to `limit`); `"hybrid"` (+ numpy cosine over the stored
-  `chunk_embeddings` of the configured model within the search filter, the
-  top `DENSE_TOP_K = 50` chunks collapsed to documents, fused with the FTS
-  list by reciprocal rank fusion with `RRF_K = 60`, dense-only hits loaded
-  by id); `"<mode>+rerank"` (the top `RERANK_POOL = 30` reranked by best
+  `chunk_embeddings` of the configured model and the query vector's width
+  within the search filter — at most `DENSE_MAX_CHUNKS = 20000` of them,
+  newest documents first, with one stderr line `[RANK] dense arm capped
+  at N most recent chunks` when that cap binds, so the arm never loads a
+  whole library — the top `DENSE_TOP_K = 50` chunks collapsed to
+  documents, fused with the FTS list by reciprocal rank fusion with
+  `RRF_K = 60`, dense-only hits loaded by id); `"<mode>+rerank"` (the top `RERANK_POOL = 30` reranked by best
   chunk, the rest keeping their order). The dense stage runs only when
   embeddings are on and a vector exists to fuse with; a failing FTS stage
   gives `([], "fts")`. Rerank strings are `indexed_text(title, chunk.text)`
@@ -569,11 +590,15 @@ contract below.
   block with it — and persists `brief_sources_json = [d.id for d in
   ordered]`, so the rail and the text cannot disagree. After
   `update_mission(status="done")`, `settings.export_on_mission_done` runs
-  `_export_sources` → `vector_export.export_documents(ids, mission_id)`
-  and logs `res.summary()` (`exported N · skipped M · failed F · K chunks
-  → 'quarry' · check recall@10 0.xx mrr 0.xx (pass)`) as `ok`, or `warn`
-  when something failed; an exception is one `export failed: …` warn line
-  and the mission stays `done`. `app.documents_list` sends a full-text `q`
+  `_export_sources` → `vector_export.run_export_locked(ids,
+  mission_id=...)` through `asyncio.to_thread` — the same one-at-a-time
+  lock and `export_status()` state a background export holds, so a Library
+  export in flight means one `export skipped: another export is running`
+  warn line rather than two exports racing — and logs `res.summary()`
+  (`exported N · skipped M · failed F · K chunks → 'quarry' · check
+  recall@k_eff 0.xx mrr 0.xx over n measured queries (pass)`) as `ok`, or
+  `warn` when something failed; an exception is one `export failed: …`
+  warn line and the mission stays `done`. `app.documents_list` sends a full-text `q`
   through `hybrid_search(q, search_filter)` and shows
   `_search_mode_label(mode)` beside the match count ("full-text",
   "hybrid", "ranked: hybrid + rerank · <model>"). `POST
@@ -618,10 +643,18 @@ contract below.
   matches `document_digest` and `embed_model` (`force` overrides), reuses
   stored `chunk_embeddings` of the right model and width and embeds only
   the rest (storing them back), deletes a changed document's old points
-  **by `doc_id` filter** — never a drop — and upserts the new ones in
+  **by `doc_id` filter** — never a drop — and, the moment that delete
+  succeeds, their `document_exports` rows too (an export row never
+  outlives the points it describes), then upserts the new ones in
   `UPSERT_BATCH = 400` with `wait=True`; a refused batch fails every
-  document in it with no export row, so the next run redoes them, and a
-  document that failed before the delete keeps its old points. Foreign
+  document in it with no export row — a forced run whose upsert was
+  refused included — so the next plain run redoes them, and a document
+  that failed before the delete keeps its old points and its row.
+  `ensure_collection` returns whether it created the collection; when it
+  did (missing, or wiped and gone), every `document_exports` row for that
+  collection name is cleared first, since an empty collection holds
+  nothing a row could vouch for, so a wiped collection is repopulated
+  rather than skipped as unchanged forever. Foreign
   points — anything without a `QRY-` doc_id, Coherence's own product
   points — are never touched (`test_foreign_points_in_collection_survive`).
   It writes `export_dir()/manifest-<collection>.json` (`collection,
@@ -630,7 +663,13 @@ contract below.
   `EXPORT_DIR` or `<dir of DB_PATH>/export`, i.e. the data volume under
   Docker. `start_export_in_background` runs one export at a time (a
   non-blocking lock; `False` when one is running) and `export_status()`
-  reports the last/current run with its check report. The CLI is `python
+  reports the last/current run with its check report;
+  `run_export_locked(doc_ids, *, collection=None, mission_id=None)` is the
+  in-thread form the mission runner uses — same lock, same status, `None`
+  when busy, the error recorded and re-raised. `_probe`'s "Qdrant
+  unreachable at …" error names the URL through `_redact_userinfo`
+  (`http://user:pass@host:6333` → `http://host:6333`, applied to the
+  provider's text too), so credentials never reach a trace or a status. The CLI is `python
   -m vector_export (--mission ID | --search Q | --doc ID... | --all)
   [--collection C] [--force] [--dry-run] [--no-check]`: `--dry-run` writes
   and contacts nothing, `--mission` checks itself, `--all` checks every
@@ -640,8 +679,10 @@ contract below.
 - **The corpus self-test** (`corpus_check.py`) answers "did the collection
   we just wrote retrieve what the mission found?" `build_eval_set` makes
   `Q00` = the mission question and `Q01..Qnn` = one query per requirement
-  in plan order (the first of its `next_queries_json` — the query the
-  collector actually ran — else its title), and qrels rows `{query_id,
+  in plan order (`_first_query`: the most recent entry of its
+  `search_stats_json` — the query the collector actually ran, re-tasks
+  included — else the first of its `next_queries_json`, a planned query,
+  else its title), and qrels rows `{query_id,
   doc_id: "QRY-<id>", grade}` from `get_requirement_document_map`: 2 for a
   document linked to a satisfied requirement, 1 for one linked to an unmet
   requirement, 0 for a document the same mission linked only elsewhere
@@ -651,7 +692,16 @@ contract below.
   needed for `k` distinct documents), and scores recall@k over grade ≥ 1
   and the reciprocal rank of the first grade ≥ 2 document, each mean taken
   over the queries that have something to measure; `passed = recall_at_k
-  >= settings.corpus_check_floor` (default `0.0`: report only). **The
+  >= settings.corpus_check_floor` (default `0.0`: report only). **It
+  cannot pass for free:** recall is measured at `k_effective = min(k,
+  max(1, n_docs_in_collection - 1))`, `n_docs_in_collection` being the
+  distinct `doc_id` count from a bounded scroll of the collection, so a
+  collection no bigger than `k` cannot return every document for every
+  query and score 1.0 whatever its vectors hold; and a run with no query
+  that expects a document (`n_measured == 0`) is `passed=False` with
+  `error="nothing measured"`. The report carries `k`, `k_effective`,
+  `n_measured` and `n_docs_in_collection`, and `summary()`/the CLI print
+  `recall@{k_effective} … over {n_measured} measured queries`. **The
   grades come from Quarry's own assessor, so this is a regression
   tripwire, not ground truth** — the number says "the corpus retrieves what
   the mission used", nothing more, and `report.json` carries that note.

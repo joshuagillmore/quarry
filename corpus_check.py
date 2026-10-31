@@ -12,8 +12,9 @@ the report.
 WHAT IS JUDGED
 
   ``Q00`` is the mission question. ``Q01..Qnn`` are the requirements, one
-  each, in plan order, phrased as the first of the requirement's
-  ``next_queries_json`` (the query the collector actually ran) or its title.
+  each, in plan order, phrased as the query the collector actually ran: the
+  most recent entry of the requirement's ``search_stats_json``, else the
+  first of its ``next_queries_json`` (planned, not yet run), else its title.
   A document linked to a requirement is graded 2 when that requirement was
   satisfied, 1 when it was linked but the requirement stayed unmet, and a
   document linked only to other requirements of the same mission is graded
@@ -24,6 +25,18 @@ WHAT IS JUDGED
   rank is of the first grade >= 2 document. Each mean is over the queries
   that have something to measure (a requirement with no sources contributes
   nothing to recall, one with no satisfied source nothing to MRR).
+
+WHAT CANNOT PASS FOR FREE
+
+  A query that expects nothing measures nothing, and a report with no
+  measured query (``n_measured == 0``) does not pass: it carries
+  ``error="nothing measured"``. And recall is taken at ``k_effective =
+  min(k, max(1, n_docs_in_collection - 1))``, where ``n_docs_in_collection``
+  is the distinct ``doc_id`` count of the collection (a bounded scroll): a
+  collection of six documents checked at k=10 would otherwise return every
+  document for every query and score recall 1.0 whatever its vectors hold.
+  The report records ``k`` (asked), ``k_effective`` (used), ``n_measured``
+  and ``n_docs_in_collection`` so the number can be read for what it is.
 
 The eval files are written in Coherence's ``evals/graded.py`` shape --
 ``queries.yaml`` declaring its ``collection``, ``qrels.jsonl`` rows of
@@ -56,6 +69,11 @@ GOLD_GRADE = 2       # counts for reciprocal rank
 # Chunk hits collapse to documents; fetching more than k hits is what lets
 # k distinct documents surface when one document owns several top chunks.
 HIT_MULTIPLIER = 4
+# The distinct-document count scrolls the collection's doc_id payloads, at
+# most this many points: past it the count is a floor, which only matters
+# when the collection is smaller than k, and a collection this size is not.
+DOC_COUNT_SCAN_LIMIT = 50_000
+DOC_COUNT_PAGE = 1000
 
 
 @dataclass
@@ -79,11 +97,27 @@ class CheckReport:
     passed: bool = False
     eval_dir: str = ""
     error: Optional[str] = None
+    n_measured: int = 0            # queries with >= 1 expected document
+    n_docs_in_collection: int = 0  # distinct doc_id payloads (bounded scroll)
+    k_effective: int = 0           # min(k, max(1, n_docs_in_collection - 1))
 
 
 # --- the eval set ----------------------------------------------------------------------
 
 def _first_query(req: Requirement) -> str:
+    """The query the collector actually ran for `req`: the most recent
+    search_stats_json entry's query (what hit the engine, re-tasks
+    included), else the first planned query of next_queries_json, else
+    the title."""
+    raw_stats = getattr(req, "search_stats_json", None)
+    try:
+        stats = json.loads(raw_stats) if raw_stats else []
+    except (TypeError, ValueError):
+        stats = []
+    for entry in reversed(stats if isinstance(stats, list) else []):
+        q = entry.get("query") if isinstance(entry, dict) else None
+        if isinstance(q, str) and q.strip():
+            return q.strip()
     try:
         queries = json.loads(req.next_queries_json) if req.next_queries_json else []
     except (TypeError, ValueError):
@@ -173,17 +207,51 @@ def _collapse(points) -> list[str]:
 
 # --- files -----------------------------------------------------------------------------
 
+def _join_surrogate_escapes(text: str) -> str:
+    """json.dumps(ensure_ascii=True) writes a character outside the BMP as
+    a \\uD8xx\\uDCxx surrogate pair, which YAML reads as two lone code
+    points, not the character; YAML's 8-digit \\U escape exists for exactly
+    this, so the pair is joined into it. Escapes are consumed one at a time,
+    so an escaped backslash can never be misread as the start of one."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if text[i + 1:i + 2] == "u":
+            hi = int(text[i + 2:i + 6], 16)
+            if 0xD800 <= hi <= 0xDBFF and text[i + 6:i + 8] == "\\u":
+                lo = int(text[i + 8:i + 12], 16)
+                if 0xDC00 <= lo <= 0xDFFF:
+                    cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                    out.append(f"\\U{cp:08X}")
+                    i += 12
+                    continue
+            out.append(text[i:i + 6])
+            i += 6
+            continue
+        out.append(text[i:i + 2])
+        i += 2
+    return "".join(out)
+
+
 def _yaml_scalar(value) -> str:
     """A YAML scalar for a str/int/bool/None. Strings are emitted
-    double-quoted with JSON escapes, which YAML's double-quoted style reads
-    identically (yaml.safe_load gives the same str back)."""
+    double-quoted with JSON escapes and pure ASCII: every character YAML
+    would refuse raw or read differently (C0/C1 controls, DEL, NEL, the
+    line/paragraph separators, a BOM) is a \\u escape, and a character
+    outside the BMP is one \\U escape, so yaml.safe_load gives the same str
+    back whatever the mission question or a requirement title held."""
     if value is None:
         return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
-    return json.dumps(str(value), ensure_ascii=False)
+    return _join_surrogate_escapes(json.dumps(str(value), ensure_ascii=True))
 
 
 def queries_yaml(doc: dict) -> str:
@@ -250,6 +318,36 @@ def _query(client, collection: str, vector: list[float], limit: int):
         limit=limit, with_payload=["doc_id"])
 
 
+def _count_docs(client, collection: str, scan_limit: int = DOC_COUNT_SCAN_LIMIT) -> int:
+    """Distinct doc_id payloads in the collection, from a scroll of at most
+    `scan_limit` points (vectors never loaded). A floor once the bound is
+    hit, which cannot matter: it only decides k_effective, and that only
+    moves when the collection is smaller than k."""
+    seen: set = set()
+    offset = None
+    scanned = 0
+    while scanned < scan_limit:
+        page = min(DOC_COUNT_PAGE, scan_limit - scanned)
+        records, offset = client.scroll(
+            collection_name=collection, limit=page, offset=offset,
+            with_payload=["doc_id"], with_vectors=False)
+        for r in records:
+            payload = getattr(r, "payload", None) or {}
+            doc_id = payload.get("doc_id")
+            if isinstance(doc_id, str):
+                seen.add(doc_id)
+        scanned += len(records)
+        if offset is None or not records:
+            break
+    return len(seen)
+
+
+def effective_k(k: int, n_docs: int) -> int:
+    """The k recall is measured at: never the whole collection, so a
+    collection no bigger than k cannot score 1.0 for free."""
+    return max(1, min(int(k), max(1, int(n_docs) - 1)))
+
+
 async def _run(mission_id: str, collection: str, client, k: int) -> CheckReport:
     report = CheckReport(collection=collection, mission_id=mission_id, k=k,
                          eval_dir=eval_dir_for(collection, mission_id))
@@ -268,6 +366,9 @@ async def _run(mission_id: str, collection: str, client, k: int) -> CheckReport:
         from vector_export import make_client
         client = make_client()
 
+    report.n_docs_in_collection = await asyncio.to_thread(_count_docs, client, collection)
+    k_eff = report.k_effective = effective_k(k, report.n_docs_in_collection)
+
     recalls: list[float] = []
     rrs: list[float] = []
     for q in queries_doc["queries"]:
@@ -281,18 +382,24 @@ async def _run(mission_id: str, collection: str, client, k: int) -> CheckReport:
                                          mission_id=mission_id)
         response = await asyncio.to_thread(_query, client, collection,
                                            [float(x) for x in vector],
-                                           max(1, k * HIT_MULTIPLIER))
-        hits = _collapse(getattr(response, "points", None) or [])[:k]
-        recall, rr = score_hits(hits, query_grades, k)
+                                           max(1, k_eff * HIT_MULTIPLIER))
+        hits = _collapse(getattr(response, "points", None) or [])[:k_eff]
+        recall, rr = score_hits(hits, query_grades, k_eff)
         report.queries.append(QueryCheck(q["query_id"], text, expected, hits, recall, rr))
         if expected:
             recalls.append(recall)
         if any(g >= GOLD_GRADE for g in query_grades.values()):
             rrs.append(rr)
 
+    report.n_measured = len(recalls)
     report.recall_at_k = (sum(recalls) / len(recalls)) if recalls else 0.0
     report.mrr = (sum(rrs) / len(rrs)) if rrs else 0.0
-    report.passed = report.recall_at_k >= float(settings.corpus_check_floor)
+    if report.n_measured == 0:
+        # No query expected a document: there is no recall to pass on.
+        report.passed = False
+        report.error = "nothing measured"
+    else:
+        report.passed = report.recall_at_k >= float(settings.corpus_check_floor)
     write_eval_files(report.eval_dir, queries_doc, qrels, report)
     return report
 

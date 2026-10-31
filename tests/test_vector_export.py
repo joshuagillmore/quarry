@@ -536,3 +536,140 @@ def test_cli_exports_a_search_and_a_doc(client, monkeypatch, capsys):
 def test_cli_unknown_mission_is_an_error(capsys):
     assert vector_export.main(["--mission", "nope"]) == 2
     assert "no mission" in capsys.readouterr().err
+
+
+# --- export rows never outlive the points (review F1) -----------------------------
+
+def test_failed_forced_rerun_leaves_no_export_row_so_the_next_run_reexports(client, monkeypatch):
+    """A forced run deletes the old points by filter before its upsert; when
+    that upsert is refused, the document's export row must go with the
+    points, or the next plain run skips a document the collection no longer
+    holds."""
+    doc_id = _store(_doc("d1", "body text"))
+    assert _export([doc_id], client).exported == [doc_id]
+    assert len(_doc_points(client, doc_id)) == 1
+
+    real_upsert = client.upsert
+
+    def refuse(*a, **k):
+        raise RuntimeError("storage full")
+
+    monkeypatch.setattr(client, "upsert", refuse)
+    forced = _export([doc_id], client, force=True)
+    assert doc_id in forced.failed
+    assert _doc_points(client, doc_id) == [], "old points deleted before the refused upsert"
+    assert _run(storage.get_document_exports([doc_id], COLLECTION)) == {}, \
+        "no row may say 'exported' while the collection holds no point for it"
+
+    monkeypatch.setattr(client, "upsert", real_upsert)
+    again = _export([doc_id], client)
+    assert again.exported == [doc_id] and again.skipped == []
+    assert len(_doc_points(client, doc_id)) == 1
+
+
+def test_recreated_collection_is_repopulated(client):
+    """A collection that was wiped (dropped and recreated by the export)
+    holds nothing: every export row for that collection name is stale, so
+    the next run re-exports instead of skipping as unchanged."""
+    d1 = _store(_doc("d1", "body text", url="https://example.com/1"))
+    d2 = _store(_doc("d2", "other text", url="https://example.com/2"))
+    assert sorted(_export([d1, d2], client).exported) == sorted([d1, d2])
+    assert client.collection_exists(COLLECTION)
+
+    client.delete_collection(COLLECTION)
+    res = _export([d1], client)
+    assert res.exported == [d1] and res.skipped == []
+    assert len(_doc_points(client, d1)) == 1
+    # The rows of documents outside this run were cleared too, so d2 is
+    # re-exported when it next comes round rather than skipped forever.
+    assert _run(storage.list_exported_document_ids(COLLECTION)) == [d1]
+    assert _export([d2], client).exported == [d2]
+
+
+def test_ensure_collection_reports_whether_it_created_the_collection(client):
+    assert vector_export.ensure_collection(client, COLLECTION, DIM) is True
+    assert vector_export.ensure_collection(client, COLLECTION, DIM) is False
+
+
+# --- the auto-export shares the lock and status (review F7) -------------------------
+
+def test_run_export_locked_holds_the_lock_and_status_for_the_whole_run(client, monkeypatch):
+    seen = {}
+
+    async def fake_export(doc_ids, **kw):
+        status = vector_export.export_status()
+        seen["running"] = status["running"]
+        seen["mission_id"] = status["mission_id"]
+        seen["doc_count"] = status["doc_count"]
+        seen["locked"] = vector_export._export_lock.locked()
+        # A background export asked for mid-run must be refused.
+        seen["background"] = vector_export.start_export_in_background(list(doc_ids))
+        seen["kw"] = kw
+        return vector_export.ExportResult(collection=kw.get("collection") or "c",
+                                          exported=list(doc_ids))
+
+    monkeypatch.setattr(vector_export, "export_documents", fake_export)
+    res = vector_export.run_export_locked(["d1", "d1", "d2"], mission_id="m1")
+    assert res is not None and res.exported == ["d1", "d2"]
+    assert seen["running"] is True and seen["locked"] is True
+    assert seen["mission_id"] == "m1" and seen["doc_count"] == 2
+    assert seen["background"] is False
+    assert seen["kw"]["mission_id"] == "m1" and seen["kw"]["collection"] == COLLECTION
+    status = vector_export.export_status()
+    assert status["running"] is False and status["error"] is None
+    assert status["result"]["exported"] == ["d1", "d2"]
+    assert not vector_export._export_lock.locked()
+
+
+def test_run_export_locked_returns_none_when_an_export_is_running(monkeypatch, capsys):
+    calls = []
+
+    async def fake_export(doc_ids, **kw):
+        calls.append(list(doc_ids))
+        return vector_export.ExportResult(collection="c")
+
+    monkeypatch.setattr(vector_export, "export_documents", fake_export)
+    assert vector_export._export_lock.acquire(blocking=False)
+    try:
+        assert vector_export.run_export_locked(["d1"], mission_id="m1") is None
+    finally:
+        vector_export._export_lock.release()
+    assert calls == []
+    assert "another export is running" in capsys.readouterr().err
+
+
+def test_run_export_locked_releases_the_lock_and_records_the_error_on_failure(monkeypatch):
+    async def fake_export(doc_ids, **kw):
+        raise vector_export.ExportError("no qdrant")
+
+    monkeypatch.setattr(vector_export, "export_documents", fake_export)
+    with pytest.raises(vector_export.ExportError):
+        vector_export.run_export_locked(["d1"], mission_id="m1")
+    status = vector_export.export_status()
+    assert status["running"] is False and "no qdrant" in status["error"]
+    assert not vector_export._export_lock.locked()
+
+
+# --- the Qdrant URL's userinfo never reaches a message (review F10) -------------------
+
+def test_probe_error_redacts_userinfo_in_the_qdrant_url(monkeypatch):
+    monkeypatch.setattr(settings, "qdrant_url", "http://user:s3cret@qdrant.internal:6333")
+
+    class Down:
+        def get_collections(self):
+            raise RuntimeError("cannot connect to http://user:s3cret@qdrant.internal:6333/")
+
+    with pytest.raises(vector_export.ExportError) as err:
+        vector_export._probe(Down())
+    text = str(err.value)
+    assert "s3cret" not in text and "user:" not in text
+    assert "Qdrant unreachable at http://qdrant.internal:6333" in text
+    assert "RuntimeError: cannot connect to http://qdrant.internal:6333/" in text
+
+
+def test_redact_userinfo():
+    assert vector_export._redact_userinfo("http://u:p@host:6333") == "http://host:6333"
+    assert vector_export._redact_userinfo("https://k@host/x") == "https://host/x"
+    assert vector_export._redact_userinfo("http://host:6333") == "http://host:6333"
+    assert vector_export._redact_userinfo("a http://u:p@h:1 and https://u2:p2@h2") == \
+        "a http://h:1 and https://h2"

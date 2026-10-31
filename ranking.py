@@ -44,6 +44,11 @@ from models import Document, SearchResult
 # Dense arm of hybrid_search: how many chunk hits (by cosine) are collapsed
 # into documents before fusion with the FTS list.
 DENSE_TOP_K = 50
+# The most chunk vectors the dense arm loads into memory per search, newest
+# documents first (storage orders by crawled_at DESC): a library past this
+# many chunks is searched densely over its most recent ones, with one
+# stderr line saying so, rather than loading every vector it holds.
+DENSE_MAX_CHUNKS = 20000
 # How many fused documents the reranker sees; the rest keep their fused order.
 RERANK_POOL = 30
 # Rerank strings per rank_documents call. Round-robin over documents, so a
@@ -306,10 +311,20 @@ async def _dense_stage(query: str, search_filter: Optional[str],
             search_filter, preview_chars=0)]
         if not ids:
             return None
-    rows = await storage.get_chunk_embeddings(model, ids)
-    if not rows:
+    # Is there anything to fuse with at all? One row is enough to know, and
+    # it saves the query embedding when nothing is embedded yet.
+    if not await storage.get_chunk_embeddings(model, ids, limit=1):
         return None
     qvec = await asyncio.to_thread(embeddings.embed_query, query)
+    # Only vectors of the query's width can match it, and at most
+    # DENSE_MAX_CHUNKS of them (the most recent), so the arm is bounded.
+    cap = max(1, int(DENSE_MAX_CHUNKS))
+    rows = await storage.get_chunk_embeddings(model, ids, dim=len(qvec), limit=cap)
+    if not rows:
+        return None
+    if len(rows) == cap:
+        print(f"[RANK] dense arm capped at {cap} most recent chunks",
+              file=sys.stderr, flush=True)
     hits = _dense_doc_hits(rows, qvec)
     if not hits:
         return None
@@ -331,10 +346,13 @@ async def hybrid_search(query: str, search_filter: Optional[str], *,
 
       "fts"            storage.search_documents_fts(query, search_filter)
       "hybrid"         + dense: cosine over the stored chunk vectors of the
-                       configured embed model (within the search filter), top
-                       DENSE_TOP_K chunks collapsed to documents, fused with
-                       the FTS list by reciprocal rank fusion (k = RRF_K), cut
-                       to `limit`; dense-only hits get their bodies loaded
+                       configured embed model and the query's width (within
+                       the search filter; at most DENSE_MAX_CHUNKS, newest
+                       documents first, one stderr line when that cap binds),
+                       top DENSE_TOP_K chunks collapsed to documents, fused
+                       with the FTS list by reciprocal rank fusion (k =
+                       RRF_K), cut to `limit`; dense-only hits get their
+                       bodies loaded
       "<mode>+rerank"  + the top RERANK_POOL documents reranked by their
                        best chunk (rank_documents); the rest keep their order
 

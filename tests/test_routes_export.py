@@ -347,3 +347,19 @@ def test_token_rows_order_includes_rerank_and_embed():
                             ("zzz", "embed", "brief", "rerank", "plan", "extract", "assess")}}
     assert [r["purpose"] for r in app_mod._token_rows(usage)] == \
         ["plan", "assess", "extract", "brief", "rerank", "embed", "zzz"]
+
+
+# --- the poll never loads document bodies (review F4) --------------------------------
+
+def test_api_mission_export_state_never_loads_document_bodies(client, monkeypatch):
+    _seed()
+    _export_row("doc01", "2026-10-31T20:14:07+00:00")
+    import app as app_mod
+
+    def bodies(*a, **k):
+        raise AssertionError("api_mission loaded full document rows on a poll")
+
+    monkeypatch.setattr(app_mod, "get_mission_documents", bodies)
+    body = client.get(f"/api/mission/{MID}").get_json()
+    assert body["export_state"]["exported"] == 1 and body["export_state"]["total"] == 2
+    assert body["export_state"]["line"] == "exported 1 of 2 → quarry · last 2026-10-31 20:14Z"

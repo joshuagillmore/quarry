@@ -534,3 +534,53 @@ def test_run_job_embedding_call_goes_through_embed_pending_documents(monkeypatch
     asyncio.run(jobs._run_job(jid))
     assert seen == [(jobs.get_job(jid).document_ids, None)]
     assert "embedded <em>3</em> chunks" in _log_text(jid)
+
+
+def test_auto_export_is_skipped_while_another_export_runs(monkeypatch):
+    """The auto-export goes through vector_export's one-at-a-time lock, so a
+    background export in flight means one skip line, not a second export."""
+    monkeypatch.setattr(settings, "export_on_mission_done", True)
+    jid = jobs.create_mission_job("Q", 5)
+    _mission_with_sources(jid)
+    calls = []
+
+    async def fake_export(ids, **kw):
+        calls.append(list(ids))
+        return _export_result(exported=list(ids))
+
+    monkeypatch.setattr(vector_export, "export_documents", fake_export)
+    monkeypatch.setattr(agent_runner, "synthesize_brief",
+                        lambda mission, reqs, docs, new_urls, ordered=None: "brief")
+    assert vector_export._export_lock.acquire(blocking=False)
+    try:
+        asyncio.run(agent_runner._synthesize("m1", None, jid))
+    finally:
+        vector_export._export_lock.release()
+    assert calls == []
+    assert "export skipped: another export is running" in _log_text(jid)
+    j = jobs.get_job(jid)
+    assert j.done and j.stage == "done"
+
+
+def test_auto_export_sets_the_shared_export_status_while_it_runs(monkeypatch):
+    monkeypatch.setattr(settings, "export_on_mission_done", True)
+    jid = jobs.create_mission_job("Q", 5)
+    _mission_with_sources(jid)
+    seen = {}
+
+    async def fake_export(ids, **kw):
+        status = vector_export.export_status()
+        seen["running"] = status["running"]
+        seen["mission_id"] = status["mission_id"]
+        seen["locked"] = vector_export._export_lock.locked()
+        return _export_result(exported=list(ids))
+
+    monkeypatch.setattr(vector_export, "export_documents", fake_export)
+    monkeypatch.setattr(agent_runner, "synthesize_brief",
+                        lambda mission, reqs, docs, new_urls, ordered=None: "brief")
+    asyncio.run(agent_runner._synthesize("m1", None, jid))
+    assert seen == {"running": True, "mission_id": "m1", "locked": True}
+    status = vector_export.export_status()
+    assert status["running"] is False and status["mission_id"] == "m1"
+    assert status["result"]["exported"] and not vector_export._export_lock.locked()
+    assert "exported 2 · skipped 0" in _log_text(jid)

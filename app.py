@@ -35,7 +35,7 @@ from storage import (
     get_related_documents,
     insert_agent, get_agent, list_agents, update_agent, delete_agent,
     insert_mission, update_mission, get_mission, list_missions,
-    get_requirements_for_mission, get_mission_documents,
+    get_requirements_for_mission, get_mission_documents, get_mission_document_ids,
     get_missions_enriched, get_distinct_search_queries,
     insert_requirement, update_requirement, delete_requirement,
     get_requirement_documents, get_agent_track_records,
@@ -1152,6 +1152,11 @@ def mission_view(mission_id):
 
     budget = _mission_budget(mission)
     llm_usage = run_async(get_mission_llm_usage(mission_id))
+    # The spend the budget counts (embed/rerank rows excluded unless the
+    # setting says otherwise): what the strip compares with max_llm_tokens
+    # and what the Resume form's "used" prefill feeds the raise math. The
+    # grand total and the per-purpose rows stay unfiltered.
+    budget_tokens = _budget_tokens_used(mission_id)
     # The compare link only when there is a previous run to compare with.
     has_parent = bool(mission.parent_mission_id) and \
         run_async(get_mission(mission.parent_mission_id)) is not None
@@ -1167,11 +1172,9 @@ def mission_view(mission_id):
         brief_html=brief_html, brief_checks=_brief_checks(mission.brief_warnings_json),
         ext_ids=ext_ids, budget=budget,
         llm_usage=llm_usage, token_rows=_token_rows(llm_usage),
+        budget_tokens=budget_tokens,
         max_llm_tokens=_budget_max_llm_tokens(budget),
-        # The Resume form's "used" prefill feeds the raise math, so it is
-        # the budget's number (embed/rerank rows excluded), not the strip's.
-        resume=_resume_offer(mission, requirements, budget, agent,
-                             _budget_tokens_used(mission_id)),
+        resume=_resume_offer(mission, requirements, budget, agent, budget_tokens),
         has_parent=has_parent,
         live_state=live_state,
         live=mission.job_id in get_in_memory_job_ids(),
@@ -1926,10 +1929,14 @@ def api_mission(mission_id):
     # cell ([data-tele-tokens]) follows it live.
     usage = run_async(get_mission_llm_usage(mission_id))
     state["llm_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    # What the token budget counts ([data-tele-budget-tokens] and the bar):
+    # the same number the runner's checkpoints compare with max_llm_tokens.
+    state["budget_tokens"] = _budget_tokens_used(mission_id)
     # The done-state "exported n of total" line ([data-export-state]) follows
-    # this while a background export writes rows.
+    # this while a background export writes rows. Ids only: a ~1.2s poll
+    # must not pull every source body out of SQLite each time.
     state["export_state"] = _export_state(
-        [d.id for d in run_async(get_mission_documents(mission_id))], mission_id)
+        run_async(get_mission_document_ids(mission_id)), mission_id)
     if mission.job_id:
         js = job_state(mission.job_id)
         if js:

@@ -659,16 +659,23 @@ async def _synthesize(mission_id: str, agent, job_id,
 
 async def _export_sources(mission_id: str, docs, job_id) -> None:
     """Export a finished mission's sources to the Qdrant corpus and log the
-    result (vector_export's one-line summary, check report included). Any
+    result (vector_export's one-line summary, check report included). It
+    goes through vector_export.run_export_locked, so it shares the
+    one-at-a-time lock and the status the export page polls with a
+    background export: one already running means one skip line here. Any
     failure — Qdrant unreachable, embeddings off, a bug — is one warn line."""
     try:
-        res = await vector_export.export_documents([d.id for d in docs],
-                                                   mission_id=mission_id)
+        res = await asyncio.to_thread(vector_export.run_export_locked,
+                                      [d.id for d in docs], mission_id=mission_id)
     except Exception as e:  # noqa: BLE001 - export never fails a mission
         traceback.print_exc()
         if job_id:
             jobs.add_log(job_id, "warn",
                          f"export failed: {_esc(type(e).__name__)}: {_esc(str(e))}")
+        return
+    if res is None:
+        if job_id:
+            jobs.add_log(job_id, "warn", "export skipped: another export is running")
         return
     if job_id:
         jobs.add_log(job_id, "warn" if res.failed else "ok", _esc(res.summary()))

@@ -1816,7 +1816,8 @@ def test_mission_page_shows_llm_tokens(client):
     _seed_llm_calls()
     html = client.get("/missions/m1").get_data(as_text=True)
     assert "LLM tokens" in html
-    assert "<span data-tele-tokens>2,200</span> <small>/ 50,000</small>" in html
+    assert ("<span data-tele-tokens>2,200</span> <small>· "
+            "<span data-tele-budget-tokens>2,200</span> of 50,000 budgeted</small>") in html
     assert 'data-tele-tokens-bar style="width:4%"' in html
     # By purpose: compact on the cell, exact in its hover title.
     assert re.search(r'<small class="tele-sub">\s*plan 1.2k · assess 1k\s*</small>', html)
@@ -1828,7 +1829,8 @@ def test_mission_page_token_cap_defaults_to_the_setting(client, monkeypatch):
     _seed_mission(status="done")          # its budget sets no max_llm_tokens
     monkeypatch.setattr(config.settings, "max_llm_tokens", 9000)
     html = client.get("/missions/m1").get_data(as_text=True)
-    assert "<span data-tele-tokens>0</span> <small>/ 9,000</small>" in html
+    assert ("<span data-tele-tokens>0</span> <small>· "
+            "<span data-tele-budget-tokens>0</span> of 9,000 budgeted</small>") in html
     assert "none recorded" in html
     monkeypatch.setattr(config.settings, "max_llm_tokens", 0)   # unlimited
     html = client.get("/missions/m1").get_data(as_text=True)
@@ -2026,3 +2028,34 @@ def test_log_cursor_template_strings_present(name):
         src = f.read()
     assert "log_total" in src
     assert "renderedLogs = " in src
+
+
+# --- mission page: the budget compares the budgeted spend (review F6) --------
+
+def test_telemetry_strip_compares_the_budgeted_spend_with_the_cap(client, monkeypatch):
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", False)
+    _seed_mission(status="done")
+    _run(storage.update_mission("m1", budget_json=json.dumps(
+        {"max_sources": 7, "max_llm_tokens": 1000})))
+    _spend_tokens("m1", 500)
+    _spend_embed_tokens("m1", 5000)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    # The grand total still counts every row ...
+    assert "<span data-tele-tokens>5,500</span>" in html
+    assert re.search(r'<small class="tele-sub">\s*assess 500 · embed 5k\s*</small>', html)
+    assert "embed: 1 call, 5,000 prompt + 0 completion" in html
+    # ... while "N of M" and the bar are the budget's number.
+    assert "<span data-tele-budget-tokens>500</span> of 1,000 budgeted" in html
+    assert 'data-tele-tokens-bar style="width:50%"' in html
+    body = client.get("/api/mission/m1").get_json()
+    assert body["llm_tokens"] == 5500 and body["budget_tokens"] == 500
+    with open("templates/mission.html", encoding="utf-8") as f:
+        src = f.read()
+    assert "'[data-tele-budget-tokens]'" in src and "s.budget_tokens" in src
+
+    # When the setting counts embed rows, the two agree.
+    monkeypatch.setattr(config.settings, "embed_tokens_count_toward_budget", True)
+    html = client.get("/missions/m1").get_data(as_text=True)
+    assert "<span data-tele-budget-tokens>5,500</span> of 1,000 budgeted" in html
+    assert 'data-tele-tokens-bar style="width:100%"' in html
+    assert client.get("/api/mission/m1").get_json()["budget_tokens"] == 5500

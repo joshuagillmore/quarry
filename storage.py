@@ -942,6 +942,22 @@ async def get_mission_documents(mission_id: str) -> list[Document]:
             return [Document(**dict(row)) for row in rows]
 
 
+async def get_mission_document_ids(mission_id: str) -> list[str]:
+    """The ids get_mission_documents would return, in the same order
+    (DISTINCT, newest crawl first), without loading a single body: the
+    mission page's poll only counts them against document_exports."""
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            """SELECT DISTINCT d.id, d.crawled_at FROM documents d
+               JOIN mission_documents m ON m.document_id = d.id
+               WHERE m.mission_id = ?
+               ORDER BY d.crawled_at DESC""",
+            (mission_id,),
+        ) as cur:
+            return [row[0] for row in await cur.fetchall()]
+
+
 async def get_mission_pair_documents(mission_id: str, parent_id: str
                                      ) -> tuple[list[Document], list[Document]]:
     """The documents of a mission and of its parent run, for the compare
@@ -1168,18 +1184,28 @@ async def get_chunks_for_documents(document_ids: Iterable[str]) -> dict[str, lis
 
 async def get_chunks_missing_embeddings(model: str,
                                         document_ids: Optional[Iterable[str]] = None,
-                                        limit: int = 2000) -> list[ChunkRow]:
+                                        limit: int = 2000, *,
+                                        dim: Optional[int] = None) -> list[ChunkRow]:
     """Chunks with no chunk_embeddings row for `model`, optionally only of
-    the given documents, in (document_id, idx) order, at most `limit`."""
+    the given documents, in (document_id, idx) order, at most `limit`.
+    With `dim`, a row of another width counts as missing too (the join is
+    on model AND dim), so a changed EMBED_DIM gets every chunk re-embedded
+    rather than leaving vectors a query of the new width can never match;
+    None accepts any width (a provider's native width is not configured)."""
     limit = max(0, int(limit))
     if limit == 0:
         return []
     ids = None if document_ids is None else _unique(document_ids)
     if ids is not None and not ids:
         return []
+    join = "e.chunk_id = c.chunk_id AND e.model = ?"
+    args: tuple = (model,)
+    if dim is not None:
+        join += " AND e.dim = ?"
+        args = (model, int(dim))
     base = f"""SELECT {", ".join("c." + col.strip() for col in _CHUNK_COLUMNS.split(","))}
                FROM chunks c
-               LEFT JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model = ?
+               LEFT JOIN chunk_embeddings e ON {join}
                WHERE e.chunk_id IS NULL"""
     out: list[ChunkRow] = []
     db_path = get_db_path()
@@ -1187,7 +1213,7 @@ async def get_chunks_missing_embeddings(model: str,
         db.row_factory = aiosqlite.Row
         if ids is None:
             async with db.execute(
-                base + " ORDER BY c.document_id, c.idx LIMIT ?", (model, limit)
+                base + " ORDER BY c.document_id, c.idx LIMIT ?", (*args, limit)
             ) as cur:
                 return [_chunk_row(r) for r in await cur.fetchall()]
         for batch in _batches(ids):
@@ -1197,7 +1223,7 @@ async def get_chunks_missing_embeddings(model: str,
             async with db.execute(
                 base + f" AND c.document_id IN ({_marks(len(batch))})"
                        " ORDER BY c.document_id, c.idx LIMIT ?",
-                (model, *batch, remaining),
+                (*args, *batch, remaining),
             ) as cur:
                 out.extend(_chunk_row(r) for r in await cur.fetchall())
     return out
@@ -1233,29 +1259,52 @@ async def upsert_chunk_embeddings(rows: list[tuple[str, str, int, bytes]]) -> No
         await db.commit()
 
 
-async def get_chunk_embeddings(model: str, document_ids: Optional[Iterable[str]] = None
+async def get_chunk_embeddings(model: str, document_ids: Optional[Iterable[str]] = None,
+                               *, dim: Optional[int] = None,
+                               limit: Optional[int] = None
                                ) -> list[tuple[str, str, bytes]]:
     """(chunk_id, document_id, vector) for every embedded chunk of `model`,
-    optionally only of the given documents, in (document_id, idx) order.
-    Only chunks that still exist are returned."""
+    optionally only of the given documents, newest document first
+    (documents.crawled_at DESC, then document_id, idx). Only chunks that
+    still exist are returned. `dim` keeps only vectors of that width (a
+    query vector can match no other); `limit` caps the rows SQL-side, so a
+    caller that loads vectors into memory takes the most recent `limit`
+    chunks rather than the whole library."""
     ids = None if document_ids is None else _unique(document_ids)
     if ids is not None and not ids:
         return []
+    if limit is not None:
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
     base = """SELECT e.chunk_id, c.document_id, e.vector
               FROM chunk_embeddings e
               JOIN chunks c ON c.chunk_id = e.chunk_id
+              JOIN documents d ON d.id = c.document_id
               WHERE e.model = ?"""
-    order = " ORDER BY c.document_id, c.idx"
+    args: tuple = (model,)
+    if dim is not None:
+        base += " AND e.dim = ?"
+        args = (model, int(dim))
+    order = " ORDER BY d.crawled_at DESC, c.document_id, c.idx"
     out: list[tuple[str, str, bytes]] = []
     db_path = get_db_path()
     async with aiosqlite.connect(db_path) as db:
         if ids is None:
-            async with db.execute(base + order, (model,)) as cur:
+            tail = order + (" LIMIT ?" if limit is not None else "")
+            tail_args = (limit,) if limit is not None else ()
+            async with db.execute(base + tail, (*args, *tail_args)) as cur:
                 return [(cid, did, bytes(vec)) for cid, did, vec in await cur.fetchall()]
         for batch in _batches(ids):
+            tail, tail_args = order, ()
+            if limit is not None:
+                remaining = limit - len(out)
+                if remaining <= 0:
+                    break
+                tail, tail_args = order + " LIMIT ?", (remaining,)
             async with db.execute(
-                base + f" AND c.document_id IN ({_marks(len(batch))})" + order,
-                (model, *batch),
+                base + f" AND c.document_id IN ({_marks(len(batch))})" + tail,
+                (*args, *batch, *tail_args),
             ) as cur:
                 out.extend((cid, did, bytes(vec)) for cid, did, vec in await cur.fetchall())
     return out

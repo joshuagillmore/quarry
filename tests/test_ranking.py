@@ -71,6 +71,7 @@ B_BODY = "solar battery storage in one paragraph"
 
 def test_interface_constants_and_dataclass():
     assert ranking.DENSE_TOP_K == 50 and ranking.RERANK_POOL == 30
+    assert ranking.DENSE_MAX_CHUNKS == 20000
     r = ranking.RankedDoc(doc=_doc("d", "x"), score=0.5, excerpt="x", chunk_id="d#0")
     assert (r.score, r.excerpt, r.chunk_id) == (0.5, "x", "d#0")
     assert ranking.rank_for_brief.__defaults__ == (brief.MAX_BRIEF_SOURCES,)
@@ -424,3 +425,39 @@ def test_hybrid_never_raises_even_when_fts_does(monkeypatch, capsys):
     capsys.readouterr()
     assert _run(ranking.hybrid_search(QUERY, None)) == ([], "fts")
     assert len(_rank_lines(capsys)) == 1
+
+
+# ---------- the dense arm is bounded (review F5) ----------
+
+def test_dense_arm_capped_at_the_most_recent_chunks(monkeypatch, capsys):
+    monkeypatch.setattr(settings, "rerank_model", "")
+    monkeypatch.setattr(settings, "embed_model", PRO)
+    monkeypatch.setattr(ranking, "DENSE_MAX_CHUNKS", 2)
+    a = Document(id="A", url="http://x/A", domain="x", title="title A", search_query="Q",
+                 crawled_at="2026-03-01", content_markdown="zebra crossing rules",
+                 content_fit="", word_count=500)
+    b = Document(id="B", url="http://x/B", domain="x", title="title B", search_query="Q",
+                 crawled_at="2026-02-01", content_markdown="zebra crossing rules " + "w " * 100,
+                 content_fit="", word_count=500)
+    x = Document(id="X", url="http://x/X", domain="x", title="title X", search_query="Q",
+                 crawled_at="2026-01-01", content_markdown="giraffe facts",
+                 content_fit="", word_count=500)
+    _store(a, b, x)
+    # The oldest document holds the perfect dense hit; the two newer ones
+    # hold vectors of other text.
+    _run(storage.upsert_chunk_embeddings([
+        ("A#0", PRO, DIM, _query_vector("something else")),
+        ("B#0", PRO, DIM, _query_vector("another thing")),
+        ("X#0", PRO, DIM, _query_vector("zebra"))]))
+    capsys.readouterr()
+    docs, mode = _run(ranking.hybrid_search("zebra", None))
+    assert mode == "hybrid"
+    assert "X" not in _ids(docs), "the oldest chunk was outside the cap"
+    lines = _rank_lines(capsys)
+    assert lines == ["[RANK] dense arm capped at 2 most recent chunks"]
+
+    # Under the cap: no line, and the dense-only hit surfaces.
+    monkeypatch.setattr(ranking, "DENSE_MAX_CHUNKS", 4)
+    docs, mode = _run(ranking.hybrid_search("zebra", None))
+    assert mode == "hybrid" and "X" in _ids(docs)
+    assert _rank_lines(capsys) == []

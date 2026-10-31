@@ -121,12 +121,13 @@
     {% set llm_total = llm_usage.prompt_tokens + llm_usage.completion_tokens %}
     <div class="tele-cell tele-tokens"{% if token_rows %} title="{% for t in token_rows %}{{ t.purpose }}: {{ t.calls }} call{{ '' if t.calls == 1 else 's' }}, {{ '{:,}'.format(t.prompt) }} prompt + {{ '{:,}'.format(t.completion) }} completion{% if not loop.last %}&#10;{% endif %}{% endfor %}"{% endif %}>
       <div class="tele-k">LLM tokens</div>
-      <div class="tele-v"><span data-tele-tokens>{{ '{:,}'.format(llm_total) }}</span>{% if max_llm_tokens %} <small>/ {{ '{:,}'.format(max_llm_tokens) }}</small>{% endif %}</div>
+      {# The grand total counts every recorded call; "N of M budgeted" and the bar compare the budget's own number (embed/rerank rows excluded unless the setting counts them) with the cap, as the runner does. #}
+      <div class="tele-v"><span data-tele-tokens>{{ '{:,}'.format(llm_total) }}</span>{% if max_llm_tokens %} <small>· <span data-tele-budget-tokens>{{ '{:,}'.format(budget_tokens) }}</span> of {{ '{:,}'.format(max_llm_tokens) }} budgeted</small>{% endif %}</div>
       <small class="tele-sub">
         {%- for t in token_rows %}{{ t.purpose }} {{ kfmt(t.total) }}{{ ' · ' if not loop.last }}{% else %}none recorded{% endfor -%}
       </small>
       {% if max_llm_tokens %}
-      <div class="tele-bar"><span data-tele-tokens-bar style="width:{{ [100, (100 * llm_total / max_llm_tokens) | round | int] | min }}%"></span></div>
+      <div class="tele-bar"><span data-tele-tokens-bar style="width:{{ [100, (100 * budget_tokens / max_llm_tokens) | round | int] | min }}%"></span></div>
       {% endif %}
     </div>
     {% if mission.status in ('collecting', 'synthesizing') and live %}
@@ -747,11 +748,15 @@
       seg('cov-satisfied', sat); seg('cov-unmet', unmet); seg('cov-pending', total - sat - unmet);
     }
 
-    // Tokens are counted per recorded LLM call, trace or not.
+    // Tokens are counted per recorded LLM call, trace or not; the budget
+    // cell and bar follow the budget's own number (embed/rerank excluded).
     if (typeof s.llm_tokens === 'number') {
       setTxt('[data-tele-tokens]', s.llm_tokens.toLocaleString('en-US'));
+    }
+    if (typeof s.budget_tokens === 'number') {
+      setTxt('[data-tele-budget-tokens]', s.budget_tokens.toLocaleString('en-US'));
       const tb = document.querySelector('[data-tele-tokens-bar]');
-      if (tb && maxLlmTokens) tb.style.width = Math.min(100, 100 * s.llm_tokens / maxLlmTokens) + '%';
+      if (tb && maxLlmTokens) tb.style.width = Math.min(100, 100 * s.budget_tokens / maxLlmTokens) + '%';
     }
     // The corpus export line is plain text from the server (never markup).
     if (s.export_state && typeof s.export_state.line === 'string') {

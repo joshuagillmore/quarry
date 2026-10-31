@@ -140,8 +140,9 @@ class ExportResult:
             if self.check.error:
                 line += f" · check failed: {self.check.error}"
             else:
-                line += (f" · check recall@{self.check.k} {self.check.recall_at_k:.2f}"
-                         f" mrr {self.check.mrr:.2f}"
+                line += (f" · check recall@{self.check.k_effective}"
+                         f" {self.check.recall_at_k:.2f} mrr {self.check.mrr:.2f}"
+                         f" over {self.check.n_measured} measured queries"
                          f" ({'pass' if self.check.passed else 'FAIL'})")
         return line
 
@@ -284,12 +285,14 @@ def _dense_size(info) -> Optional[int]:
     return None
 
 
-def ensure_collection(client, collection: str, dim: int) -> None:
+def ensure_collection(client, collection: str, dim: int) -> bool:
     """Create `collection` with a named dense vector of `dim` when it does
     not exist, and make sure the payload indexes Coherence filters on are
-    there. An existing collection whose dense vector is not `dim` wide (or
-    that has no "dense" vector) is refused with ExportError. Nothing is ever
-    deleted here: a wrong collection is the operator's to fix."""
+    there. Returns True when the collection was created here (so the caller
+    knows it is empty), False when it already existed. An existing
+    collection whose dense vector is not `dim` wide (or that has no "dense"
+    vector) is refused with ExportError. Nothing is ever deleted here: a
+    wrong collection is the operator's to fix."""
     from qdrant_client import models as qm
 
     if not _COLLECTION_RE.match(collection or ""):
@@ -306,6 +309,7 @@ def ensure_collection(client, collection: str, dim: int) -> None:
                 f"collection {collection!r} exists with {what}, not {dim}; "
                 f"refusing to touch it (never deleted)")
         existing = set((getattr(info, "payload_schema", None) or {}).keys())
+        created = False
     else:
         client.create_collection(
             collection_name=collection,
@@ -313,6 +317,7 @@ def ensure_collection(client, collection: str, dim: int) -> None:
                 size=dim, distance=qm.Distance.COSINE)},
         )
         existing = set()
+        created = True
     schema = {"integer": qm.PayloadSchemaType.INTEGER,
               "keyword": qm.PayloadSchemaType.KEYWORD}
     with warnings.catch_warnings():
@@ -325,17 +330,29 @@ def ensure_collection(client, collection: str, dim: int) -> None:
             client.create_payload_index(
                 collection_name=collection, field_name=name,
                 field_schema=schema[kind], wait=True)
+    return created
+
+
+_USERINFO_RE = re.compile(r"(?i)\b(https?://)[^/\s@]*@")
+
+
+def _redact_userinfo(text: str) -> str:
+    """`http://user:pass@host:6333` -> `http://host:6333`, for every URL in
+    `text`: a message that names the Qdrant URL (an error, a status field,
+    a trace line) must not carry its credentials."""
+    return _USERINFO_RE.sub(r"\1", text or "")
 
 
 def _probe(client) -> None:
     """One round-trip that proves Qdrant answers; anything else is an
-    ExportError before a single write."""
+    ExportError before a single write. The message names the URL without
+    its userinfo, and the provider's own text is redacted the same way."""
     try:
         client.get_collections()
     except Exception as e:  # noqa: BLE001 - the exact class is qdrant's business
-        raise ExportError(
+        raise ExportError(_redact_userinfo(
             f"Qdrant unreachable at {settings.qdrant_url}: "
-            f"{type(e).__name__}: {e}") from e
+            f"{type(e).__name__}: {e}")) from e
 
 
 def _delete_doc_points(client, collection: str, doc_ids: list[str]) -> None:
@@ -464,7 +481,17 @@ async def export_documents(doc_ids: Iterable[str], *, collection: Optional[str] 
         except Exception as e:  # noqa: BLE001 - missing package, bad url
             raise ExportError(f"cannot create Qdrant client: {type(e).__name__}: {e}") from e
     await asyncio.to_thread(_probe, client)
-    await asyncio.to_thread(ensure_collection, client, collection, dim)
+    created = await asyncio.to_thread(ensure_collection, client, collection, dim)
+    if created:
+        # A collection that had to be created holds nothing: whatever
+        # document_exports says this collection received (a run before it
+        # was wiped and recreated) is stale, so clear it before deciding
+        # what is "unchanged", or those documents are skipped forever.
+        stale = await storage.list_exported_document_ids(collection)
+        if stale:
+            await storage.delete_document_exports(stale, collection)
+            _say(log, f"collection '{collection}' created empty: "
+                      f"{len(stale)} export row(s) cleared, re-exporting")
 
     ids = list(dict.fromkeys(doc_ids))
     docs = await storage.get_documents_by_ids(ids)
@@ -522,6 +549,13 @@ async def export_documents(doc_ids: Iterable[str], *, collection: Optional[str] 
             await asyncio.to_thread(
                 _delete_doc_points, client, collection,
                 [coherence_doc_id(doc.id) for doc, _d, _p in prepared])
+            # The points are gone: the export row must not outlive them, or
+            # a refused upsert below leaves a row saying "exported" for a
+            # document the collection no longer holds (a forced run would
+            # then be skipped as unchanged next time). The row comes back
+            # once the upsert succeeds.
+            await storage.delete_document_exports(
+                [doc.id for doc, _d, _p in prepared], collection)
         except Exception as e:  # noqa: BLE001
             reason = f"delete failed: {type(e).__name__}: {e}"
             for doc, _digest, _points in prepared:
@@ -650,6 +684,37 @@ def start_export_in_background(doc_ids: Iterable[str], *, collection: Optional[s
     return True
 
 
+def run_export_locked(doc_ids: Iterable[str], *, collection: Optional[str] = None,
+                      mission_id: Optional[str] = None) -> Optional[ExportResult]:
+    """export_documents under the same one-at-a-time lock and status as the
+    background thread, run to completion in the calling thread (its own
+    event loop via asyncio.run, so call it off any running loop, e.g.
+    through asyncio.to_thread). None, with one stderr line, when an export
+    is already running — the caller logs the skip; nothing is queued. An
+    error is recorded in the status and re-raised; whatever happens the
+    lock is released and the status says the run is over."""
+    ids = list(dict.fromkeys(doc_ids))
+    if not _export_lock.acquire(blocking=False):
+        print("[EXPORT] skipped: another export is running", file=sys.stderr, flush=True)
+        return None
+    collection = (collection or settings.qdrant_export_collection or "").strip()
+    _set_state(running=True, collection=collection, mission_id=mission_id,
+               doc_count=len(ids), started_at=_now(), finished_at=None,
+               result=None, error=None)
+    try:
+        result = asyncio.run(export_documents(
+            ids, collection=collection, mission_id=mission_id))
+        _set_state(running=False, finished_at=_now(), result=result.to_dict(),
+                   error=None)
+        return result
+    except BaseException as e:  # noqa: BLE001 - the status must say how it ended
+        _set_state(running=False, finished_at=_now(),
+                   error=f"{type(e).__name__}: {e}" if str(e) else type(e).__name__)
+        raise
+    finally:
+        _export_lock.release()
+
+
 def export_status() -> dict:
     """The last/current background export: running flag, what it covers,
     when, its ExportResult (dict, with the check report) or its error."""
@@ -753,8 +818,9 @@ async def _cli(args) -> int:
             print(f"check {report.mission_id}: error {report.error}")
             ok = False
             continue
-        print(f"check {report.mission_id}: recall@{report.k} {report.recall_at_k:.2f} "
-              f"mrr {report.mrr:.2f} over {len(report.queries)} queries "
+        print(f"check {report.mission_id}: recall@{report.k_effective} "
+              f"{report.recall_at_k:.2f} mrr {report.mrr:.2f} "
+              f"over {report.n_measured} measured queries "
               f"({'pass' if report.passed else 'FAIL'}) → {report.eval_dir}")
         ok = ok and report.passed
     print(result.summary())
